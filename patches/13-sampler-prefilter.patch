@@ -1,5 +1,5 @@
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 7b241e3..86c79f2 100644
+index 7b241e3..795b705 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -9,6 +9,7 @@
@@ -31,7 +31,7 @@ index 7b241e3..86c79f2 100644
 +//
 +// The block test ORs the comparisons rather than reducing to a max.  A float max reduction is a
 +// serial dependency chain that the compiler will not vectorise (std::max is not associative across
-+// NaN), which measured 8x slower than the OR form: 130 us vs 19 us per token over a 151936-entry
++// NaN), which measured ~7x slower than the OR form: 130 us vs 19 us per token over a 151936-entry
 +// vocabulary.  Integer OR has no such problem.
 +//
 +// Elements equal to the threshold are dropped, so `out` holds *a* valid top-nkeep set (ties broken

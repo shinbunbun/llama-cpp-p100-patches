@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 509195b..e161f5f 100644
+index d23f297..fd96d72 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -369,8 +369,31 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+@@ -370,8 +370,32 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #endif
  }
  
@@ -21,9 +21,10 @@ index 509195b..e161f5f 100644
 +        //   IQ4_XS    512   32 of 128       43.35 -> 27.38  (1 warp)
 +        //   Q2_K     2048  128 of 128       unchanged, the block is already full
 +        //
-+        // small_k now carries the warp count the host computed as "just enough to cover K", so the
++        // small_k now carries the warp count the host computed as "just enough to cover K" (clamped
++        // to the 1 / 2 / 4 variants that are instantiated), so the
 +        // idle tail is never launched; 0 keeps the table value.  End to end this is +1.29% on MoE
-+        // decode (production sampler, thermal cooldown, interleaved arms) and +0.12% on the dense 9B,
++        // decode (realistic sampler, thermal cooldown, interleaved arms) and +0.12% on the dense 9B,
 +        // with prefill and the speculative acceptance rate unchanged.
 +        //
 +        // The gain is smaller than the idle-thread ratio suggests because occupancy here is limited
@@ -35,7 +36,7 @@ index 509195b..e161f5f 100644
          switch (ncols_dst) {
              case 1:
              case 2:
-@@ -475,10 +498,17 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -476,10 +500,17 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
      return 1;
  }
  
@@ -54,7 +55,7 @@ index 509195b..e161f5f 100644
                  if (small_k) {
                      return nwarps;
                  }
-@@ -488,7 +518,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+@@ -489,7 +520,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
                  // so several rows per block pay off.  Decode sweep (9B Q4_0, llama-bench tg32):
                  // 1 -> 46.9 / 2 -> 54.1 (+15.4%) / 4 -> 57.7 (+23.0%) / 8 -> 57.2 t/s.
                  // Turing+ / GCN are not measured here and keep the upstream value.
@@ -63,7 +64,7 @@ index 509195b..e161f5f 100644
              case 2:
              case 3:
              case 4:
-@@ -512,8 +542,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+@@ -513,8 +544,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
      return 1;
  }
  
@@ -74,7 +75,7 @@ index 509195b..e161f5f 100644
  static __global__ void mul_mat_vec_q(
          const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
-@@ -530,7 +560,7 @@ static __global__ void mul_mat_vec_q(
+@@ -531,7 +562,7 @@ static __global__ void mul_mat_vec_q(
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
      constexpr int vdr = get_vdr_mmvq(type);
      constexpr mmvq_parameter_table_id table_id = get_device_table_id();
@@ -83,7 +84,7 @@ index 509195b..e161f5f 100644
      constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
      constexpr int warp_size = ggml_cuda_get_physical_warp_size();
  
-@@ -808,8 +838,8 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -809,8 +840,8 @@ static __global__ void mul_mat_vec_q_moe(
  template<ggml_type type>
  static std::pair<dim3, dim3> calc_launch_params(
          const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -94,7 +95,7 @@ index 509195b..e161f5f 100644
      const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
      const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
      const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
-@@ -817,7 +847,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+@@ -818,7 +849,7 @@ static std::pair<dim3, dim3> calc_launch_params(
      return {block_nums, block_dims};
  }
  
@@ -103,7 +104,7 @@ index 509195b..e161f5f 100644
  static void mul_mat_vec_q_switch_fusion(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
-@@ -905,7 +935,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -909,7 +940,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
  
      const bool has_ids = ids != nullptr;
  
@@ -112,7 +113,7 @@ index 509195b..e161f5f 100644
          // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
          // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
          constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
-@@ -914,8 +944,26 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -918,8 +949,26 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int     blocks_per_row_x      = ncols_x / qk;
          const int     blocks_per_iter_1warp = vdr * warp_size / qi;
          const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
@@ -123,8 +124,8 @@ index 509195b..e161f5f 100644
  
 +        // On pre-Turing NVIDIA this returns a warp count instead of a flag.
 +        // The type lists below were tuned for the old meaning of small_k -- raise rows_per_block to
-+        // nwarps when K is small -- which on this table is a no-op, because the sm_60 rows-per-block
-+        // patch already returns 4 for ncols_dst == 1 either way.  Raising rows_per_block also cannot
++        // nwarps when K is small -- which on this table is a no-op, because the GENERIC branch of
++        // calc_rows_per_block already returns 4 for ncols_dst == 1 either way.  Raising rows_per_block also cannot
 +        // help: rows are iterated by the same threads, so the idle ones stay idle.  What costs time
 +        // is the idle tail of the 4-warp block, so the choice is purely "how many warps does K
 +        // need".  Q2_K and the attention tensors need all 4 and are left alone by the test below.
@@ -139,7 +140,7 @@ index 509195b..e161f5f 100644
          constexpr std::array<ggml_type, 2> iq_slow_turing = {
              GGML_TYPE_IQ3_XXS,
              GGML_TYPE_IQ3_S,
-@@ -930,9 +978,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -934,9 +983,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
              GGML_TYPE_Q3_K,
          };
  
@@ -149,7 +150,7 @@ index 509195b..e161f5f 100644
          if (is_nvidia_turing_plus) {
              if (ncols_dst == 1 &&
                      std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
-@@ -944,7 +989,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -948,7 +994,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
              use = false;
          }
  
@@ -158,7 +159,7 @@ index 509195b..e161f5f 100644
      };
  
      if (has_ids && ncols_dst > 1) {
-@@ -961,12 +1006,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -965,12 +1011,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
          case 1: {
              constexpr int c_ncols_dst = 1;
  

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
-index a9ec4f6..f2e928e 100644
+index a9ec4f6..da4b258 100644
 --- a/ggml/src/ggml-cuda/getrows.cu
 +++ b/ggml/src/ggml-cuda/getrows.cu
 @@ -230,6 +230,38 @@ static void get_rows_cuda_kq(
@@ -8,7 +8,7 @@ index a9ec4f6..f2e928e 100644
  
 +// The general kernel gives each gathered row its own block, which is a poor fit when the rows
 +// are only a few elements wide: a scalar gather over a large index array then launches one
-+// mostly-idle block per element. Flatten (row, element) into a single thread index instead.
++// mostly-idle block per gathered row. Flatten (row, element) into a single thread index instead.
 +// Kept to ne00 <= 2 so it can never take work away from the vectorised same-type path, whose
 +// smallest useful width is 4 (f32) / 8 (f16).
 +template<typename src0_t, typename dst_t>

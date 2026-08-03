@@ -1,22 +1,24 @@
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index d7dbc8b..c68284b 100644
+index d7dbc8b..4b95430 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
-@@ -809,7 +809,17 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+@@ -809,7 +809,19 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                  if (cc >= GGML_CUDA_CC_TURING) {
                      return ne11 <= 4;
                  }
 -                return ne11 <= 3;
-+                // Pre-Turing NVIDIA has no tensor cores at all, so it should not
-+                // share the ne11 <= 3 limit that is used for GPUs which do (ampere_mma / fp32_mma).
++                // Pascal and older have no tensor cores at all, so they should not share the
++                // ne11 <= 3 limit that is used for GPUs which do (ampere_mma / fp32_mma).  This
++                // branch also covers Volta, which does have them and was not measured.
 +                // Every other no-matrix-core branch in this function -- AMD without fp32_mma, and the
 +                // generic fallback below -- returns 8, and the comment at the call site says the custom
 +                // vector kernel is preferable exactly "for GPUs without tensor cores or with a thin
 +                // src0 matrix".  On a Tesla P100 (sm_60) this matters a lot with speculative decoding,
 +                // because ne11 = n_draft + 1 lands on 4 and pushes every F32 mul_mat into cuBLAS SGEMM:
 +                // for Qwen3.5-MoE that is the MoE router (2048,256) plus ssm_alpha / ssm_beta (2048,32),
-+                // measured at 5.9% of decode GPU time.  Raising the limit to 8 measures +4.3% decode
-+                // with one workload bit-identical and 3.6% faster.
++                // measured at 5.9% of decode GPU time.  Raising the limit to 8 measures +3.7% to
++                // +4.3% depending on the workload.  The one workload whose output was checked is
++                // bit-identical and 3.6% faster; the others were not checked.
 +                return ne11 <= 8;
              } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                  if (fp32_mma_hardware_available(cc)) {

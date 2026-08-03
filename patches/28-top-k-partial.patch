@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index 9681cd2..68991bf 100644
+index 9681cd2..e64a692 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
 @@ -48,6 +48,233 @@ static int next_power_of_2(int x) {
@@ -7,7 +7,7 @@ index 9681cd2..68991bf 100644
  #endif                            // CUB_TOP_K_AVAILABLE
  
 +// Partial selection for small k.  Where cub::DeviceTopK (CCCL >= 3.2) is unavailable, the
-+// implementation above degrades to "fully sort the row, take the first k" -- but obtaining k
++// caller below falls back to fully sorting the row and taking the first k -- but obtaining k
 +// elements does not require a sort.
 +//
 +// Comparisons use the same monotonic uint32 mapping cub uses, not float, and break ties toward

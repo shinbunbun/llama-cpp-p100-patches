@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 12b5046..868c226 100644
+index 12b5046..9bce8df 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -838,7 +838,17 @@ static void mul_mat_vec_q_moe_launch(
+@@ -838,7 +838,20 @@ static void mul_mat_vec_q_moe_launch(
          const uint32_t ncols_dst, const uint32_t ids_stride,
          const int warp_size, const int nchannels_dst, cudaStream_t stream) {
  
@@ -14,7 +14,10 @@ index 12b5046..868c226 100644
 +    // worth +1.9% end-to-end decode with the output unchanged bit for bit, and leaves prefill
 +    // untouched (661.2 -> 660.9 t/s) because prefill uses MMQ rather than this kernel.
 +    //
-+    // Measured with production interleaved between candidates and a wait for the GPU to drop
++    // Note this constant is NOT architecture-gated: every GPU gets 4, and upstream's 2 is not
++    // preserved anywhere.  Only sm_60 was measured.
++    //
++    // Measured with the baseline arm interleaved between candidates and a wait for the GPU to drop
 +    // below 62 C before each run: a P100's boost clock sags from 1328 to 1101 MHz over a long
 +    // benchmark, which is larger than the effect being measured.
 +    constexpr int rows_per_block = 4;

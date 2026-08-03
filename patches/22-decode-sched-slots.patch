@@ -1,15 +1,16 @@
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index eed041e..5653040 100644
+index eed041e..8c823db 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -595,6 +595,43 @@ void llama_context::sched_reserve() {
+@@ -595,6 +595,44 @@ void llama_context::sched_reserve() {
  
      sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
  
 +    {
 +        // Decode graph slots.  LLAMA_DEC_SLOTS=0 disables them (upstream behaviour).
 +        // Reuse hits saturate around 8 slots (275 at 4, 295 at 8, 301 at 16), but each slot owns
-+        // its own compute buffer and therefore costs VRAM (~16.5 MiB per slot in practice).
++        // its own compute buffer and therefore costs VRAM (~16.5 MiB per slot in practice; the
++        // graph itself is smaller, see llama-context.h).
 +        // 4 is the default because it keeps most of the gain at half the VRAM; raise it when
 +        // there is headroom.
 +        const char * LLAMA_DEC_SLOTS = getenv("LLAMA_DEC_SLOTS");
@@ -46,7 +47,7 @@ index eed041e..5653040 100644
      llama_memory_context_ptr mctx;
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
-@@ -699,7 +736,7 @@ void llama_context::synchronize() {
+@@ -699,7 +737,7 @@ void llama_context::synchronize() {
          return;
      }
  
@@ -55,7 +56,7 @@ index eed041e..5653040 100644
  
      // FIXME: if multiple single tokens are evaluated without a synchronization,
      // the stats will be added to the prompt evaluation stats
-@@ -801,6 +838,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -801,6 +839,7 @@ bool llama_context::memory_update(bool optimize) {
          // TODO: change the mctx->apply() to return information if a graph reserve is needed
          //       reset the graph result only if the memory module did reset the scheduler
          gf_res_prev->reset();
@@ -63,7 +64,7 @@ index eed041e..5653040 100644
  
          if (!mctx->apply()) {
              LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
-@@ -1321,29 +1359,88 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1321,29 +1360,88 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -158,7 +159,7 @@ index eed041e..5653040 100644
  
          //const auto t_start_us = ggml_time_us();
  
-@@ -1357,10 +1454,49 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1357,10 +1455,49 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -212,7 +213,7 @@ index eed041e..5653040 100644
          }
      }
  
-@@ -1467,7 +1603,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1467,7 +1604,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
  
      // extract logits
      if (logits.data && t_logits) {
@@ -221,7 +222,7 @@ index eed041e..5653040 100644
          GGML_ASSERT(backend_res != nullptr);
          GGML_ASSERT(logits.data != nullptr);
  
-@@ -1476,7 +1612,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1476,7 +1613,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
  
      // extract embeddings
      if (embd.data && t_embd) {
@@ -230,7 +231,7 @@ index eed041e..5653040 100644
          GGML_ASSERT(backend_embd != nullptr);
  
          switch (cparams.pooling_type) {
-@@ -1531,7 +1667,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1531,7 +1668,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
  
      // extract nextn embeddings (hidden state before the final output norm)
      if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
@@ -239,7 +240,7 @@ index eed041e..5653040 100644
          GGML_ASSERT(backend_h != nullptr);
  
          const uint32_t n_embd = hparams.n_embd_out();
-@@ -1901,7 +2037,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1901,7 +2038,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          // extract logits
          if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
@@ -248,7 +249,7 @@ index eed041e..5653040 100644
              GGML_ASSERT(backend_res != nullptr);
              GGML_ASSERT(logits.data != nullptr);
  
-@@ -1916,7 +2052,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1916,7 +2053,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          // extract embeddings
          if (embd.data && t_embd && n_outputs > 0) {
@@ -257,7 +258,7 @@ index eed041e..5653040 100644
              GGML_ASSERT(backend_embd != nullptr);
  
              switch (cparams.pooling_type) {
-@@ -1984,7 +2120,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1984,7 +2121,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
              const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
  
              if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
@@ -266,7 +267,7 @@ index eed041e..5653040 100644
                  GGML_ASSERT(backend_h != nullptr);
  
                  const uint32_t n_embd  = hparams.n_embd_out();
-@@ -2001,11 +2137,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -2001,11 +2138,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
              const auto stride = n_vocab;
  
              // async copy the sampling data from the backend to the host
@@ -282,7 +283,7 @@ index eed041e..5653040 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -2256,7 +2392,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+@@ -2256,7 +2393,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
          const size_t dst_offset = token_offset * row_floats;
          GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
  
@@ -291,7 +292,7 @@ index eed041e..5653040 100644
          GGML_ASSERT(backend != nullptr);
          ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
      }
-@@ -2366,6 +2502,7 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2366,6 +2503,7 @@ ggml_cgraph * llama_context::graph_reserve(
  
      // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
      gf_res_prev->reset();
@@ -299,7 +300,7 @@ index eed041e..5653040 100644
  
      // store the n_outputs as it is, and restore it afterwards
      // TODO: not sure if needed, might simplify in the future by removing this
-@@ -2411,6 +2548,22 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2411,6 +2549,22 @@ ggml_cgraph * llama_context::graph_reserve(
      return gf;
  }
  
@@ -322,7 +323,7 @@ index eed041e..5653040 100644
  llm_graph_params llama_context::graph_params(
                          llm_graph_result * res,
                        const llama_ubatch & ubatch,
-@@ -2454,7 +2607,7 @@ ggml_status llama_context::graph_compute(
+@@ -2454,7 +2608,7 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
@@ -332,7 +333,7 @@ index eed041e..5653040 100644
          LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
      }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index bf91daa..7358c19 100644
+index bf91daa..76f36c5 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -343,6 +343,37 @@ private:
@@ -343,8 +344,8 @@ index bf91daa..7358c19 100644
 +    //
 +    // Upstream keeps a single graph slot, so a workload whose graph type and n_tokens change every
 +    // step (speculative decoding with MTP) only reuses about 30% of the time.  Adding slots does
-+    // not help while there is a single scheduler: allocation has to be redone and the value drops
-+    // to a fifteenth (+0.21% measured).  Giving each slot its own scheduler restores upstream's
++    // not help while there is a single scheduler: allocation has to be redone and the value PER HIT
++    // drops to a fifteenth -- an experiment that pushed reuse to 88% still gained only +0.21%.  Giving each slot its own scheduler restores upstream's
 +    // "skip everything, keep the allocation" reuse.
 +    //
 +    // Each slot needs its own compute buffer, but a decode graph is only 7.83 MiB at ubatch 8

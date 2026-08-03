@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
-index 410b1fc..372e4ee 100644
+index 6e834dd..8149a19 100644
 --- a/ggml/src/ggml-cuda/concat.cu
 +++ b/ggml/src/ggml-cuda/concat.cu
-@@ -210,8 +210,263 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+@@ -211,8 +211,265 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
      }
  }
  
@@ -121,7 +121,8 @@ index 410b1fc..372e4ee 100644
 +           dst->nb[1] % 16 == 0 && ((uintptr_t) dst->data) % 16 == 0;
 +}
 +
-+// The type-width-independent part of the test, shared with ggml_cuda_concat_can_fuse_gather.
++// The part of the test that does not depend on the template parameter T, shared with
++// ggml_cuda_concat_can_fuse_gather.
 +// for_gather means "a preceding GET_ROWS is being folded in", i.e. a whole launch disappears.
 +static bool concat_rows_eligible(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
 +                                 int dim, bool for_gather) {
@@ -184,6 +185,7 @@ index 410b1fc..372e4ee 100644
 +
 +        const bool vec16 = concat_rows_vec16(dst);
 +        // Microbenchmark optima: block 256 for the vector store, block 64 for per-element writes
++        // (the gather variant always uses 64)
 +        // (the latter gives each thread little work, so smaller blocks spread better over the SMs)
 +        const int block  = (vec16 && gather == nullptr) ? CUDA_CONCAT_BLOCK_SIZE : 64;
 +        const int nblk   = (int) ((nrows + block - 1) / block);
@@ -267,7 +269,7 @@ index 410b1fc..372e4ee 100644
      if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
          const T * src0_d = (const T *) src0->data;
          const T * src1_d = (const T *) src1->data;
-@@ -315,6 +570,21 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -316,6 +573,21 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
  
      const int32_t dim = ((int32_t *) dst->op_params)[0];
  
@@ -289,7 +291,7 @@ index 410b1fc..372e4ee 100644
      GGML_ASSERT(src0->type == src1->type);
      GGML_ASSERT(dst->type  == src0->type);
  
-@@ -330,6 +600,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -331,6 +603,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
          GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
  
          // if first 3 dimensions are contiguous and ne[0] is multiple of the block size we can concat both tensors as byte tensors
@@ -297,7 +299,7 @@ index 410b1fc..372e4ee 100644
          concat_cuda<uint8_t>(src0, src1, dst, dim, stream);
      } else {
          GGML_ASSERT(ggml_blck_size(src0->type) == 1);
-@@ -342,7 +613,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -343,7 +616,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                  concat_cuda<uint16_t>(src0, src1, dst, dim, stream);
                  break;
              case 4:
@@ -328,10 +330,10 @@ index aa506a0..4369856 100644
 +
  void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 753e306..8f59a29 100644
+index ed04828..9848554 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3359,6 +3359,55 @@ static bool ggml_cuda_node_reads(const ggml_tensor * n, const ggml_tensor * t) {
+@@ -3361,6 +3361,55 @@ static bool ggml_cuda_node_reads(const ggml_tensor * n, const ggml_tensor * t) {
      return false;
  }
  
@@ -387,7 +389,7 @@ index 753e306..8f59a29 100644
  // If the deferred GET_ROWS belongs to this gdn, build the fold description for it
  static bool ggml_cuda_take_deferred_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * gdn,
                                             ggml_cuda_gated_delta_net_fused_gather & out) {
-@@ -3424,38 +3473,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3426,38 +3475,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                      break;      // something reads it before gdn does, so it cannot be deferred
                  }
              }

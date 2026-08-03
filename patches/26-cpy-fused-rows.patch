@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index c10a065..670154e 100644
+index 90620e9..be674ad 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
 @@ -90,6 +90,44 @@ struct cpy_fused_ptrs {
@@ -19,7 +19,7 @@ index c10a065..670154e 100644
 +    }
 +
 +    // Unroll so the indices are constants: a runtime index spills the struct to local memory
-+    // (same reason as in the fused variant)
++    // (same reason as in cpy_scalar_fastdiv_fused)
 +    const char * cx   = p.cx[0];
 +    char *       cdst = p.cdst[0];
 +    const int    ky   = (int) blockIdx.y;
@@ -47,7 +47,7 @@ index c10a065..670154e 100644
  template <cpy_kernel_t cpy_1>
  static __global__ void cpy_scalar_fastdiv_fused(const cpy_fused_ptrs p, const int ne,
                                    const uint3 fd_s0, const uint3 fd_s1, const uint3 fd_s2,
-@@ -780,6 +818,51 @@ bool ggml_cuda_cpy_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes,
+@@ -781,6 +819,51 @@ bool ggml_cuda_cpy_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes,
          p.cdst[k] = (char *)       nodes[k]->src[1]->data;
      }
  

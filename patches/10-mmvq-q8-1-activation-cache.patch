@@ -52,10 +52,10 @@ index cb1336b..7357351 100644
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index e161f5f..a2a8695 100644
+index fd96d72..b44592a 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1320,12 +1320,49 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1325,12 +1325,49 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -107,7 +107,7 @@ index e161f5f..a2a8695 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1351,7 +1388,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1356,7 +1393,7 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(

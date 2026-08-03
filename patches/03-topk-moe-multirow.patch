@@ -18,23 +18,27 @@ index e73a7b8..cb1336b 100644
      }
  
 diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
-index c8cec70..2e32d3e 100644
+index c8cec70..f7d16a1 100644
 --- a/ggml/src/ggml-cuda/topk-moe.cu
 +++ b/ggml/src/ggml-cuda/topk-moe.cu
-@@ -87,7 +87,11 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
+@@ -87,7 +87,15 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
  
      It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
  */
 -template <int n_experts, bool has_bias>
 +// multi_row selects the variant usable when the fused subgraph outputs alias its logits input
-+// for more than one row.  It costs one block-wide barrier, so the
-+// n_rows == 1 case upstream already fuses keeps the original barrier-free code and stays
-+// bit-identical (a __syncthreads() also constrains instruction scheduling / FMA contraction).
++// for more than one row.  It costs one block-wide barrier, so the n_rows == 1 case that upstream
++// already fuses keeps the original barrier-free code and stays bit-identical (a __syncthreads()
++// also constrains instruction scheduling / FMA contraction).
++//
++// At n_rows > 1 the fused kernel REPLACES the soft_max + argsort + get_rows + sum_rows + clamp +
++// div chain, so its output is not bit-identical to the unpatched build -- the two could already
++// disagree on expert selection, which is the mismatch this removes.
 +template <int n_experts, bool has_bias, bool multi_row = false>
  __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *         logits,
                                                                    float *               weights,
                                                                    int32_t *             ids,
-@@ -98,13 +102,20 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
+@@ -98,13 +106,20 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
                                                                    const float           scale_val,
                                                                    const topk_moe_config config) {
      const int row = blockIdx.x * blockDim.y + threadIdx.y;
@@ -60,7 +64,7 @@ index c8cec70..2e32d3e 100644
  
      constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
  
-@@ -123,6 +134,13 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
+@@ -123,6 +138,13 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
          wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
      }
  
@@ -74,7 +78,7 @@ index c8cec70..2e32d3e 100644
      if (!config.delayed_softmax) {
          if (config.use_sigmoid) {
             sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
-@@ -268,7 +286,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
+@@ -268,7 +290,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
      }
  }
  
@@ -83,7 +87,7 @@ index c8cec70..2e32d3e 100644
  static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                   const float *               logits,
                                   float *                     weights,
-@@ -282,7 +300,7 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
+@@ -282,7 +304,7 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                   const topk_moe_config       config) {
      GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                  "delayed softmax is not supported with weight normalization");
@@ -92,7 +96,7 @@ index c8cec70..2e32d3e 100644
      dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
      dim3         block_dims(WARP_SIZE, rows_per_block, 1);
      cudaStream_t stream = ctx.stream();
-@@ -290,51 +308,51 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
+@@ -290,51 +312,51 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
  
      switch (n_expert) {
          case 1:
@@ -156,12 +160,12 @@ index c8cec70..2e32d3e 100644
                  logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
              break;
          default:
-@@ -382,12 +400,24 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
+@@ -382,12 +404,24 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
      config.with_norm         = with_norm;
      config.delayed_softmax   = args.delayed_softmax;
  
-+    // only the n_rows > 1 launch pays for the aliasing barrier, so the
-+    // single-row path that upstream already fuses keeps generating exactly the code it did before.
++    // Only the n_rows > 1 launch pays for the aliasing barrier; the single-row path that upstream
++    // already fuses keeps generating exactly the code it did before.
      if (bias) {
 -        launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
 -                             scale_val, config);

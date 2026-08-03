@@ -1,7 +1,10 @@
 # The patches
 
-28 patches against llama.cpp `b10133`, in application order. Order matters:
-several touch the same files, and later ones build on earlier ones.
+日本語版: [patches.ja.md](patches.ja.md)
+
+28 patches against llama.cpp `b10133`, grouped by scope below; the application
+order is the file numbering. Order matters: several touch the same files, and
+later ones build on earlier ones.
 
 Every patch carries its full reasoning — including the measurements that
 justify it and the alternatives that were tried and rejected — in the comments
@@ -11,9 +14,12 @@ it adds to the source. This page is the index.
 
 | Scope | Meaning |
 |---|---|
-| `sm_60` | Specific to Pascal GP100 (no DP4A, full-rate HFMA2). Do not apply elsewhere without measuring. |
-| `pre-Turing` | Applies to NVIDIA GPUs without tensor cores. |
+| `sm_60` | Gated to Pascal GP100 (no DP4A, full-rate HFMA2). Do not apply elsewhere without measuring. |
+| `pre-Volta` | Gated to NVIDIA before Volta, i.e. Pascal and older. |
+| `pre-Turing` | Gated to NVIDIA before Turing. **This includes Volta, which does have tensor cores and was not measured.** |
+| `all archs` | Not architecture-gated at all: every GPU gets the change. Measured only on sm_60. |
 | `CUDA` | Architecture-independent CUDA improvement. |
+| `CUDA (delta-net)` | Architecture-independent, but only fires for models with a gated delta-net block. |
 | `host` | CPU-side; the faster the GPU, the larger the share. |
 | `model` | Depends on a model architecture, not on hardware. |
 
@@ -35,12 +41,17 @@ do it without the extraction: ~15 → ~6.75 SASS instructions.
 
 MMVQ computes one output row per block and re-reads the q8_1 activation row
 from L2 once per output row. On pre-Turing NVIDIA that load — not DRAM
-bandwidth (32–34% of peak) and not instruction count — is the limit.
+bandwidth (32–34% of peak) and not instruction count — is the limit (measured on
+GP100/sm_60; the other pre-Turing parts are an inference from that).
 
 Sweep at ncols_dst 1 (9B Q4_0, `llama-bench` tg32): 1 → 46.9, 2 → 54.1, **4 →
 57.7 (+23.0%)**, 8 → 57.2 t/s.
 
-**+15.4% (Q4_0) / +16.5% (Q4_1) decode.** Turing+ and GCN keep upstream values.
+**+23.0% at the shipped value of 4** on that sweep. An earlier revision that
+shipped 2 rows measured +15.4% (Q4_0) / +16.5% (Q4_1) end-to-end; the +23.0%
+figure is `llama-bench tg32`, which has no speculative decoding — see
+[benchmarking.md](benchmarking.md) on why that harness can disagree with the
+real workload. Turing and later and GCN keep upstream values.
 
 ### 05 · `mmvf-f32-pascal` — `pre-Turing`
 
@@ -52,12 +63,15 @@ vector kernel wins "for GPUs without tensor cores". Pascal has none.
 Speculative decoding makes `ne11 = n_draft + 1 = 4`, one over the cap, so every
 F32 `mul_mat` fell into cuBLAS SGEMM — 5.9% of decode GPU time.
 
-**+3.7–3.9%**, bit-identical, reproduced three times independently.
+**+3.7–4.3% depending on the workload**, reproduced three times independently.
+The one workload whose output was checked is bit-identical (and 3.6% faster);
+the others were not checked. Note the edited branch is `cc < TURING`, so it also
+raises the limit for Volta, which was not measured.
 
 ### 06 · `mmq-mul-mat-id-sm60` — `sm_60`
 
 MMQ is disabled wholesale without native DP4A. **That is correct for dense
-`MUL_MAT`**: measured across every quantization at n=512, MMQ runs at
+`MUL_MAT`**: measured across every quantization tested at n=512, MMQ runs at
 0.49–0.61× the cuBLAS path, and forcing it on costs a dense model 56% of its
 prefill.
 
@@ -70,7 +84,7 @@ per expert. A 0.6× kernel wins easily.
 (paired ΔNLL +0.0028 ± 0.0029, t = 0.96); against a CPU-backend reference the
 patched build is *closer* (+0.038% vs +0.224%).
 
-### 07 · `mmvq-moe-rows-sm60` — `pre-Turing`
+### 07 · `mmvq-moe-rows-sm60` — `all archs`
 
 `rows_per_block = 2; // 2 gives best perf based on tuning` in the fused MoE
 matvec launcher is hardcoded and architecture-independent, and that tuning was
@@ -78,7 +92,11 @@ not done without DP4A. The kernel is 20.1% of an MoE decode step.
 
 **+1.9% decode**, prefill unchanged (it uses MMQ).
 
-### 08 · `mmvq-mmid-batch-sm60` — `sm_60`
+**This one is not architecture-gated.** The constant is a plain `constexpr`, so
+every GPU gets 4 and upstream's 2 is not preserved anywhere. Only sm_60 was
+measured; if you are on Turing or later, measure or revert this one.
+
+### 08 · `mmvq-mmid-batch-sm60` — `pre-Volta`
 
 The table gating quantized `MUL_MAT_ID` into the fused MoE matvec is keyed on
 `cc < VOLTA`, lumping sm_60 in with sm_61. They differ in exactly the thing
@@ -86,6 +104,14 @@ that decides where the crossover belongs: past the cap sm_61 lands on MMQ,
 which is fine, while sm_60 falls all the way to sorted-gather.
 
 **+2.2%** (geometric mean over three prompts, no workload regressing).
+
+Two caveats the patch states and this entry should not bury. Only IQ2_XS and
+IQ3_XXS were measured directly — the whole table is raised because the reason
+(on sm_60 the fallback is the slow path for every type) does not depend on the
+type, which is an argument rather than a measurement, and it is the weakest link
+here. And the table is keyed on `cc < VOLTA`, so the ceiling is removed for
+sm_61 (P40, GTX 10xx) too, where the argument above does not hold: there the
+fallback is MMQ, which is a fine place to land.
 
 ### 09 · `mmvq-nwarps-small-k-sm60` — `pre-Turing`
 
@@ -96,7 +122,7 @@ the whole kernel: IQ3_XXS at K=512 used 16 of 128 threads.
 Passing "just enough warps to cover K" from the host: IQ3_XXS 64.03 → 36.64 µs,
 Q3_K 106.59 → 48.27, IQ2_XS 24.00 → 20.76.
 
-**+1.29% MoE decode, +0.12% dense.** Raising `rows_per_block` cannot fix this —
+**+1.29% MoE decode; dense unchanged within noise (+0.12%, floor ±0.17%).** Raising `rows_per_block` cannot fix this —
 rows are iterated by the same threads, so the idle ones stay idle.
 
 ### 12 · `mmvq-f16-sm60` — `sm_60`
@@ -108,11 +134,15 @@ accumulated in fp16.
 
 **+9.4% at width 5** initially; a later revision (shape-selected warp count,
 plus removing a 64-bit multiply per row caused by the 20-byte `block_q4_1`)
-took it to **+9.48% end-to-end**.
+measured **+9.5% end-to-end** — the same within noise, but across more
+workloads.
 
 Output differs in the last bits at the widths that take this path, because the
-epilogue converts once instead of twice. Verified with perplexity at ubatch 4:
-7.2370 → 7.2359 (−0.015%, one two-hundredth of the ±2.9% measurement error).
+epilogue converts once instead of twice. Perplexity at ubatch 4 moved
+7.2370 → 7.2359 (−0.015%) — 200× below the ±2.9% spread of the throughput
+measurement, so that **bounds** the change rather than confirming it. The
+argument that it is harmless is the exactness of the dequantization (Sterbenz),
+not this number.
 
 Knobs: `GGML_A16_NCOLS_MIN` / `GGML_A16_NCOLS_MAX` restrict the width range so
 the two kernels can be compared inside one binary; `GGML_A16_NWARPS`,
@@ -132,29 +162,36 @@ exception safe for every row a block owns.
 Speculative decoding verifies `n_draft + 1` rows and hit this head-on, falling
 back to a six-kernel chain (4.0% of decode GPU time versus 1.0% fused).
 
-**+2.8–6.1% decode.** Also removes a mismatch where draft (fused) and verify
-(argsort) selected experts differently, which raised the acceptance rate.
+**+2.8–6.1% decode.**
+
+**Output is not bit-identical above one row.** The fused kernel replaces the
+argsort chain, and the two could already disagree on expert selection — removing
+that mismatch is what raises the acceptance rate. The `n_rows == 1` path upstream
+already fuses is untouched and stays bit-identical. No perplexity was taken for
+this one.
 
 ### 04 · `concat-non-cont-flat` — `CUDA`
 
 The non-contiguous concat kernel maps one block to each `(i1, i2, i3)` and
 loops `i0` over `blockDim.x`, so only `min(ne0, 256)` threads work. Delta-net's
-conv-state concat is `ne0 = 4..7` with `ne1 = 8192`: 2.1M threads to move 32k
-elements, 224 KiB in 33 µs — 4 GB/s on a 732 GB/s card.
+conv-state concat is `ne0 = 4..8` with `ne1 = 8192`: 2.1M threads to move 32k
+elements, 128 KiB in 33 µs — 4 GB/s on a 732 GB/s card.
 
-One thread per output element: **18.0 → 4.7 µs**, 1.8% of decode GPU time.
+One thread per output element: **18.0 → 4.7 µs** at the real shape, 1.8% of
+decode GPU time. (The 33 µs above is the same kernel measured in isolation; 128
+KiB is the `ne0 = 4` end of the range, 224 KiB the `ne0 = 8` end.)
 
 ### 10 · `mmvq-q8-1-activation-cache` — `CUDA`
 
 `ggml_cuda_mul_mat_vec_q` re-quantizes `src1` on every call, so an FFN's gate
 and up matmuls quantize the same activations twice. `quantize_row_q8_1_cuda`
-ignores `src0->type`, so the second result is bit-for-bit the first.
+ignores `src0->type`, so the second result is bit-identical the first.
 34.6% of quantize launches were duplicates.
 
 **+1.17% MoE / +0.88% dense decode.**
 
 Enabling upstream's MMVQ fusion on Pascal instead was measured at −0.48% and
-rejected: fusion removes the same duplicate but holds two weights in one
+rejected (this comparison is recorded here, not in the patch): fusion removes the same duplicate but holds two weights in one
 kernel, and the register increase (Q3_K 140 → 218) costs 36% occupancy.
 Upstream's "fusion is not universally faster on Pascal" is literally correct;
 this patch takes only the half that helps.
@@ -167,12 +204,13 @@ that is 248,320 blocks moving one element each, 278 µs. Flattening
 
 ### 16 · `cpy-fastdiv` — `CUDA`
 
-`cpy_scalar` performs six 64-bit integer divisions per element. An f32→f32 copy
-of 24,576 elements took 4.94 µs — 2.6× a trivial kernel of the same shape, and
-40 GB/s, one fifteenth of measured read bandwidth. The divisors are
-loop-invariant, so ggml's existing `fastdiv` applies.
+`cpy_scalar` performs six 64-bit integer divisions per element. At the
+microbenchmark shape — an f32→f32 copy of 24,576 elements — it took 4.94 µs,
+2.6× a trivial kernel of the same shape, and 40 GB/s, one fifteenth of measured
+read bandwidth. The divisors are loop-invariant, so ggml's existing `fastdiv`
+applies.
 
-**11.26 → 4.96 µs per call (−56%)**, +0.82% end-to-end.
+At the real shape: **11.26 → 4.96 µs per call (−56%)**, +0.82% end-to-end.
 
 ### 17 · `norm-register-cache` — `CUDA`
 
@@ -184,8 +222,9 @@ the second read.
 **`rms_norm<1024>` 7.79 → 6.50 µs, `l2_norm<32>` 2.96 → 2.39 µs**; +0.71%
 (dense) / +0.95% (MoE).
 
-Gated at compile time on `block_size >= 1024`. A runtime gate loses: at 1.9 µs
-launch floor the branch instructions themselves cost ~6%.
+The `rms_norm` side is gated at compile time on `block_size >= 1024`; `l2_norm`
+caches at every block size. A runtime gate loses: at a 1.9 µs launch floor the
+branch instructions themselves cost ~6% on the narrow norms.
 
 ### 18 · `fuse-sibling-nodes` — `CUDA`
 
@@ -227,15 +266,25 @@ One thread per **row** instead of per element for the fused copies, when dim 0
 is contiguous and the higher dimensions are dense. Index arithmetic drops from
 six `fastdiv` per element to one multiply per row.
 
-Microbenchmark at the production shape: 8.92 µs (110 GB/s) → 5.42 (181), with
-4.17 (236) as the no-indexing ceiling. **The limit is index arithmetic, not
-data volume.**
+Microbenchmark at the real shape, four variants:
+
+| | µs | GB/s |
+|---|---:|---:|
+| one thread per element (current) | 8.92 | 110 |
+| one thread per row, `ne0` at runtime | 5.42 | 181 |
+| one thread per row, `ne0` a compile-time constant | **4.66** | **211** |
+| no index arithmetic at all (ceiling) | 4.17 | 236 |
+
+The shipped code takes the third row when it can, which is the **1.9×**. **The
+limit is index arithmetic, not data volume** — the ceiling is only 12% further
+on.
 Kill switch: `GGML_CUDA_DISABLE_CPY_ROWS`.
 
 ### 28 · `top-k-partial` — `CUDA`
 
 `ggml_top_k` uses `cub::DeviceTopK::MaxPairs`, which **requires CCCL ≥ 3.2**.
-On CUDA 12.8 and earlier that is unavailable, so it falls back to
+CCCL 3.x ships with CUDA 13, so on **every CUDA 12.x release** it is
+unavailable and the code falls back to
 `argsort_f32_i32_cuda_cub` and fully radix-sorts the vocabulary to take the
 first *k*. With speculative decoding this runs once per token with k=10 over
 151,936 entries: ~172 µs, 1.1% of decode.
@@ -246,7 +295,8 @@ a plain unsigned compare reproduces cub's stable order exactly — including
 signed zeros and NaNs — and the result is bit-identical.
 
 Microbenchmark at n=151,936: cub full sort 157.2 µs vs **20.6 µs at k=10
-(7.6×)**, zero mismatches against the full sort.
+(7.6×)**, with zero mismatches against the full sort over a set seeded with 40
+ties and a −inf.
 
 Two things made it fast, both measured: replacing the block-wide tree reduction
 with warp shuffles (70.9 → 42.1 µs — the *k* rounds of barriers were the
@@ -254,11 +304,13 @@ limit), and packing into 64 bits for one branch-free shuffle (42.1 → 20.6). Th
 elements-per-thread count barely matters: it is latency-bound per round, not
 work-bound.
 
-Falls back to the sort for k > 16, where sorting wins.
+Falls back to the existing sort for k > 16 (a hard implementation cap — the
+candidates live in per-thread register arrays), for narrow rows, and for
+oversized grids.
 Kill switch: `GGML_CUDA_DISABLE_TOP_K_PARTIAL`.
 
-> This one is worth attention beyond Pascal: every CCCL < 3.2 user with GPU
-> sampling pays a full-vocabulary sort per token.
+> This one is worth attention beyond Pascal: **every CUDA 12.x user with GPU
+> sampling pays a full-vocabulary sort per token.**
 
 ---
 
@@ -280,9 +332,9 @@ Kill switch: `GGML_CUDA_DISABLE_FUSE_GDN_BETA`.
 
 ### 24 · `fuse-gdn-state-gather` — `CUDA`
 
-The SSM state `GET_ROWS` (a 2 MB gather) folded into `gated_delta_net`.
-`k_get_rows_float_vec` fired as often as gdn (3,984 launches, 46.24 ms, 1.396%
-of decode) and did nothing but copy 2 MB out of the cache and hand it over.
+The SSM state `GET_ROWS` (a 2 MiB gather) folded into `gated_delta_net`.
+`k_get_rows_float_vec` fired as often as gdn (3,984 launches, 46.24 ms, 1.4% of
+decode) and did nothing but copy 2 MiB out of the cache and hand it over.
 gdn already writes the *new* state directly into the cache, so it reads the
 input directly too.
 
@@ -301,7 +353,7 @@ copies (+7.31 ms).
 
 The conv-state `GET_ROWS` folded into the `CONCAT` that follows it, which
 requires making `dim == 0` CONCAT run one thread per row. `build_conv_state`
-gathers a 96 KB row and immediately concatenates it; both kernels ran at 42 and
+gathers a 96 KiB row and immediately concatenates it; both kernels ran at 42 and
 51 GB/s, 7–8% of the ceiling, limited by index arithmetic (`concat_cont<T,0>`
 does a **64-bit runtime division** by an `ne0` of 4, and GP100 has no 64-bit
 divider).
@@ -340,15 +392,18 @@ output is bit-identical.
 ### 13 · `sampler-prefilter` — `host`
 
 `common_sampler::set_logits` writes a `llama_token_data` per vocabulary entry
-every token (12 B × 151,936 = 1.82 MB), and the first order-sensitive sampler
+every token (12 B × 151,936 = 1.82 MiB), and the first order-sensitive sampler
 reads all of it back. It runs after `llama_synchronize()`, so the GPU is idle
 throughout: **2.2% of decode, entirely on the critical path.**
 
 Do not build what top-k discards: one pass over the raw logits keeping the top
 `top_k + penalty_last_n`. Penalties only ever *lower* logits and touch at most
 `penalty_last_n` entries, so that set provably contains the true post-penalty
-top-k. The scan takes a max per 64-element block and compares it to a
-threshold, so nearly every block is discarded by one vectorized reduction.
+top-k. The scan tests a whole 64-element block with an **OR of comparisons**, so nearly
+every block is discarded by one vectorized pass. A max reduction here is 8×
+slower — `std::max` is not associative across NaN, so the compiler will not
+vectorise it and it becomes a serial dependency chain: 130 µs against 19 µs per
+token.
 
 Falls back to the full build for non-equivalent chains (grammar, logit_bias,
 mirostat, DRY, top-n-sigma, an unknown sampler before top-k).
@@ -358,7 +413,7 @@ Kill switch: `LLAMA_SAMPLER_PREFILTER=0`.
 
 `ggml_backend_sched_reset` memsets the whole hash table. It is sized from
 `graph_size` — tens of thousands of entries — while one graph fills a few
-thousand, so this moved over 1 MB per graph. Measured against the alternatives
+thousand, so this moved over 1 MiB per graph. Measured against the alternatives
 in the same build: **`sched_reset` 94 ms (118 µs/call) vs `alloc_graph` 58 ms
 vs `build_graph` 8.5–54.5 ms — the reset was the largest term.**
 
@@ -374,22 +429,25 @@ unused entries are `(-1, NULL)` is established once in
 ### 22 · `decode-sched-slots` — `host`
 
 Upstream keeps one graph slot, so a workload whose graph type and `n_tokens`
-change every step reuses it only ~30% of the time. Adding slots does not help
-while there is a single scheduler — allocation has to be redone, and the value
-per hit drops **15×** (an experiment that reached 88% reuse gained +0.21%).
+change every step reuses it only ~14% of the time (140 hits per 1000 graphs).
+Adding slots does not help while there is a single scheduler — allocation has to
+be redone, and the value **per hit** drops 15×: an experiment that pushed reuse
+to 88% still gained only +0.21%.
 
 Giving each slot its own scheduler restores the real thing: skip build, reset,
 split and alloc entirely.
 
-| Slots | True reuse | Dense A/B | VRAM |
+| Slots | True reuse (hits / 1000 graphs) | Dense A/B | VRAM |
 |---:|---:|---|---:|
-| 0 | 140 | — | baseline |
+| 0 (upstream) | 140 | — | baseline |
 | **4** (default) | 275 | **+0.97%** | +72 MiB |
 | 8 | 295 | +1.35% | +132 MiB |
 | 16 | 301 | — | — |
 
-4 is the default because VRAM exhaustion is fatal while 0.38 points is
-invisible. Raise it with `LLAMA_DEC_SLOTS=8` where there is headroom; `=0`
+4 is the default because the asymmetry is severe: running out of VRAM means the
+model does not load, while 0.38 points — real, and well above the ±0.07%
+resolution established in [benchmarking.md](benchmarking.md), but small — is not
+worth that risk. Raise it with `LLAMA_DEC_SLOTS=8` where there is headroom; `=0`
 restores upstream behaviour.
 
 `LLAMA_DEC_MAX_TOK` defaults to 4, and that number is load-bearing:
@@ -412,8 +470,11 @@ Q4_1 GEMV by grid X shows 12.7% of it is one tensor — `output.weight`, 606 MiB
 75% of that is the draft side, 8.1% of the decode wall.
 
 The draft only needs its own argmax and probability, and **every proposal is
-verified by the target**, so shrinking the vocabulary cannot change the output —
-only the acceptance rate. Demonstrated: with `--spec-draft-p-min 0` (fixed
+verified by the target**, so shrinking the vocabulary cannot change which tokens
+the target accepts — only how often a draft is accepted. The demonstration pins
+the draft width so both builds share an FP path; at the default `p-min` the
+*number* of drafted tokens changes, so byte-identical output is not claimed
+there. Demonstrated: with `--spec-draft-p-min 0` (fixed
 width, identical FP path) all three prompts hash identically with and without
 the subset; degrading the subset to 277 tokens drops acceptance to 0.01 while
 the output hash stays intact.

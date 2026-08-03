@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index 8360e02..c10a065 100644
+index 8360e02..90620e9 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
-@@ -78,6 +78,60 @@ static __global__ void cpy_scalar_fastdiv(const char * cx, char * cdst, const in
+@@ -78,6 +78,61 @@ static __global__ void cpy_scalar_fastdiv(const char * cx, char * cdst, const in
      cpy_1(cx + x_offset, cdst + dst_offset);
  }
  
@@ -46,7 +46,8 @@ index 8360e02..c10a065 100644
 +    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 +
 +    // Indexing the parameter struct at runtime spills it to per-thread local memory (128 B stack
-+    // frame) and is 2.7x slower.  Unroll so every index is a constant.  blockIdx.y has to be taken
++    // frame): 38.7 us against 14.7 us for the unfused pair.  Unroll so every index is a constant,
++    // which gives 0 B of stack frame and 8.2 us.  blockIdx.y has to be taken
 +    // into an int local before it is compared, or the spill comes back.
 +    const char * cx   = p.cx[0];
 +    char *       cdst = p.cdst[0];
@@ -63,7 +64,7 @@ index 8360e02..c10a065 100644
  template <typename T>
  static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                 const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
-@@ -659,6 +713,88 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+@@ -659,6 +714,88 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
      }
  }
  
@@ -168,10 +169,10 @@ index a7a87d8..d7dcdce 100644
 +
  void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7357351..5917932 100644
+index 7357351..8d8ddb0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3148,6 +3148,124 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3148,6 +3148,126 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -196,7 +197,8 @@ index 7357351..5917932 100644
 +    };
 +
 +    for (int a = 0; a < n; ++a) {
-+        // dst_src_idx >= 0 means src[dst_src_idx] is the destination (CPY); otherwise the node is
++        // dst_src_idx >= 0 means src[dst_src_idx] is the destination (CPY); otherwise the node
++        // itself is the destination (L2_NORM)
 +        const ggml_tensor * dst_a = dst_src_idx >= 0 ? nodes[a]->src[dst_src_idx] : nodes[a];
 +        if (!dst_a) {
 +            return false;
@@ -257,7 +259,8 @@ index 7357351..5917932 100644
 +                  i, collected, disjoint, launched, buf);
 +}
 +
-+// Fire confirmation: with GGML_CUDA_FUSE_LOG=1, print once per rule, so that "did it fire at all"
++// Fire confirmation: with GGML_CUDA_FUSE_LOG=1, print the first few firings (budget shared across
++// rules), so that "did it fire at all"
 +// can be answered without running a profiler.
 +static void ggml_cuda_fuse_log(const char * rule, int n) {
 +    static bool enabled = getenv("GGML_CUDA_FUSE_LOG") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_LOG"));
@@ -296,7 +299,7 @@ index 7357351..5917932 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -3172,6 +3290,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3172,6 +3292,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -347,7 +350,7 @@ index 7357351..5917932 100644
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index df4716e..b78ba38 100644
+index 66c635b..3588696 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -340,6 +340,147 @@ static __global__ void l2_norm_f32(

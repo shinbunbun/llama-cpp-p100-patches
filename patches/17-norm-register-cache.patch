@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 09d9f3a..df4716e 100644
+index 09d9f3a..66c635b 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -127,10 +127,33 @@ static __global__ void rms_norm_f32(const float * x,
@@ -10,10 +10,10 @@ index 09d9f3a..df4716e 100644
 +    // For a single row the grid is 1 block, so this kernel runs on one SM and is limited by the
 +    // bytes it moves through it; on a Tesla P100 the 4096-wide norms of a decode step cost
 +    // 7.82 us each, 7075 times per 256 tokens = 1.9% of the decode wall.  When the row fits in
-+    // RMS_NORM_MAX_CACHE values per thread, keep it in registers instead and drop the second read.
++    // max_cache values per thread, keep it in registers instead and drop the second read.
 +    // The <1024> instantiation is the only one launched with a row wide enough to need more than
 +    // one value per thread (rms_norm_f32_cuda picks <256> when ncols < 1024), and adding the
-+    // branch to the narrow one measured +6% on the 128/256-wide norms, so gate it at compile time.
++    // branch to the narrow one COST ~6% on the 128/256-wide norms, so gate it at compile time.
 +    constexpr int  max_cache = 4;
 +    constexpr bool do_cache  = block_size >= 1024;
 +    const bool cached = do_cache && ncols > block_size && ncols <= max_cache*block_size;

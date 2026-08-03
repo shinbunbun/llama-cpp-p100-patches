@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 868c226..509195b 100644
+index 9bce8df..d23f297 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -110,28 +110,48 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+@@ -110,28 +110,49 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
  // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
  
  static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {
@@ -11,17 +11,18 @@ index 868c226..509195b 100644
 +    // belongs: the caller falls back to MMQ once ne2 exceeds the ceiling, and sm_61 has native
 +    // DP4A so that is a fine place to land, while sm_60 has none.  There MMQ is unavailable and
 +    // MUL_MAT_ID drops all the way to the sorted-gather path, which launches one matvec per
-+    // (expert, token) -- 41 layers x 8 experts x 5 tokens per decode step on this model.
++    // (expert, token) -- 41 layers x 8 experts x 5 tokens per decode step on a Qwen3.5-MoE.
 +    //
 +    // So the ceiling costs sm_60 far more than it saves.  Only IQ2_XS and IQ3_XXS were measured
-+    // (the ffn_gate/up_exps and ffn_down_exps of the MoE model measured), but the reason does not depend
++    // (those are the types of that model's ffn_gate/up_exps and ffn_down_exps), but the reason does not depend
 +    // on the type -- on sm_60 the fallback is the slow path for every quantization -- so the whole
-+    // table is raised to match the reason rather than the sample.
++    // table is raised to match the reason rather than the sample.  Note this removes the ceiling
++    // for every pre-Volta NVIDIA, including sm_61, which the argument above does not cover.
 +    //
 +    // With --spec-draft-n-max 4 (ne2 = 5, one past the old IQ3_XXS ceiling) the geometric mean over
 +    // three prompts goes 89.89 -> 91.90 t/s, +2.2%, with no workload regressing.  Prefill is
-+    // untouched: it runs at ne2 = 2048, far past every entry here.  Measured with the production
-+    // sampler, production interleaved between candidates, and a wait for the GPU to drop below
++    // untouched: it runs at ne2 = 2048, far past every entry here.  Measured with a realistic
++    // sampler, the baseline arm interleaved between candidates, and a wait for the GPU to drop below
 +    // 62 C before each run -- a P100 sheds 17% of its boost clock over a long benchmark, which is
 +    // larger than the effect being measured, and an earlier sequential sweep concluded the opposite
 +    // because of it.

@@ -1,5 +1,7 @@
 # How these were measured
 
+日本語版: [benchmarking.ja.md](benchmarking.ja.md)
+
 Most of the patches here are worth between 0.5% and 2%. Measuring that reliably
 is harder than writing them, and several were nearly rejected — or nearly
 accepted — because of a broken measurement. This is what it took.
@@ -7,7 +9,7 @@ accepted — because of a broken measurement. This is what it took.
 ## Measure in the regime you ship
 
 Three separate wrong conclusions came from benchmarking under conditions that
-differed from the deployed one.
+differed from the one the patches actually run in.
 
 **Thermals.** A P100's boost clock sags from 1328 to 1101 MHz (−17%) over a long
 run. Measuring candidates sequentially therefore favours whichever ran first, by
@@ -16,14 +18,14 @@ candidates, and wait for the GPU to drop below a fixed temperature before every
 run. With that, the baseline reproduces to ±0.02% on prefill.
 
 **Greedy sampling.** Any change that moves the speculative acceptance rate must
-be measured with the *production* sampler. One patch looked like +7.7% under
+be measured with a *realistic* sampler. One patch looked like +7.7% under
 temp 0 / top-k 1, because greedy pushes acceptance to 0.99 and unfairly favours
 deeper drafts. With a realistic sampler it was +2.2%.
 
 **The wrong harness.** `llama-bench` has no speculative decoding. One change
-measured +1.4% there and **+0.01%** in production, because without a draft model
+measured +1.4% there and **+0.01%** in the real workload, because without a draft model
 every expert matmul is `ncols_dst = 1`, which is precisely the case the change
-addressed; in production that traffic moves to a different kernel.
+addressed; in the real workload that traffic moves to a different kernel.
 
 ## Know your noise floor before trusting a number
 
@@ -39,16 +41,17 @@ wrong twice over. Running a **null A/B** — the same binary as both arms — ga
 
 Two errors. First, ±0.4% was a *maximum*, not the resolution of a mean; over
 four rounds the mean resolves to ±0.165%. Second, **one prompt was producing
-about 95% of the variance** — and not by varying constantly, but bimodally: 2 of
-16 runs came in ~1% slow.
+about 90% of the variance** (0.555² of 0.343 total) — and not by varying
+constantly, but bimodally: 2 of 16 runs came in ~1% slow.
 
-Dropping that prompt took the SD to 0.068%, i.e. ±0.067% over four rounds — a
-**6× improvement in resolution for free**. Clocks were innocent (all 74 samples
+Dropping that prompt took the SD from 0.169% to 0.068% — ±0.067% over four
+rounds. That is **2.5× better than the measured three-prompt figure, and 6×
+better than the ±0.4% I had been budgeting for**, for free. Clocks were innocent (all 74 samples
 at 1328 MHz, throttle reasons 0x0 throughout).
 
 Validated against a known effect: a kill-switch A/B measured +0.723% ± 0.041%
-over 8 rounds, and +0.720% over the first 4. A by-product was that an earlier
-patch's true value was +0.72%, not the +0.47% originally reported.
+over 8 rounds, and +0.720% over the first 4. A by-product was that patch 20
+(`fuse-add-unary-mul`) was really worth +0.72%, not the +0.47% first reported.
 
 ## Prefer one binary with a runtime switch
 
@@ -57,19 +60,21 @@ Where possible each patch has a kill switch (`GGML_CUDA_DISABLE_*`,
 layout, allocator state, and build nondeterminism from the comparison at once.
 
 When two binaries are unavoidable, build the control by removing only the patch
-from the same tree. If the result is not byte-identical to the deployed build,
-the difference is not what you think it is.
+from the same tree — then check the direction that must actually hold:
+**re-applying it has to reproduce the reference build byte for byte.** If it does
+not, your control differs from that build by something other than the
+patch, and the difference you are measuring is not the one you think it is.
 
 **Always include an arm that should be unchanged.** One round of results had to
 be discarded because the scratch tree still carried a previously rejected
-change; the tell was that the "no-op" arm came in 3.4% below the deployed build
+change; the tell was that the "no-op" arm came in 3.4% below the reference build
 with a different register count. A control arm that fails to reproduce the
 baseline is the cheapest bug detector available — do not proceed without it.
 
 ## Reading profiles
 
 **Split by grid X, not by kernel name.** Per-call cost inside one kernel name
-can vary 27× between tensors. Grid X is rows / rows-per-block, which identifies
+can vary 27× between tensors. Grid X is rows / rows-per-block, which usually identifies
 the tensor uniquely. Aggregating by name once hid the entire finding behind an
 average.
 
@@ -89,8 +94,8 @@ a kernel by 20.7% of its instructions and ran 38% *slower*: register use hit the
 cap, and the recomputation needed to stay under it cost more than the
 instructions saved.
 
-More generally, on the a16 kernel every instruction reduction measured neutral
-or negative — including one that removed 63% of the loop's instructions while
+More generally, on the sm_60 Q4_1 HFMA2 GEMV (patch 12's "a16" kernel) every
+instruction reduction measured neutral or negative — including one that removed 63% of the loop's instructions while
 moving zero extra bytes, for −6.4%. The arithmetic was already hidden under
 memory latency, and was itself acting as the cover.
 
@@ -105,14 +110,14 @@ code back to the *original* block count did not recover it: the loss was the
 +30 instructions of address rematerialization the register cap forced, not the
 occupancy.
 
-**Derive bandwidth, don't assume it.** Divide the weight bytes actually read per
+**Derive bandwidth, do not assume it.** Divide the weight bytes actually read per
 forward pass by the measured time and compare against a *measured* ceiling
 (606 GB/s on a P100 — 83% of the 732 GB/s theoretical figure).
 
 ## Isolated microbenchmarks did not predict this kernel
 
 Twice, a standalone benchmark that reproduced the real kernel's timing at the
-production shape still mispredicted the real change by ~10 points:
+real tensor shape still mispredicted the real change by ~10 points:
 
 | Change | Microbenchmark | Real |
 |---|---:|---:|
@@ -138,8 +143,9 @@ at one sixteenth the parallelism: no work was added and it still grew by
 attempt cost +0.26 µs across all 14,102 calls of an unrelated path.
 
 **Indexing a kernel parameter struct at runtime spills it to local memory.**
-`p.cx[blockIdx.y]` produced a 128 B stack frame; at 24,576 threads that is 3 MB
-of extra traffic and the "fused" version ran 2.4× slower. `#pragma unroll` to
+`p.cx[blockIdx.y]` produced a 128 B stack frame; at 24,576 threads that is 3 MiB
+of extra traffic and the "fused" version ran 2.6× slower than the unfused pair
+(38.7 µs against 14.7). `#pragma unroll` to
 constant indices only: 0 B, and 14.7 → 8.2 µs. Taking `blockIdx.y` into an `int`
 local before comparing is part of the fix.
 
@@ -162,7 +168,8 @@ flag it.
 ## Do not extrapolate hit counts linearly
 
 Graph reuse looked like a large win by extrapolation: 341 hits per 1000 were
-worth +1.92%, so raising reuse to 88% should be worth ~1.9%.
+worth +1.92%, so the ~540 additional hits from raising reuse to 88% should have
+been worth about as much again.
 
 It was worth +0.21%. A *true* hit skips build, reset, split and allocation; the
 partial hit that the extra slots produced skips only build. The two differ in
