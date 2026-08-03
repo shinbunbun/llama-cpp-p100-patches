@@ -33,6 +33,8 @@ cuBLAS に落ちる一方、このカードが本当に速い命令は使われ�
   21 `sched-reset-lazy` / 28 `top-k-partial` はいずれもアーキテクチャ非依存、
   ビット一致、扱えない入力では元の経路にフォールバックする。出していないのは
   時間の問題でしかない
+- P100 上で全パッチ適用のまま **`test-backend-ops` が通る**: 13,329 件・失敗 0 を
+  3 回連続。無パッチ版と同じ結果である
 - パッチ自身が断らない限り、出力は無パッチ版と**ビット一致**する。出力が変わるのは
   3 本 (03 は 1 行を超える場合、12 は通る幅で、15 は設計上) で、それぞれ根拠付きで
   明示してある
@@ -57,7 +59,7 @@ cuBLAS に落ちる一方、このカードが本当に速い命令は使われ�
 | 07 | `mmvq-moe-rows-sm60` | all archs | decode +1.9% |
 | 08 | `mmvq-mmid-batch-sm60` | pre-Volta | +2.2% |
 | 09 | `mmvq-nwarps-small-k-sm60` | pre-Turing | MoE decode +1.29% |
-| 10 | `mmvq-q8-1-activation-cache` | CUDA | +1.17% / +0.88% |
+| 10 | `mmvq-q8-1-activation-cache` | CUDA | +1.17% / +0.88%, この形では約 0.5% 少ない |
 | 11 | `penalties-direct` | host | +5.3% |
 | 12 | `mmvq-f16-sm60` | sm_60 | decode +9.5% |
 | 13 | `sampler-prefilter` | host | decode の 2.2% をクリティカルパスから外す |

@@ -35,6 +35,8 @@ to the source.
   `penalties-direct`, 21 `sched-reset-lazy`, 28 `top-k-partial` are all
   architecture-independent, bit-identical, and fall back to the original path on
   any input they do not handle. Nothing but time has kept them out.
+- `test-backend-ops` passes on a P100 with the full set applied: 13,329 tests,
+  no failures, three consecutive runs — the same result as the unpatched build.
 - Unless a patch says otherwise, its output is **bit-identical** to the
   unpatched build. Three do change output (03 above one row, 12 at the widths it
   takes, 15 by design) and say so with the evidence.
@@ -61,7 +63,7 @@ each was measured against the stack as it stood at the time.
 | 07 | `mmvq-moe-rows-sm60` | all archs | +1.9% decode |
 | 08 | `mmvq-mmid-batch-sm60` | pre-Volta | +2.2% |
 | 09 | `mmvq-nwarps-small-k-sm60` | pre-Turing | +1.29% MoE decode |
-| 10 | `mmvq-q8-1-activation-cache` | CUDA | +1.17% / +0.88% |
+| 10 | `mmvq-q8-1-activation-cache` | CUDA | +1.17% / +0.88%, ~0.5% less in this form |
 | 11 | `penalties-direct` | host | +5.3% |
 | 12 | `mmvq-f16-sm60` | sm_60 | +9.5% decode |
 | 13 | `sampler-prefilter` | host | removes 2.2% of decode from the critical path |

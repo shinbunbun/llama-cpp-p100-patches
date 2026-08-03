@@ -1,10 +1,10 @@
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index f26b830..808daf3 100644
+index 8566842..a39fc43 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1430,6 +1430,24 @@ struct ggml_backend_cuda_context {
-     size_t                                     q8_1_cache_size   = 0;
-     int64_t                                    q8_1_cache_s[4]   = { 0, 0, 0, 0 };
+@@ -1439,6 +1439,24 @@ struct ggml_backend_cuda_context {
+     size_t              q8_1_cache_size   = 0;
+     int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
  
 +    // A GET_ROWS whose execution was deferred so it can be folded into its consumer.  Set up here
 +    // for gated_delta_net; the concat path reuses the same two fields.
@@ -24,8 +24,8 @@ index f26b830..808daf3 100644
 +        gdn_gather_owner = nullptr;
 +    }
 +
+     // Forget the key, keep the buffer.  Called at the top of every graph computation.
      void q8_1_cache_clear() {
-         q8_1_cache_buf.reset();
          q8_1_cache_src1   = nullptr;
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
 index db34813..0f60aba 100644
@@ -222,10 +222,10 @@ index 00d9362..eb4a1f8 100644
  // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
  void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 457d622..e6f5fc2 100644
+index 5dec1bf..b71f77a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3335,8 +3335,50 @@ static bool ggml_cuda_should_fuse_rms_norm_mul(const ggml_tensor * rms_norm, con
+@@ -3333,8 +3333,50 @@ static bool ggml_cuda_should_fuse_rms_norm_mul(const ggml_tensor * rms_norm, con
      return true;
  }
  
@@ -277,7 +277,7 @@ index 457d622..e6f5fc2 100644
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
      if (disable_fusion) {
-@@ -3345,6 +3387,71 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3343,6 +3385,71 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -349,7 +349,7 @@ index 457d622..e6f5fc2 100644
      // SIGMOID -> (view) -> GATED_DELTA_NET
      // Fold beta = sigmoid(x) into the gdn prologue.  gdn also writes the folded SIGMOID's dst, so
      // no use-count analysis is needed and the output is bit-identical.  Composes with cache fusion.
-@@ -3365,12 +3472,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3363,12 +3470,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              if (gdn != nullptr && gdn->op == GGML_OP_GATED_DELTA_NET && gdn->src[4] == node) {
                  ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
                  const int cache_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, j, fused_state_cpy);
@@ -368,7 +368,7 @@ index 457d622..e6f5fc2 100644
                  return (j - i) + cache_skip;
              }
          }
-@@ -3380,13 +3490,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3378,13 +3488,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      if (node->op == GGML_OP_GATED_DELTA_NET) {
          ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
          const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
@@ -394,7 +394,7 @@ index 457d622..e6f5fc2 100644
          }
      }
  
-@@ -4191,6 +4308,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4189,6 +4306,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
      ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
@@ -405,7 +405,7 @@ index 457d622..e6f5fc2 100644
      bool                         is_concurrent_event_active = false;
      ggml_cuda_concurrent_event * concurrent_event           = nullptr;
      bool                         should_launch_concurrent_events = false;
-@@ -4324,7 +4445,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4322,7 +4443,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  

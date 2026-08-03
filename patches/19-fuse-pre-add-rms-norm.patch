@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8d8ddb0..87d1fb7 100644
+index 1d4cc49..732af59 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3268,6 +3268,73 @@ static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, in
+@@ -3266,6 +3266,73 @@ static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, in
      return n;
  }
  
@@ -76,7 +76,7 @@ index 8d8ddb0..87d1fb7 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -3314,6 +3381,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3312,6 +3379,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  

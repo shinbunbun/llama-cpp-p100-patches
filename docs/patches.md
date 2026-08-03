@@ -185,16 +185,36 @@ KiB is the `ne0 = 4` end of the range, 224 KiB the `ne0 = 8` end.)
 
 `ggml_cuda_mul_mat_vec_q` re-quantizes `src1` on every call, so an FFN's gate
 and up matmuls quantize the same activations twice. `quantize_row_q8_1_cuda`
-ignores `src0->type`, so the second result is bit-identical the first.
+ignores `src0->type`, so the second result is bit-identical to the first.
 34.6% of quantize launches were duplicates.
 
-**+1.17% MoE / +0.88% dense decode.**
+**+1.17% MoE / +0.88% dense decode** when first measured. The form shipped here
+is ~0.5% slower than that figure, for the two reasons below. Neither is
+optional.
+
+**The buffer must not come from the CUDA pool.** The pool is a stack allocator
+that asserts every free is the top of the stack, so an allocation held across
+calls breaks it as soon as some caller allocates before `mul_mat_vec_q` and
+frees after — which is exactly what `ggml_cuda_mul_mat_id`'s sorted-gather path
+does. It is a plain grow-only device allocation instead. Taking it out of the
+pool arena changes address layout, and `ggml_cuda_check_fusion_memory_ranges`
+decides fusion from actual addresses, which is where most of the ~0.5% goes.
+
+**The key must include `src1->data`, not just the tensor pointer.** That same
+sorted-gather path declares its `ggml_tensor` inside the per-expert loop, so
+every expert reuses one stack address while `data` advances. Keyed on the
+pointer alone, two experts with equal token counts match and the second
+silently computes against the first one's activations.
+
+A shared buffer is also only safe on the stream that owns it, so calls on any
+other stream fall back to upstream's per-call pool allocation.
 
 Enabling upstream's MMVQ fusion on Pascal instead was measured at −0.48% and
-rejected (this comparison is recorded here, not in the patch): fusion removes the same duplicate but holds two weights in one
-kernel, and the register increase (Q3_K 140 → 218) costs 36% occupancy.
-Upstream's "fusion is not universally faster on Pascal" is literally correct;
-this patch takes only the half that helps.
+rejected (recorded here, not in the patch): fusion removes the same duplicate
+but holds two weights in one kernel, and the register increase
+(Q3_K 140 → 218) costs 36% occupancy. Upstream's note that fusion is not
+universally faster on Pascal holds here; this patch takes only the half that
+does help.
 
 ### 14 · `getrows-narrow-rows` — `CUDA`
 

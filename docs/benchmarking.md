@@ -165,6 +165,27 @@ change which fusions fire and therefore change the output. Both results are
 correct, but they are not bit-identical, and a hash-based regression check will
 flag it.
 
+## One clean run is not evidence
+
+Three habits, all cheap, each of which caught a real bug in this set.
+
+**Run the whole suite, not the failing case.** A `test-backend-ops` failure in
+SOFT_MAX did not reproduce under `-o SOFT_MAX`; it appeared only in a full run,
+because the damage was done by state an earlier op left behind. Narrowing to
+the failing case is the natural debugging move, and it makes this class of bug
+invisible.
+
+**Run it more than once, and read *where* it fails.** Consecutive full runs
+failed at different ops with very different error magnitudes — 2e-4 in
+SOFT_MAX, 0.54 in MUL_MAT_ID. A precision problem is stable and stays in one
+op. A failure that moves, with an error far too large for rounding, is memory
+being reused, not arithmetic.
+
+**A crash can hide a wrong answer.** An abort partway through the suite left
+the rest unrun; removing it exposed a silent incorrect-result bug that had been
+sitting behind it the whole time. Reaching "no crash" is not reaching
+"correct" — the run has to complete, repeatedly, before a pass means anything.
+
 ## Do not extrapolate hit counts linearly
 
 Graph reuse looked like a large win by extrapolation: 341 hits per 1000 were

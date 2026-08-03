@@ -507,7 +507,7 @@ index 0000000..8bdebd1
 +void ggml_cuda_mmvq_f16_sm60(
 +    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index b44592a..8ca9d39 100644
+index 77df297..94d9405 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -528,5 +528,5 @@ index b44592a..8ca9d39 100644
 +    }
 +
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+     ggml_cuda_pool_alloc<char> src1_q8_1_scoped(ctx.pool());
      char * src1_q8_1_d = nullptr;
-     {
