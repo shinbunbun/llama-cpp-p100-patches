@@ -1,0 +1,74 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 868c226..509195b 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -110,28 +110,48 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+ // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
+ 
+ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {
++    // This table is keyed on cc < VOLTA, which lumps sm_60 (P100) in with
++    // sm_61 (1080 / P40).  Those two differ in the one thing that decides where the crossover
++    // belongs: the caller falls back to MMQ once ne2 exceeds the ceiling, and sm_61 has native
++    // DP4A so that is a fine place to land, while sm_60 has none.  There MMQ is unavailable and
++    // MUL_MAT_ID drops all the way to the sorted-gather path, which launches one matvec per
++    // (expert, token) -- 41 layers x 8 experts x 5 tokens per decode step on this model.
++    //
++    // So the ceiling costs sm_60 far more than it saves.  Only IQ2_XS and IQ3_XXS were measured
++    // (the ffn_gate/up_exps and ffn_down_exps of the MoE model measured), but the reason does not depend
++    // on the type -- on sm_60 the fallback is the slow path for every quantization -- so the whole
++    // table is raised to match the reason rather than the sample.
++    //
++    // With --spec-draft-n-max 4 (ne2 = 5, one past the old IQ3_XXS ceiling) the geometric mean over
++    // three prompts goes 89.89 -> 91.90 t/s, +2.2%, with no workload regressing.  Prefill is
++    // untouched: it runs at ne2 = 2048, far past every entry here.  Measured with the production
++    // sampler, production interleaved between candidates, and a wait for the GPU to drop below
++    // 62 C before each run -- a P100 sheds 17% of its boost clock over a long benchmark, which is
++    // larger than the effect being measured, and an earlier sequential sweep concluded the opposite
++    // because of it.
++
+     switch (type) {
+-        case GGML_TYPE_IQ1_S:   return 6;
+-        case GGML_TYPE_IQ1_M:   return 6;
+-        case GGML_TYPE_IQ2_S:   return 4;
+-        case GGML_TYPE_IQ2_XS:  return 5;
+-        case GGML_TYPE_IQ2_XXS: return 5;
+-        case GGML_TYPE_IQ3_S:   return 4;
+-        case GGML_TYPE_IQ3_XXS: return 4;
+-        case GGML_TYPE_IQ4_NL:  return 6;
+-        case GGML_TYPE_IQ4_XS:  return 5;
+-        case GGML_TYPE_MXFP4:   return 4;
+-        case GGML_TYPE_NVFP4:   return 4;
+-        case GGML_TYPE_Q2_K:    return 4;
+-        case GGML_TYPE_Q3_K:    return 4;
+-        case GGML_TYPE_Q4_0:    return 6;
+-        case GGML_TYPE_Q4_1:    return 6;
+-        case GGML_TYPE_Q4_K:    return 5;
+-        case GGML_TYPE_Q5_0:    return 6;
+-        case GGML_TYPE_Q5_1:    return 6;
+-        case GGML_TYPE_Q5_K:    return 5;
+-        case GGML_TYPE_Q6_K:    return 4;
+-        case GGML_TYPE_Q8_0:    return 4;
++        case GGML_TYPE_IQ1_S:   return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_IQ1_M:   return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_IQ2_S:   return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_IQ2_XS:  return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_IQ2_XXS: return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_IQ3_S:   return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_IQ3_XXS: return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_IQ4_NL:  return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_IQ4_XS:  return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_MXFP4:   return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_NVFP4:   return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q2_K:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q3_K:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q4_0:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q4_1:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q4_K:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q5_0:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q5_1:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q5_K:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q6_K:    return MMVQ_MAX_BATCH_SIZE;
++        case GGML_TYPE_Q8_0:    return MMVQ_MAX_BATCH_SIZE;
+         default:                return MMVQ_MAX_BATCH_SIZE;
+     }
+ }

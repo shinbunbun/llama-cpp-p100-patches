@@ -1,0 +1,219 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 7b241e3..86c79f2 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstdlib>
+ #include <climits>
+ #include <cmath>
+ #include <cstring>
+@@ -108,6 +109,135 @@ struct ring_buffer {
+     std::vector<T> data;
+ };
+ 
++// Selects a superset of the `nkeep` highest logits without materialising the whole vocabulary.
++//
++// set_logits() below builds one llama_token_data (12 bytes) per vocabulary entry on every single
++// sampled token, and the first sampler that needs an ordering then sweeps all of them again.  On
++// Qwen3 (n_vocab 151936) that is 1.8 MB written and re-read per token, and it is on the critical
++// path: the sampler runs after llama_synchronize(), so the GPU idles through it.  Measured on a
++// llama-server decode loop it is 0.32 ms per token, 2.2% of end-to-end throughput on a Tesla P100.
++// The cost is on the host and does not shrink as the GPU gets faster, and vocabularies keep growing.
++//
++// Only the top few candidates can ever be selected once top-k runs, so scan the raw float logits
++// instead and copy out just those.  The scan keeps a threshold equal to the nkeep-th largest logit
++// seen so far, which makes the common case a compare that fails, and tests a whole 64-wide block at
++// a time so the rejection is one vectorised pass.  common_sampler_prefilter_nkeep() decides whether
++// the chain is one where this is provably equivalent; see there.
++//
++// The block test ORs the comparisons rather than reducing to a max.  A float max reduction is a
++// serial dependency chain that the compiler will not vectorise (std::max is not associative across
++// NaN), which measured 8x slower than the OR form: 130 us vs 19 us per token over a 151936-entry
++// vocabulary.  Integer OR has no such problem.
++//
++// Elements equal to the threshold are dropped, so `out` holds *a* valid top-nkeep set (ties broken
++// by position) rather than a specific one.  That is all the caller's argument needs: every excluded
++// token has a logit <= the smallest kept one.
++static void common_sampler_prefilter(
++        const float * logits, int n_vocab, int nkeep, std::vector<int32_t> & out) {
++    const int cap = 4*nkeep;
++
++    out.clear();
++    out.reserve(cap);
++
++    float thr = -INFINITY;
++
++    // thr can rise inside this, which only ever drops more; anything skipped is <= the thr in force
++    // at the time, and thr never decreases, so it is <= the smallest surviving candidate.
++    const auto probe = [&](int i) {
++        if (logits[i] > thr) {
++            out.push_back(i);
++
++            if ((int) out.size() == cap) {
++                std::nth_element(out.begin(), out.begin() + nkeep - 1, out.end(),
++                        [logits](int32_t a, int32_t b) { return logits[a] > logits[b]; });
++                out.resize(nkeep);
++
++                // strictly-greater from here on, so later ties with the nkeep-th value are
++                // dropped -- still a valid top-nkeep set
++                thr = logits[out[nkeep - 1]];
++            }
++        }
++    };
++
++    int i0 = 0;
++    for (; i0 + 64 <= n_vocab; i0 += 64) {
++        int any = 0;
++        for (int j = 0; j < 64; ++j) {
++            any |= (int) (logits[i0 + j] > thr);
++        }
++        if (!any) {
++            continue;
++        }
++
++        for (int j = 0; j < 64; ++j) {
++            probe(i0 + j);
++        }
++    }
++    for (; i0 < n_vocab; ++i0) {
++        probe(i0);
++    }
++}
++
++// Number of candidates set_logits() must keep for the prefilter to be equivalent to building the
++// whole vocabulary, or 0 when it is not.
++//
++// Samplers that run before top-k must either be no-ops or only ever lower logits, and the number of
++// tokens they can lower must be bounded, because the margin over top_k is what guarantees enough
++// untouched candidates survive.  Penalties qualify: they touch at most penalty_last_n distinct
++// tokens, and with repeat >= 1 and non-negative freq/present the arithmetic is monotone
++// non-increasing.  Anything past top-k sees exactly the same top-k either way, so it does not
++// matter what it is.
++static int common_sampler_prefilter_nkeep(const common_params_sampling & params, int n_vocab) {
++    static const bool enabled = getenv("LLAMA_SAMPLER_PREFILTER")
++        ? atoi(getenv("LLAMA_SAMPLER_PREFILTER")) != 0 : true;
++
++    if (!enabled || params.mirostat != 0 || params.top_k <= 0 || params.has_logit_bias()) {
++        return 0;
++    }
++
++    const bool penalties_off =
++        params.penalty_last_n == 0 ||
++        (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
++
++    if (!penalties_off &&
++        (params.penalty_last_n < 0 || params.penalty_repeat < 1.0f ||
++         params.penalty_freq < 0.0f || params.penalty_present < 0.0f)) {
++        return 0;
++    }
++
++    const bool dry_off = params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0;
++
++    bool seen_top_k = false;
++    for (const auto & cnstr : params.samplers) {
++        if (cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
++            seen_top_k = true;
++            break;
++        }
++
++        // everything reachable before top-k has to leave the ordering of the tail alone
++        switch (cnstr) {
++            case COMMON_SAMPLER_TYPE_PENALTIES:                              break;
++            case COMMON_SAMPLER_TYPE_DRY:         if (!dry_off) return 0;     break;
++            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA: if (params.top_n_sigma > 0.0f) return 0; break;
++            default: return 0;
++        }
++    }
++
++    if (!seen_top_k) {
++        return 0;
++    }
++
++    const int margin = penalties_off ? 0 : params.penalty_last_n;
++    const int nkeep  = std::min<int64_t>(n_vocab, (int64_t) params.top_k + margin);
++
++    // the scan writes up to 4*nkeep candidates, so there has to be real headroom to be worth it
++    if (nkeep <= 0 || 8*nkeep >= n_vocab) {
++        return 0;
++    }
++
++    return nkeep;
++}
++
+ struct common_sampler {
+     common_params_sampling params;
+ 
+@@ -121,13 +251,16 @@ struct common_sampler {
+ 
+     llama_token_data_array cur_p;
+ 
++    int pf_nkeep;                 // 0 = prefilter not applicable to this chain
++    std::vector<int32_t> pf_idx;
++
+     void reset() {
+         prev.clear();
+ 
+         llama_sampler_reset(chain);
+     }
+ 
+-    void set_logits(struct llama_context * ctx, int idx) {
++    void set_logits(struct llama_context * ctx, int idx, bool prefilter = false) {
+         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+@@ -152,9 +285,25 @@ struct common_sampler {
+         } else {
+             const auto * logits = llama_get_logits_ith(ctx, idx);
+             GGML_ASSERT(logits != nullptr);
+-            cur.resize(n_vocab);
+-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++
++            if (prefilter && pf_nkeep > 0 && pf_nkeep < n_vocab) {
++                common_sampler_prefilter(logits, n_vocab, pf_nkeep, pf_idx);
++            } else {
++                pf_idx.clear();
++            }
++
++            if (!pf_idx.empty()) {
++                cur.resize(pf_idx.size());
++                for (size_t i = 0; i < pf_idx.size(); ++i) {
++                    const llama_token token_id = pf_idx[i];
++                    cur[i] = llama_token_data{token_id, logits[token_id], 0.0f};
++                }
++            } else {
++                // no candidate above -inf (or prefilter not applicable): build the whole vocabulary
++                cur.resize(n_vocab);
++                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
++                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++                }
+             }
+         }
+ 
+@@ -409,6 +558,8 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
+         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+         /* .cur     = */ {},
+         /* .cur_p   = */ {},
++        /* .pf_nkeep= */ common_sampler_prefilter_nkeep(params, llama_vocab_n_tokens(vocab)),
++        /* .pf_idx  = */ {},
+     };
+ 
+     return result;
+@@ -561,7 +712,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, idx);
++    // The prefilter drops everything that top-k would drop anyway, so it is only equivalent while
++    // nothing else needs the full vocabulary: a grammar masks arbitrary tokens, and a reasoning
++    // budget in FORCING state keeps exactly one token that need not be among the highest logits.
++    const bool prefilter = !grammar_should_apply(gsmpl) &&
++        (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING);
++
++    gsmpl->set_logits(ctx, idx, prefilter);
+ 
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.

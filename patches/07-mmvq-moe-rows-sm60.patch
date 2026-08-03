@@ -1,0 +1,23 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 12b5046..868c226 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -838,7 +838,17 @@ static void mul_mat_vec_q_moe_launch(
+         const uint32_t ncols_dst, const uint32_t ids_stride,
+         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+ 
+-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
++    // This constant is hardcoded and architecture-independent, and the
++    // tuning behind "2 gives best perf" was not done on a GPU without native DP4A.  On sm_60
++    // the same knob in the non-MoE MMVQ kernel was worth +23% when raised from 1 to 4, and
++    // this kernel is 20.1% of a Qwen3.5-MoE decode step (nvprof, GP100).  Raising it to 4 is
++    // worth +1.9% end-to-end decode with the output unchanged bit for bit, and leaves prefill
++    // untouched (661.2 -> 660.9 t/s) because prefill uses MMQ rather than this kernel.
++    //
++    // Measured with production interleaved between candidates and a wait for the GPU to drop
++    // below 62 C before each run: a P100's boost clock sags from 1328 to 1101 MHz over a long
++    // benchmark, which is larger than the effect being measured.
++    constexpr int rows_per_block = 4;
+     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+     const dim3 block_nums(nblocks_rows, nchannels_dst);
+     const dim3 block_dims(warp_size, ncols_dst);

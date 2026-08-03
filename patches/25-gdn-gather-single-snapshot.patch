@@ -1,0 +1,63 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index c123f05..523b64c 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1439,14 +1439,24 @@ struct ggml_backend_cuda_context {
+     // The row indices are saved at the position the GET_ROWS occupied.  Deferring execution lets
+     // galloc reuse the input tensor's addresses for something else in the meantime (which really
+     // happens with the small per-slot compute buffers), so reading them at gdn would be corrupt.
+-    int32_t * gdn_rows_scratch   = nullptr;
+-    size_t    gdn_rows_scratch_n = 0;
++    int32_t *           gdn_rows_scratch   = nullptr;
++    size_t              gdn_rows_scratch_n = 0;
++    // The tensor the snapshot came from; an identical one is not saved again.  Every SSM layer uses
++    // the same index tensor, so once per graph is enough.  Cleared per graph computation.
++    const ggml_tensor * gdn_rows_src       = nullptr;
+ 
++    // Called on every consumption; does not forget gdn_rows_src
+     void gdn_gather_clear() {
+         gdn_gather_node  = nullptr;
+         gdn_gather_owner = nullptr;
+     }
+ 
++    // Called once at the top of a graph computation
++    void gdn_gather_reset_graph() {
++        gdn_gather_clear();
++        gdn_rows_src = nullptr;
++    }
++
+     void q8_1_cache_clear() {
+         q8_1_cache_buf.reset();
+         q8_1_cache_src1   = nullptr;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1f99939..753e306 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3439,9 +3439,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                         CUDA_CHECK(cudaMalloc((void **) &cuda_ctx->gdn_rows_scratch, 4096 * sizeof(int32_t)));
+                         cuda_ctx->gdn_rows_scratch_n = 4096;
+                     }
+-                    CUDA_CHECK(cudaMemcpyAsync(cuda_ctx->gdn_rows_scratch, node->src[1]->data,
+-                                               n_idx * sizeof(int32_t), cudaMemcpyDeviceToDevice,
+-                                               cuda_ctx->stream()));
++                    // Reuse the existing snapshot when the index tensor is the same.  Every SSM
++                    // layer uses the same tensor, so one copy per graph suffices; doing it per
++                    // layer stacks up a 1.8 us device-to-device copy for every layer.
++                    if (cuda_ctx->gdn_rows_src != node->src[1]) {
++                        CUDA_CHECK(cudaMemcpyAsync(cuda_ctx->gdn_rows_scratch, node->src[1]->data,
++                                                   n_idx * sizeof(int32_t), cudaMemcpyDeviceToDevice,
++                                                   cuda_ctx->stream()));
++                        cuda_ctx->gdn_rows_src = node->src[1];
++                    }
+                     cuda_ctx->gdn_gather_node  = node;
+                     cuda_ctx->gdn_gather_owner = gdn;
+                     return GGML_CUDA_FUSE_DEFERRED;
+@@ -4309,7 +4315,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     // Only defer node execution when concurrent streams are not in use: reordering across streams
+     // is unsafe.  The record is cleared per graph computation.
+     const bool                   allow_defer = stream_ctx.concurrent_events.empty();
+-    cuda_ctx->gdn_gather_clear();
++    cuda_ctx->gdn_gather_reset_graph();
+     bool                         is_concurrent_event_active = false;
+     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
+     bool                         should_launch_concurrent_events = false;

@@ -1,0 +1,118 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 8145a9f..f26b830 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1421,6 +1421,22 @@ struct ggml_backend_cuda_context {
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
+ 
++    // Single-slot cache of a matvec's q8_1-quantized activation, so that the second
++    // matmul of a gate/up pair does not redo the identical quantization.  Cleared at the top of
++    // every graph compute because the key holds a tensor pointer, which a later graph may reuse.
++    std::unique_ptr<ggml_cuda_pool_alloc<char>> q8_1_cache_buf;
++    const ggml_tensor *                        q8_1_cache_src1   = nullptr;
++    cudaStream_t                               q8_1_cache_stream = nullptr;
++    size_t                                     q8_1_cache_size   = 0;
++    int64_t                                    q8_1_cache_s[4]   = { 0, 0, 0, 0 };
++
++    void q8_1_cache_clear() {
++        q8_1_cache_buf.reset();
++        q8_1_cache_src1   = nullptr;
++        q8_1_cache_stream = nullptr;
++        q8_1_cache_size   = 0;
++    }
++
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cb1336b..7357351 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -703,6 +703,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
++    // This holds a pool allocation, and the pools are destroyed with the members below,
++    // so it has to go back before they do
++    q8_1_cache_clear();
++
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
+@@ -4106,6 +4110,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    // The q8_1 activation cache keys on a tensor pointer, which a later graph may
++    // reuse for a different tensor, so it must not outlive the graph that filled it
++    cuda_ctx->q8_1_cache_clear();
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e161f5f..a2a8695 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1320,12 +1320,49 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
++    char * src1_q8_1_d = nullptr;
+     {
++        const size_t  q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++
++        // The gate and up matmuls of an FFN share src1, and quantize_row_q8_1_cuda
++        // ignores src0->type, so the second quantization is bit-for-bit the first one.  Reuse it
++        // when the stream matches too -- a buffer written on another stream would need an event.
++        const bool hit = ctx.q8_1_cache_buf &&
++                         ctx.q8_1_cache_src1   == src1 &&
++                         ctx.q8_1_cache_stream == stream &&
++                         ctx.q8_1_cache_size   == q8_1_size &&
++                         ctx.q8_1_cache_s[0]   == ne10_padded &&
++                         ctx.q8_1_cache_s[1]   == s11 &&
++                         ctx.q8_1_cache_s[2]   == s12 &&
++                         ctx.q8_1_cache_s[3]   == s13;
++
++        if (hit) {
++            src1_q8_1_d = ctx.q8_1_cache_buf->get();
++        } else {
++            // The CUDA pool is a stack allocator: it asserts that every free is the top of the
++            // stack.  Release the previous cache entry BEFORE taking a new one, or the new
++            // allocation sits on top of the old and freeing the old aborts.  (The first version of
++            // this patch used unique_ptr::reset(new ...), which allocates first, and it died on
++            // that assert during warmup.  The assert firing rather than corrupting is why holding a
++            // pool allocation across calls is testable at all.)
++            ctx.q8_1_cache_buf.reset();
++            ctx.q8_1_cache_src1 = nullptr;
++            ctx.q8_1_cache_buf.reset(new ggml_cuda_pool_alloc<char>(ctx.pool(), q8_1_size));
++            src1_q8_1_d = ctx.q8_1_cache_buf->get();
++
++            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++
++            ctx.q8_1_cache_src1   = src1;
++            ctx.q8_1_cache_stream = stream;
++            ctx.q8_1_cache_size   = q8_1_size;
++            ctx.q8_1_cache_s[0]   = ne10_padded;
++            ctx.q8_1_cache_s[1]   = s11;
++            ctx.q8_1_cache_s[2]   = s12;
++            ctx.q8_1_cache_s[3]   = s13;
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1351,7 +1388,7 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

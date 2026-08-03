@@ -1,0 +1,38 @@
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 8a0f4d3..41980db 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -301,7 +301,32 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+     }
+ 
+     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
+-        return false;
++        // An arch without native DP4A emulates it, so MMQ loses to
++        // dequantize-to-F16 + cuBLAS -- the same conclusion the gfx900 comment below reaches.
++        // Measured on a Tesla P100 (sm_60) with test-backend-ops perf at n=512, MMQ runs at 0.49x
++        // (q2_K) to 0.61x (iq2_xs) of the cuBLAS path for EVERY quantization tested, and forcing it
++        // on for plain MUL_MAT costs a dense model 56% of its prefill throughput.  So the blanket
++        // exclusion is right for MUL_MAT and must stay.
++        //
++        // MUL_MAT_ID is the exception, because there the alternative is not cuBLAS at all.  With
++        // neither MMQ nor MMF available, ggml_cuda_mul_mat_id() falls through to the sorted-gather
++        // path at the bottom of that function: two cudaStreamSynchronize() per call, an
++        // ne02*ne12*n_expert_used host-side loop, and then one separate mul_mat per expert.  For a
++        // 256-expert model at ubatch 2048 that is thousands of tiny matmuls per layer, and a kernel
++        // running at 0.6x still wins by a wide margin -- measured +36% prefill on Qwen3.5-MoE
++        // (427.9 -> 583.7 t/s), with peak VRAM ~200 MiB lower because the F16 dequantization
++        // scratch buffers disappear.
++        //
++        // The two call sites already distinguish themselves: ggml_cuda_mul_mat passes n_experts = 0,
++        // ggml_cuda_mul_mat_id passes ne02.  Restricting to Pascal keeps pre-Pascal archs, where the
++        // MMQ kernels are untested, on the original path.
++        //
++        // Quality: perplexity over 40 chunks is statistically indistinguishable from the cuBLAS path
++        // (paired dNLL +0.0028 +/- 0.0029, t = 0.96), and against a CPU-backend reference the
++        // MUL_MAT_ID-only build actually sits closer (+0.038%) than the cuBLAS path (+0.224%).
++        if (n_experts == 0 || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL) {
++            return false;
++        }
+     }
+ 
+ #ifdef GGML_CUDA_FORCE_MMQ

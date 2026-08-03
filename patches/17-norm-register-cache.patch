@@ -1,0 +1,127 @@
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 09d9f3a..df4716e 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -127,10 +127,33 @@ static __global__ void rms_norm_f32(const float * x,
+ 
+     float tmp = 0.0f; // partial sum for thread in warp
+ 
++    // x is read twice (once for the sum of squares, once for the scaling).
++    // For a single row the grid is 1 block, so this kernel runs on one SM and is limited by the
++    // bytes it moves through it; on a Tesla P100 the 4096-wide norms of a decode step cost
++    // 7.82 us each, 7075 times per 256 tokens = 1.9% of the decode wall.  When the row fits in
++    // RMS_NORM_MAX_CACHE values per thread, keep it in registers instead and drop the second read.
++    // The <1024> instantiation is the only one launched with a row wide enough to need more than
++    // one value per thread (rms_norm_f32_cuda picks <256> when ncols < 1024), and adding the
++    // branch to the narrow one measured +6% on the 128/256-wide norms, so gate it at compile time.
++    constexpr int  max_cache = 4;
++    constexpr bool do_cache  = block_size >= 1024;
++    const bool cached = do_cache && ncols > block_size && ncols <= max_cache*block_size;
++    float xv[max_cache];
++
+     ggml_cuda_pdl_sync();
+-    for (int col = tid; col < ncols; col += block_size) {
+-        const float xi = x[col];
+-        tmp += xi * xi;
++    if (cached) {
++#pragma unroll
++        for (int k = 0; k < max_cache; ++k) {
++            const int col  = tid + k*block_size;
++            const float xi = col < ncols ? x[col] : 0.0f;
++            xv[k] = xi;
++            tmp  += xi * xi;
++        }
++    } else {
++        for (int col = tid; col < ncols; col += block_size) {
++            const float xi = x[col];
++            tmp += xi * xi;
++        }
+     }
+ 
+     // sum up partial sums
+@@ -140,16 +163,30 @@ static __global__ void rms_norm_f32(const float * x,
+     const float mean = tmp / ncols;
+     const float scale = rsqrtf(mean + eps);
+ 
+-    for (int col = tid; col < ncols; col += block_size) {
++    auto store = [&](const int col, const float xi) {
+         if constexpr (do_multiply && do_add) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+             const int add_col = fastmodulo(col, add_ncols_packed);
+-            dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
++            dst[col]          = scale * xi * mul[mul_col] + add[add_col];
+         } else if constexpr (do_multiply) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+-            dst[col]          = scale * x[col] * mul[mul_col];
++            dst[col]          = scale * xi * mul[mul_col];
+         } else {
+-            dst[col] = scale * x[col];
++            dst[col] = scale * xi;
++        }
++    };
++
++    if (cached) {
++#pragma unroll
++        for (int k = 0; k < max_cache; ++k) {
++            const int col = tid + k*block_size;
++            if (col < ncols) {
++                store(col, xv[k]);
++            }
++        }
++    } else {
++        for (int col = tid; col < ncols; col += block_size) {
++            store(col, x[col]);
+         }
+     }
+ }
+@@ -258,10 +295,26 @@ static __global__ void l2_norm_f32(
+ 
+     float tmp = 0.0f; // partial sum for thread in warp
+ 
++    // Same double read as rms_norm_f32 above; cache the row in registers
++    // when it fits so the scaling pass does not go back to memory.
++    constexpr int max_cache = 4;
++    const bool cached = ncols > block_size && ncols <= max_cache*block_size;
++    float xv[max_cache];
++
+     ggml_cuda_pdl_sync();
+-    for (int col = tid; col < ncols; col += block_size) {
+-        const float xi = x[col];
+-        tmp += xi * xi;
++    if (cached) {
++#pragma unroll
++        for (int k = 0; k < max_cache; ++k) {
++            const int col  = tid + k*block_size;
++            const float xi = col < ncols ? x[col] : 0.0f;
++            xv[k] = xi;
++            tmp  += xi * xi;
++        }
++    } else {
++        for (int col = tid; col < ncols; col += block_size) {
++            const float xi = x[col];
++            tmp += xi * xi;
++        }
+     }
+ 
+     // sum up partial sums
+@@ -272,8 +325,18 @@ static __global__ void l2_norm_f32(
+     // from https://pytorch.org/docs/stable/generated/torch.nn.functional.normalize.html
+     const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+ 
+-    for (int col = tid; col < ncols; col += block_size) {
+-        dst[col] = scale * x[col];
++    if (cached) {
++#pragma unroll
++        for (int k = 0; k < max_cache; ++k) {
++            const int col = tid + k*block_size;
++            if (col < ncols) {
++                dst[col] = scale * xv[k];
++            }
++        }
++    } else {
++        for (int col = tid; col < ncols; col += block_size) {
++            dst[col] = scale * x[col];
++        }
+     }
+ }
+ 

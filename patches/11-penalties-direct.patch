@@ -1,0 +1,61 @@
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 6520e41..df6649e 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -2678,7 +2678,48 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
+         return;
+     }
+ 
++    // The loop below probes token_count once per candidate, but token_count never holds more than
++    // penalty_last_n entries (64 by default) while cur_p is the whole vocabulary whenever penalties
++    // runs first in the chain, which is the default order.  On Qwen3 (n_vocab 151936) that is one
++    // hash lookup per candidate of which at most 64 can hit -- roughly one lookup in 2400 does any
++    // work.  Measured on a llama-server decode loop it costs 0.78 ms per token: 5.3% of end-to-end
++    // throughput on a Tesla P100, and a larger share on faster hardware, since the cost is on the
++    // host and does not shrink with the GPU.  Vocabularies keep growing (Gemma 3 is 262144), so it
++    // gets worse over time.
++    //
++    // Walk the penalised tokens instead, when that is provably equivalent.  Every in-tree producer
++    // of cur_p builds it with unique token ids, so if position `id` holds token `id` then it is the
++    // only entry for that token and writing it directly is complete.  Verifying that for every
++    // entry of token_count costs at most penalty_last_n comparisons; if any entry fails (another
++    // sampler has already reordered or truncated cur_p) fall back to the original scan, which stays
++    // correct in every case.
++    bool direct = true;
++    for (const auto & kv : ctx->token_count) {
++        if ((size_t) kv.first >= cur_p->size || cur_p->data[kv.first].id != kv.first) {
++            direct = false;
++            break;
++        }
++    }
++
+     // Apply frequency and presence penalties to the cur_p
++    if (direct) {
++        for (const auto & kv : ctx->token_count) {
++            const int count = kv.second;
++
++            assert(count > 0 && count <= ctx->penalty_last_n);
++
++            auto & cand = cur_p->data[kv.first];
++
++            // same arithmetic as the scan below, in the same order per token
++            if (cand.logit <= 0) {
++                cand.logit *= ctx->penalty_repeat;
++            } else {
++                cand.logit /= ctx->penalty_repeat;
++            }
++
++            cand.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
++        }
++    } else {
+     for (size_t i = 0; i < cur_p->size; ++i) {
+         const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+         if (token_iter == ctx->token_count.end()) {
+@@ -2699,6 +2740,7 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
+ 
+         cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+     }
++    }
+ 
+     cur_p->sorted = false;
+ }

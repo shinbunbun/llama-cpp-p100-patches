@@ -1,0 +1,515 @@
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index 8360e02..c10a065 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -78,6 +78,60 @@ static __global__ void cpy_scalar_fastdiv(const char * cx, char * cdst, const in
+     cpy_1(cx + x_offset, cdst + dst_offset);
+ }
+ 
++// Merge a run of identically shaped copies into a single kernel.
++// Qwen3.5's linear-attention layers snapshot the conv state into one slot per rollback slot
++// (K = n_rs_seq + 1 = 5), so five cpy_scalar_fastdiv launches sit back to back per layer per
++// decode step.  Measured on a P100 each costs 2.53 us plus 0.65 us of launch gap while moving only
++// 98 KB -- almost entirely fixed cost.  Once the host has verified that the destinations do not
++// overlap each other or any input, they become one launch that selects the copy by grid.y.
++// Per-element arithmetic is unchanged, so the output is bit-identical.
++struct cpy_fused_ptrs {
++    const char * cx  [CUDA_CPY_FUSE_MAX];
++    char *       cdst[CUDA_CPY_FUSE_MAX];
++};
++
++template <cpy_kernel_t cpy_1>
++static __global__ void cpy_scalar_fastdiv_fused(const cpy_fused_ptrs p, const int ne,
++                                  const uint3 fd_s0, const uint3 fd_s1, const uint3 fd_s2,
++                                  const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++                                  const uint3 fd_d0, const uint3 fd_d1, const uint3 fd_d2,
++                                  const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
++    ggml_cuda_pdl_lc();
++    const int i = blockDim.x*blockIdx.x + threadIdx.x;
++
++    if (i >= ne) {
++        return;
++    }
++
++    uint32_t r = (uint32_t) i;
++    const uint32_t i03 = fastdiv(r, fd_s2); r -= i03*fd_s2.z;
++    const uint32_t i02 = fastdiv(r, fd_s1); r -= i02*fd_s1.z;
++    const uint32_t i01 = fastdiv(r, fd_s0);
++    const uint32_t i00 = r - i01*fd_s0.z;
++    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
++
++    uint32_t q = (uint32_t) i;
++    const uint32_t i13 = fastdiv(q, fd_d2); q -= i13*fd_d2.z;
++    const uint32_t i12 = fastdiv(q, fd_d1); q -= i12*fd_d1.z;
++    const uint32_t i11 = fastdiv(q, fd_d0);
++    const uint32_t i10 = q - i11*fd_d0.z;
++    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
++
++    // Indexing the parameter struct at runtime spills it to per-thread local memory (128 B stack
++    // frame) and is 2.7x slower.  Unroll so every index is a constant.  blockIdx.y has to be taken
++    // into an int local before it is compared, or the spill comes back.
++    const char * cx   = p.cx[0];
++    char *       cdst = p.cdst[0];
++    const int    ky   = (int) blockIdx.y;
++#pragma unroll
++    for (int k = 1; k < CUDA_CPY_FUSE_MAX; ++k) {
++        if (ky == k) { cx = p.cx[k]; cdst = p.cdst[k]; }
++    }
++
++    ggml_cuda_pdl_sync();
++    cpy_1(cx + x_offset, cdst + dst_offset);
++}
++
+ template <typename T>
+ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
+                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+@@ -659,6 +713,88 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+     }
+ }
+ 
++// Execute nodes[0..n) as a single CPY launch and return true, if that is possible.
++// Independence has already been checked on the graph side; this only decides whether one kernel
++// can express all of them.
++bool ggml_cuda_cpy_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n) {
++    if (n < 2 || n > CUDA_CPY_FUSE_MAX) {
++        return false;
++    }
++
++    const ggml_tensor * src0 = nodes[0]->src[0];
++    const ggml_tensor * src1 = nodes[0]->src[1];
++
++    // Restrict to non-contiguous f32 -> f32 copies, i.e. the cpy_scalar_fastdiv path
++    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
++        return false;
++    }
++
++    // Shape and strides must match exactly -- only the data pointers may differ
++    for (int k = 1; k < n; ++k) {
++        const ggml_tensor * s = nodes[k]->src[0];
++        const ggml_tensor * d = nodes[k]->src[1];
++        if (!s || !d || s->type != src0->type || d->type != src1->type) {
++            return false;
++        }
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            if (s->ne[i] != src0->ne[i] || s->nb[i] != src0->nb[i] ||
++                d->ne[i] != src1->ne[i] || d->nb[i] != src1->nb[i]) {
++                return false;
++            }
++        }
++    }
++
++    const int64_t ne = ggml_nelements(src0);
++    if (ne != ggml_nelements(src1)) {
++        return false;
++    }
++
++    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2];
++    const int64_t nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
++    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2];
++    const int64_t nb10 = src1->nb[0], nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
++
++    // Contiguous copies, 2D memcpy and transposes each have their own fast path; leave them alone
++    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
++        return false;
++    }
++    size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
++    if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
++        return false;
++    }
++    if (nb01 == (int64_t) ggml_element_size(src0) && src0->ne[3] == 1 &&
++        nb02 == ne00*ne01*(int64_t) ggml_element_size(src0)) {
++        return false;
++    }
++
++    // Precondition of the fastdiv path: the indices fit in 32 bits
++    const int64_t s2 = ne00*ne01*ne02;
++    const int64_t d2 = ne10*ne11*ne12;
++    if (ne > INT_MAX || s2 <= 0 || d2 <= 0 || s2 > UINT_MAX || d2 > UINT_MAX) {
++        return false;
++    }
++
++    cpy_fused_ptrs p = {};
++    for (int k = 0; k < n; ++k) {
++        p.cx[k]   = (const char *) nodes[k]->src[0]->data;
++        p.cdst[k] = (char *)       nodes[k]->src[1]->data;
++    }
++
++    const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
++    GGML_ASSERT(num_blocks <= INT_MAX);
++    const dim3 grid((unsigned int) num_blocks, (unsigned int) n, 1);
++    const ggml_cuda_kernel_launch_params launch_params =
++        ggml_cuda_kernel_launch_params(grid, CUDA_CPY_BLOCK_SIZE, 0, ctx.stream());
++    ggml_cuda_kernel_launch(cpy_scalar_fastdiv_fused<cpy_1_scalar<float, float>>, launch_params,
++        p, (int) ne,
++        init_fastdiv_values(ne00), init_fastdiv_values(ne00*ne01), init_fastdiv_values(s2),
++        nb00, nb01, nb02, nb03,
++        init_fastdiv_values(ne10), init_fastdiv_values(ne10*ne11), init_fastdiv_values(d2),
++        nb10, nb11, nb12, nb13);
++
++    return true;
++}
++
+ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     ggml_cuda_cpy(ctx, src0, dst);
+diff --git a/ggml/src/ggml-cuda/cpy.cuh b/ggml/src/ggml-cuda/cpy.cuh
+index a7a87d8..d7dcdce 100644
+--- a/ggml/src/ggml-cuda/cpy.cuh
++++ b/ggml/src/ggml-cuda/cpy.cuh
+@@ -4,4 +4,10 @@
+ 
+ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1);
+ 
++// Merge a run of identically shaped CPY nodes into one launch (implementation and preconditions
++// in cpy.cu)
++#define CUDA_CPY_FUSE_MAX 8
++
++bool ggml_cuda_cpy_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n);
++
+ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7357351..5917932 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3148,6 +3148,124 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     return false;
+ }
+ 
++// Sibling fusion: merge a run of identically shaped nodes to cut the number of launches.
++// Unlike topk-moe or rope+set_rows this removes no intermediate node -- every node is still
++// computed -- so the only requirement is that reordering them cannot change the result: the
++// destinations must not overlap each other, nor any other node's source.  That is checked here as
++// byte ranges.
++static bool ggml_cuda_fuse_nodes_disjoint(ggml_tensor ** nodes, int n, int dst_src_idx) {
++    auto range_of = [](const ggml_tensor * t, const char *& beg, const char *& end) {
++        beg = (const char *) t->data;
++        end = beg + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
++    };
++    auto overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
++        if (!a || !b || !a->data || !b->data || !a->buffer || !b->buffer) {
++            return true; // anything we cannot decide counts as overlapping, i.e. do not fuse
++        }
++        const char * as; const char * ae; const char * bs; const char * be;
++        range_of(a, as, ae);
++        range_of(b, bs, be);
++        return as < be && bs < ae;
++    };
++
++    for (int a = 0; a < n; ++a) {
++        // dst_src_idx >= 0 means src[dst_src_idx] is the destination (CPY); otherwise the node is
++        const ggml_tensor * dst_a = dst_src_idx >= 0 ? nodes[a]->src[dst_src_idx] : nodes[a];
++        if (!dst_a) {
++            return false;
++        }
++        for (int b = 0; b < n; ++b) {
++            if (a == b) {
++                continue;
++            }
++            const ggml_tensor * dst_b = dst_src_idx >= 0 ? nodes[b]->src[dst_src_idx] : nodes[b];
++            if (overlap(dst_a, dst_b)) {
++                return false;
++            }
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                const ggml_tensor * src_b = nodes[b]->src[s];
++                if (!src_b) {
++                    continue;
++                }
++                if (dst_src_idx >= 0 && s == dst_src_idx) {
++                    continue; // destination-vs-destination was handled above
++                }
++                if (overlap(dst_a, src_b)) {
++                    return false;
++                }
++            }
++        }
++    }
++
++    return true;
++}
++
++// Recover the index of the last accepted node after nodes[] has been compacted
++static int ggml_cuda_node_index_of(const ggml_cgraph * cgraph, int from, const ggml_tensor * t) {
++    for (int j = from; j < cgraph->n_nodes; ++j) {
++        if (cgraph->nodes[j] == t) {
++            return j;
++        }
++    }
++    return from;
++}
++
++// Diagnostics for when fusion does not fire.  GGML_CUDA_FUSE_LOG=2 dumps the neighbourhood of the
++// candidate nodes and the outcome of each test.  The assumption "nodes with the same op are
++// adjacent" is easily broken by no-ops and by allocation order, and without this a failure costs a
++// full build-and-trace cycle to diagnose.
++static void ggml_cuda_fuse_diag(const ggml_cgraph * cgraph, int i, int collected, int disjoint, int launched) {
++    static int level   = getenv("GGML_CUDA_FUSE_LOG") ? std::atoi(getenv("GGML_CUDA_FUSE_LOG")) : 0;
++    static int printed = 0;
++    if (level < 2 || printed++ >= 12) {
++        return;
++    }
++    char   buf[512];
++    size_t p = 0;
++    for (int j = i; j < cgraph->n_nodes && j < i + 8 && p + 64 < sizeof(buf); ++j) {
++        p += snprintf(buf + p, sizeof(buf) - p, "%s%s[f%x]", j == i ? "" : " -> ",
++                      ggml_op_name(cgraph->nodes[j]->op), (unsigned) cgraph->nodes[j]->flags);
++    }
++    GGML_LOG_INFO("ggml_cuda_fuse_diag: i=%d collected=%d disjoint=%d launched=%d | %s\n",
++                  i, collected, disjoint, launched, buf);
++}
++
++// Fire confirmation: with GGML_CUDA_FUSE_LOG=1, print once per rule, so that "did it fire at all"
++// can be answered without running a profiler.
++static void ggml_cuda_fuse_log(const char * rule, int n) {
++    static bool enabled = getenv("GGML_CUDA_FUSE_LOG") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_LOG"));
++    if (!enabled) {
++        return;
++    }
++    static int printed = 0;
++    if (printed++ < 8) {
++        GGML_LOG_INFO("ggml_cuda_fuse: %s x%d\n", rule, n);
++    }
++}
++
++// Collect a run of up to max_n consecutive nodes with the same op and return the index of the last
++// one in *last_idx.  No-ops (view / reshape / permute) are skipped by the main loop, so they are
++// ignored here too.  Missing that makes fusion never fire on any graph that routes through
++// ggml_view_* -- which is exactly what Qwen3.5's conv state and q/k l2_norm do.
++static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, int max_n,
++                                     ggml_tensor ** out, int * last_idx) {
++    int n = 0;
++    *last_idx = i;
++    for (int j = i; j < cgraph->n_nodes && n < max_n; ++j) {
++        ggml_tensor * node = cgraph->nodes[j];
++        // Nodes the main loop skips (no-ops, non-COMPUTE) are not fusion candidates either
++        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            continue;
++        }
++        if (node->op != op) {
++            break;
++        }
++        out[n++]  = node;
++        *last_idx = j;
++    }
++    return n;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -3172,6 +3290,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Merge runs of identically shaped CPY / L2_NORM nodes into one launch each
++    if (node->op == GGML_OP_CPY) {
++        static bool disable_cpy = getenv("GGML_CUDA_DISABLE_FUSE_CPY") != nullptr &&
++                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_CPY"));
++        if (!disable_cpy) {
++            ggml_tensor * nodes[CUDA_CPY_FUSE_MAX];
++            int last_idx = i;
++            int n = ggml_cuda_collect_same_op(cgraph, i, GGML_OP_CPY, CUDA_CPY_FUSE_MAX, nodes, &last_idx);
++            const int collected = n;
++            while (n >= 2 && !ggml_cuda_fuse_nodes_disjoint(nodes, n, /*dst_src_idx =*/ 1)) {
++                --n;
++                last_idx = ggml_cuda_node_index_of(cgraph, i, nodes[n - 1]);
++            }
++            const bool launched = n >= 2 && ggml_cuda_cpy_fused(*cuda_ctx, nodes, n);
++            ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
++            if (launched) {
++                ggml_cuda_fuse_log("cpy", n);
++                return last_idx - i;
++            }
++        }
++    }
++
++    if (node->op == GGML_OP_L2_NORM) {
++        static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
++                                 std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
++        if (!disable_l2) {
++            ggml_tensor * nodes[CUDA_L2_NORM_FUSE_MAX];
++            int last_idx = i;
++            int n = ggml_cuda_collect_same_op(cgraph, i, GGML_OP_L2_NORM, CUDA_L2_NORM_FUSE_MAX, nodes, &last_idx);
++            const int collected = n;
++            while (n >= 2 && !ggml_cuda_fuse_nodes_disjoint(nodes, n, /*dst_src_idx =*/ -1)) {
++                --n;
++                last_idx = ggml_cuda_node_index_of(cgraph, i, nodes[n - 1]);
++            }
++            const bool launched = n >= 2 && ggml_cuda_l2_norm_fused(*cuda_ctx, nodes, n);
++            ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
++            if (launched) {
++                ggml_cuda_fuse_log("l2_norm", n);
++                return last_idx - i;
++            }
++        }
++    }
++
+     //topk-moe
+     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index df4716e..b78ba38 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -340,6 +340,147 @@ static __global__ void l2_norm_f32(
+     }
+ }
+ 
++// Merge a run of identically shaped l2_norm calls into a single launch.
++// Qwen3.5's linear-attention layers call l2_norm back to back on two views of the same tensor
++// (q_conv / k_conv).  Measured on a P100 each call takes 2.26 us while doing only 16 blocks x 32
++// threads of work, so it is almost entirely launch overhead.  Extending grid.x to nrows*n merges
++// them.  The in-block reduction order is unchanged, so the output is bit-identical.
++struct l2_norm_fused_ptrs {
++    const float * x  [CUDA_L2_NORM_FUSE_MAX];
++    float *       dst[CUDA_L2_NORM_FUSE_MAX];
++};
++
++template <int block_size>
++static __global__ void l2_norm_f32_fused(
++        const l2_norm_fused_ptrs p, const int nrows, const int ncols, const int64_t stride_row,
++        const int64_t stride_channel, const int64_t stride_sample, const float eps) {
++    const int nchannels = gridDim.y;
++
++    const int k         = blockIdx.x / nrows;
++    const int row       = blockIdx.x - k*nrows;
++    const int channel   = blockIdx.y;
++    const int sample    = blockIdx.z;
++    const int tid       = threadIdx.x;
++
++    // Constant indices, for the same reason as in cpy.cu: a runtime index spills the parameter
++    // struct to local memory.
++    const float * xb = p.x[0];
++    float *       db = p.dst[0];
++#pragma unroll
++    for (int j = 1; j < CUDA_L2_NORM_FUSE_MAX; ++j) {
++        if (k == j) { xb = p.x[j]; db = p.dst[j]; }
++    }
++
++    const float * x = xb + sample*stride_sample + channel*stride_channel + row*stride_row;
++    float *     dst = db + ((sample*nchannels + channel)*nrows + row)*(int64_t) ncols;
++
++    float tmp = 0.0f; // partial sum for thread in warp
++
++    ggml_cuda_pdl_sync();
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = x[col];
++        tmp += xi * xi;
++    }
++
++    // sum up partial sums
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++    ggml_cuda_pdl_lc();
++
++    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
++
++    for (int col = tid; col < ncols; col += block_size) {
++        dst[col] = scale * x[col];
++    }
++}
++
++// Execute nodes[0..n) as a single L2_NORM launch and return true, if that is possible.
++// Independence has already been checked on the graph side; this only decides whether one kernel
++// can express all of them.
++bool ggml_cuda_l2_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n) {
++    if (n < 2 || n > CUDA_L2_NORM_FUSE_MAX) {
++        return false;
++    }
++
++    const ggml_tensor * src0 = nodes[0]->src[0];
++
++    if (src0->type != GGML_TYPE_F32 || nodes[0]->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_is_contiguous(nodes[0])) {
++        return false;
++    }
++
++    float eps;
++    memcpy(&eps, nodes[0]->op_params, sizeof(float));
++    if (!(eps >= 0.0f)) {
++        return false;
++    }
++
++    const size_t ts0 = ggml_type_size(src0->type);
++    if (src0->nb[0] != ts0) {
++        return false;
++    }
++
++    // Shape, strides and eps must match exactly -- only the data pointers may differ
++    for (int k = 1; k < n; ++k) {
++        const ggml_tensor * s = nodes[k]->src[0];
++        if (!s || s->type != GGML_TYPE_F32 || nodes[k]->type != GGML_TYPE_F32) {
++            return false;
++        }
++        if (!ggml_is_contiguous(nodes[k])) {
++            return false;
++        }
++        float eps_k;
++        memcpy(&eps_k, nodes[k]->op_params, sizeof(float));
++        if (memcmp(&eps_k, &eps, sizeof(float)) != 0) {
++            return false;
++        }
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            if (s->ne[i] != src0->ne[i] || s->nb[i] != src0->nb[i] ||
++                nodes[k]->ne[i] != nodes[0]->ne[i] || nodes[k]->nb[i] != nodes[0]->nb[i]) {
++                return false;
++            }
++        }
++    }
++
++    const int64_t ncols     = src0->ne[0];
++    const int64_t nrows     = src0->ne[1];
++    const int64_t nchannels = src0->ne[2];
++    const int64_t nsamples  = src0->ne[3];
++
++    if (nrows*n > INT_MAX) {
++        return false;
++    }
++
++    l2_norm_fused_ptrs p = {};
++    for (int k = 0; k < n; ++k) {
++        p.x[k]   = (const float *) nodes[k]->src[0]->data;
++        p.dst[k] = (float *)       nodes[k]->data;
++    }
++
++    const int64_t s01 = src0->nb[1] / ts0;
++    const int64_t s02 = src0->nb[2] / ts0;
++    const int64_t s03 = src0->nb[3] / ts0;
++
++    const dim3 blocks_num((unsigned int) (nrows*n), (unsigned int) nchannels, (unsigned int) nsamples);
++    if (ncols < 1024) {
++        const dim3 block_dims(WARP_SIZE, 1, 1);
++        const ggml_cuda_kernel_launch_params launch_params =
++            ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, ctx.stream()};
++        ggml_cuda_kernel_launch(l2_norm_f32_fused<WARP_SIZE>, launch_params,
++            p, (int) nrows, (int) ncols, s01, s02, s03, eps);
++    } else {
++        const dim3 block_dims(1024, 1, 1);
++        const ggml_cuda_kernel_launch_params launch_params =
++            ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32*sizeof(float), ctx.stream()};
++        ggml_cuda_kernel_launch(l2_norm_f32_fused<1024>, launch_params,
++            p, (int) nrows, (int) ncols, s01, s02, s03, eps);
++    }
++
++    return true;
++}
++
+ static void norm_f32_cuda(
+         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index a74f637..489d3d4 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -15,4 +15,10 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+ 
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// Merge a run of identically shaped L2_NORM nodes into one launch (implementation and
++// preconditions in norm.cu)
++#define CUDA_L2_NORM_FUSE_MAX 4
++
++bool ggml_cuda_l2_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n);
++
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

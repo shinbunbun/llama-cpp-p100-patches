@@ -1,0 +1,167 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f7e5c77..8d46490 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3406,6 +3406,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Fuse ADD -> UNARY -> MUL into one launch (Qwen3.5's gate preprocessing).  These three
++    // launches are 0.65% of decode GPU time, dominated by launch overhead rather than work.
++    if (node->op == GGML_OP_ADD) {
++        static bool disable_aum = getenv("GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL") != nullptr &&
++                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL"));
++        if (!disable_aum) {
++            static const ggml_op aum_ops[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
++            int idxs[3];
++            if (ggml_cuda_collect_ops(cgraph, i, aum_ops, 3, idxs)) {
++                // All three destinations are written, so nothing is eliminated: list them all
++                // in outputs
++                const int outs[3] = { idxs[0], idxs[1], idxs[2] };
++                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, aum_ops, outs, 3) &&
++                    ggml_cuda_op_fused_add_unary_mul(*cuda_ctx, cgraph->nodes[idxs[0]],
++                                                     cgraph->nodes[idxs[1]], cgraph->nodes[idxs[2]])) {
++                    ggml_cuda_fuse_log("add_unary_mul", 3);
++                    return idxs[2] - i;
++                }
++            }
++        }
++    }
++
+     if (node->op == GGML_OP_L2_NORM) {
+         static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
+                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 4cb805f..2b06922 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -627,6 +627,113 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+     }
+ }
+ 
++/* fused add + unary + mul */
++
++// Qwen3.5's linear-attention layers emit, once per layer,
++//   gate = mul(softplus(add(alpha, ssm_dt.bias)), ssm_a)
++// The tensors hold only num_v_heads * n_tokens elements (32..160), so all three kernels finish
++// instantly and the measured 8-10 us is almost entirely launch overhead.  Upstream does fuse
++// UNARY+MUL, but it requires ggml_are_same_shape, which fails once n_tokens > 1 (the
++// speculative-decoding verify batch), and the preceding ADD always passes through untouched.
++//
++// Both intermediates (the ADD and UNARY destinations) are still written, so no node is
++// eliminated.  The safety condition is therefore just "the ops are ADD, UNARY, MUL" and "the
++// chain is connected": other readers of the intermediates still see the same values, and the
++// output is bit-identical.
++template <float (*op)(float)>
++static __global__ void fused_add_unary_mul_f32(const float * __restrict__ a,
++                                               const float * __restrict__ bias,
++                                               const float * __restrict__ scale,
++                                               float * __restrict__ d_add,
++                                               float * __restrict__ d_un,
++                                               float * __restrict__ d_mul,
++                                               const int     ne0,
++                                               const int64_t nrows) {
++    const int64_t row = (int64_t) blockIdx.x;
++    if (row >= nrows) {
++        return;
++    }
++
++    const int64_t off = row * (int64_t) ne0;
++
++    for (int col = threadIdx.x; col < ne0; col += (int) blockDim.x) {
++        const float t0 = a[off + col] + bias[col];
++        d_add[off + col] = t0;
++
++        const float t1 = op(t0);
++        d_un[off + col] = t1;
++
++        d_mul[off + col] = t1 * scale[col];
++    }
++}
++
++// A small weight that broadcasts along rows only (ne0 matches, the rest are 1)
++static bool ggml_cuda_is_row_broadcast(const ggml_tensor * t, const ggml_tensor * full) {
++    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
++           t->ne[0] == full->ne[0] && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
++}
++
++template <float (*op)(float)>
++static void ggml_cuda_op_fused_add_unary_mul_impl(ggml_backend_cuda_context & ctx,
++                                                  ggml_tensor * add_node,
++                                                  ggml_tensor * unary_node,
++                                                  ggml_tensor * mul_node) {
++    const int64_t ne0   = add_node->ne[0];
++    const int64_t nrows = ggml_nrows(add_node);
++    const int     block = (int) std::min<int64_t>(256, ((ne0 + 31) / 32) * 32);
++
++    const ggml_cuda_kernel_launch_params launch_params =
++        ggml_cuda_kernel_launch_params((dim3) nrows, block, 0, ctx.stream());
++
++    ggml_cuda_kernel_launch(fused_add_unary_mul_f32<op>, launch_params,
++                            (const float *) add_node->src[0]->data,
++                            (const float *) add_node->src[1]->data,
++                            (const float *) mul_node->src[1]->data,
++                            (float *) add_node->data,
++                            (float *) unary_node->data,
++                            (float *) mul_node->data,
++                            (int) ne0, nrows);
++}
++
++bool ggml_cuda_op_fused_add_unary_mul(ggml_backend_cuda_context & ctx,
++                                      ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node) {
++    // The chain must be connected; for both ADD and MUL the larger operand is src[0]
++    if (unary_node->src[0] != add_node || mul_node->src[0] != unary_node) {
++        return false;
++    }
++    if (!add_node->src[0] || !add_node->src[1] || !mul_node->src[1]) {
++        return false;
++    }
++
++    // All F32, contiguous, identically shaped
++    for (const ggml_tensor * t : { (const ggml_tensor *) add_node->src[0], (const ggml_tensor *) add_node,
++                                   (const ggml_tensor *) unary_node,       (const ggml_tensor *) mul_node }) {
++        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, add_node)) {
++            return false;
++        }
++    }
++
++    // The addend and the multiplier broadcast along rows (ssm_dt.bias / ssm_a)
++    if (!ggml_cuda_is_row_broadcast(add_node->src[1], add_node) ||
++        !ggml_cuda_is_row_broadcast(mul_node->src[1], add_node)) {
++        return false;
++    }
++
++    switch (ggml_get_unary_op(unary_node)) {
++        case GGML_UNARY_OP_SOFTPLUS:
++            ggml_cuda_op_fused_add_unary_mul_impl<op_softplus>(ctx, add_node, unary_node, mul_node);
++            return true;
++        case GGML_UNARY_OP_SILU:
++            ggml_cuda_op_fused_add_unary_mul_impl<op_silu>(ctx, add_node, unary_node, mul_node);
++            return true;
++        case GGML_UNARY_OP_SIGMOID:
++            ggml_cuda_op_fused_add_unary_mul_impl<op_sigmoid>(ctx, add_node, unary_node, mul_node);
++            return true;
++        default:
++            return false;
++    }
++}
++
+ /* fused relu + sqr */
+ 
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 81ed873..6d8647c 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -91,6 +91,11 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+ 
++// Fuse ADD -> UNARY -> MUL into one launch.  Returns false without launching anything when the
++// shapes do not qualify.
++bool ggml_cuda_op_fused_add_unary_mul(ggml_backend_cuda_context & ctx,
++                                      ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node);
++
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
+ 
+ __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {

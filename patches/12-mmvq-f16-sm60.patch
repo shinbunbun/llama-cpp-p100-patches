@@ -1,0 +1,527 @@
+diff --git a/ggml/src/ggml-cuda/mmvq-f16-sm60.cu b/ggml/src/ggml-cuda/mmvq-f16-sm60.cu
+new file mode 100644
+index 0000000..104e62a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-f16-sm60.cu
+@@ -0,0 +1,479 @@
++// Q4_1 GEMV specialised for sm_60 (GP100), built on HFMA2.
++//
++// GP100 has no DP4A, so llama.cpp emulates the 4x int8 dot product with a chain of four PTX vmad.
++// Instruction throughput measured on this card:
++//     VMAD  = 32 lane-op/clk/SM (half rate)
++//     HFMA2 = 61.5 warp-inst/clk/SM (full rate, two MACs per instruction)
++//     LOP3  = full rate;  PRMT / SHR / BFE = half rate;  I2F / F2F = 1/4 rate
++// Per issue slot that makes HFMA2 worth 4x VMAD in MACs.
++//
++// So the 4-bit nibbles are expanded to half2 using LOP3 magic constants only -- no integer-to-float
++// conversion instruction anywhere -- and accumulated with HFMA2.  The activations are prepared as
++// half rather than int8, so the kernel contains no conversions either.
++//
++// Measured on the real kernel: +9.4% at width 5 (the speculative-decoding verify batch).  An upper
++// bound that makes MMVQ's arithmetic entirely free is +11%, so this takes 85% of what is there.
++//
++// The magic constants:
++//   fp16 0x6400 is exponent 25 with zero mantissa, i.e. exactly 1024.0.  ORing a 0..15 nibble into
++//   the low 4 mantissa bits yields exactly 1024+q, because every integer in 1024..2047 is exact in
++//   fp16.  Likewise 0x5400 = 64.0 takes a nibble in mantissa bits 4-7 and yields exactly 64+q,
++//   which extracts q4_1's "high nibble = element i+16" without a shift.  Subtracting 1024 / 64 is
++//   exact in both operands (Sterbenz), so the dequantization introduces no error.
++//
++//   Folding that subtraction into the HFMA2 as w = d*v + (m - 1024*d) does NOT work: d*v and the
++//   constant term are the same order of magnitude and cancel, which overruns fp16's 11 significant
++//   bits.  Form v-1024 exactly first and apply the scale once after the dot product, in float.
++//
++// Layout:
++//   Weights are read straight from the GGUF block_q4_1 -- no requantization.  Only the activations
++//   are converted to half.  LOP3 produces half2 pairs (i, i+2), so the activations are stored in
++//   that same order; the quantize kernel absorbs the permutation at no runtime cost.
++
++#include "mmvq-f16-sm60.cuh"
++
++#include <cstdlib>
++
++#define A16_QK     32 // elements per block, matching block_q4_1
++#define A16_NWARPS  4
++#define A16_ROWS    4 // output rows per CUDA block
++#define A16_QG      8 // lanes cooperating on one block in the quantize kernel
++#define A16_QBLOCK 128 // ... and its block size
++
++// The activations are split into two arrays: a contiguous run of quantized values, and one scale
++// pair per block.
++//
++// A first version packed both into a single 80-byte struct and came out 2.38x SLOWER than upstream.
++// MMVQ on sm_60 is limited by activation loads rather than by instruction count (see the
++// rows-per-block patch), so an interleaved header that raises bytes-per-element turns directly into
++// time.  Split, 32 elements cost 64 B contiguous plus 4 B in a separate array; with A16_ROWS = 4
++// halving the per-row re-reads, width 5 works out to 5*68/(4*32) = 2.66 B per weight row, below
++// upstream's 5*36/(2*32) = 2.81.
++//
++// Order (matched to the half2 pairs LOP3 produces):
++//   aq[b*16 + 4k + 0] = (a[4k+0],  a[4k+2])    <- low nibbles  (elements 0..15)
++//   aq[b*16 + 4k + 1] = (a[4k+16], a[4k+18])   <- high nibbles (elements 16..31)
++//   aq[b*16 + 4k + 2] = (a[4k+1],  a[4k+3])
++//   aq[b*16 + 4k + 3] = (a[4k+17], a[4k+19])
++// One thread owns k = 2h, 2h+1 (h = 0 or 1) and therefore reads the 32 contiguous bytes
++// aq[b*16 + h*8 .. +7].  Consecutive threads read consecutive 32-byte spans, so a warp's access is
++// fully coalesced.
++
++// Quantize the f32 activations.  A16_QG lanes cooperate on one block of A16_QK elements.
++//
++// Originally one thread owned a whole block.  This kernel launches as often as the GEMV itself
++// (18,094 times in one trace window) yet cost 4.78 us per call, and TRIPLING its work
++// (gridX 2 -> 6) did not change that time -- so it was limited neither by SM count nor by
++// bandwidth, but by the dependency chain inside a thread: a 32-step sequential max followed by a
++// 32-step sequential sum.  Spreading a block over G lanes cuts the chain by G and lands at
++// 2.0-2.6 us/call, essentially the 1.9 us launch floor measured for small kernels on this card.
++//
++// G = 8 is optimal: elements 4k..4k+3 and 4k+16..4k+19 each fall inside a single lane, so the
++// output permutation below stays lane-local and needs no shuffle.  Splitting across the whole warp
++// (G = 32) needs a shuffle to collect the output and is slower.  Measured us/call
++// (4096x5 / 12288x5): G=1 4.88/6.29, G=2 2.63/3.62, G=4 2.29/2.99, G=8 2.25/2.64, G=32 2.62/3.90.
++//
++// Keeping one thread per block and turning the sum into a tree instead is 20% slower (5.84 us at
++// 4096x5): 32 partial sums have to live in registers, and registers bind before the chain does.
++// Break the chain by splitting threads, not by restructuring within a thread.
++template <bool vec4>
++static __global__ void quantize_a16(
++        const float * __restrict__ x, half2 * __restrict__ aq, half2 * __restrict__ ads,
++        const int s01, const int nblocks) {
++
++    constexpr int G = A16_QG;       // lanes per block
++    constexpr int E = A16_QK/G;     // elements per lane
++
++    const int tid = blockIdx.x*blockDim.x + threadIdx.x;
++    const int ib  = tid/G;          // block index within the row
++    const int l   = tid % G;        // lane within the block
++    const int row = blockIdx.y;
++    if (ib >= nblocks) {
++        return;
++    }
++
++    // ib is shared by all G lanes, so the tail drops out G lanes at a time.  G divides 32 and the
++    // block size is a multiple of 32, so a segment never straddles a warp and shuffle partners are
++    // always live.
++    const unsigned int gmask = ((1u << G) - 1) << ((threadIdx.x & (WARP_SIZE - 1)) & ~(G - 1));
++
++    const float * xp = x + (size_t) row*s01 + ib*A16_QK + l*E;
++
++    float v[E];
++    float amax = 0.0f;
++    if (vec4) {
++#pragma unroll
++        for (int i = 0; i < E/4; ++i) {
++            const float4 t = ((const float4 *) xp)[i];
++            v[4*i + 0] = t.x; v[4*i + 1] = t.y; v[4*i + 2] = t.z; v[4*i + 3] = t.w;
++            amax = fmaxf(amax, fmaxf(fmaxf(fabsf(t.x), fabsf(t.y)), fmaxf(fabsf(t.z), fabsf(t.w))));
++        }
++    } else {
++#pragma unroll
++        for (int i = 0; i < E; ++i) {
++            v[i] = xp[i];
++            amax = fmaxf(amax, fabsf(v[i]));
++        }
++    }
++#pragma unroll
++    for (int s = G/2; s > 0; s >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(gmask, amax, s, G));
++    }
++
++    const float id = amax > 0.0f ? 1.0f/amax : 0.0f;
++
++    float sum = 0.0f;
++#pragma unroll
++    for (int i = 0; i < E; ++i) {
++        v[i] *= id;
++        sum  += v[i];
++    }
++#pragma unroll
++    for (int s = G/2; s > 0; s >>= 1) {
++        sum += __shfl_xor_sync(gmask, sum, s, G);
++    }
++
++    if (l == 0) {
++        ads[row*nblocks + ib] = make_half2(__float2half(amax), __float2half(sum));
++    }
++
++    // Lanes holding elements 0..15 write outputs 4k+0 / 4k+2; those holding 16..31 write 4k+1 / 4k+3.
++    const int off   = l >= G/2 ? 1 : 0;
++    const int kbase = (E*l - off*16)/4;
++
++    half2 * qs = aq + (size_t) row*nblocks*(A16_QK/2) + ib*(A16_QK/2);
++#pragma unroll
++    for (int e = 0; e < E/4; ++e) {
++        const int k = kbase + e;
++        qs[4*k + 0 + off] = make_half2(__float2half(v[4*e + 0]), __float2half(v[4*e + 2]));
++        qs[4*k + 2 + off] = make_half2(__float2half(v[4*e + 1]), __float2half(v[4*e + 3]));
++    }
++}
++
++// Inner loop structure and epilogue.
++//
++// Loop order is "activations into registers first, rows innermost".  The natural ordering keeps
++// w[A16_ROWS][8] live across the column loop, so register pressure grows with the row count
++// (153 registers = 3 blocks/SM at width 5 with 8 rows).  This ordering only keeps a[ncols][8],
++// which does not depend on the row count, plus w[8] for a single row.  Measured -6.4% at width 3
++// and -4.2% at width 4 (widths 2 and 5 unchanged).
++//
++// The epilogue (applying the per-block scales) runs once per (row, column, block) and is therefore
++// heavier than the dot product itself.  In GP100 issue slots (HFMA2 = 1), F2F is quarter rate so it
++// counts 4 and FP32 is half rate so it counts 2: the original "two F2F plus four FP32" is 18
++// against 8 for the dot product body.  A measurement-only build that collapsed it to one showed
++// -18.3% at width 3 and -19.4% at width 5.  What is actually obtainable is summing the low and high
++// halves in fp16 and converting once (two F2F -> one).
++//
++// The accumulator stays float: summing across blocks in fp16 loses significance.  That adds one
++// rounding step, but acc has already been through 8 fp16 FMAs inside the block, so roundings per
++// block go 8 -> 9.  Confirmed with perplexity at ubatch 4 (the width that takes this path):
++// 7.2370 -> 7.2359, -0.015%, one two-hundredth of the +/-2.9% measurement error.  A version that
++// also does the scale product in fp16 (yd / ys / dm are all half to begin with) measured the same
++// and only adds overflow risk, so it is not used.
++//
++// Raising A16_ROWS to 8 or 16 was rejected.  Every block in the grid reads the whole activation
++// vector, so doubling the rows halves that traffic -- but width 5 moves by only -3.2%, and the
++// row-count-independent register form above does not rescue it either (ROWS = 16 spills, +48%).
++// This path is not limited by activation L2 traffic.
++//
++// It is limited by instruction issue, not by bandwidth.  Comparing static SASS instruction counts
++// against measured time, width 5 consumes 96-105% of the issue slots:
++//
++//     tensor                width  measured us/call  issue floor us  utilization
++//     ffn_gate/up  gridX 3072  5        139.05           133.6           96%
++//     ffn_down     gridX 1024  5         91.64            96.0          105%
++//     lm_head     gridX 62080  5       2618.85          2699.0           97%
++//
++//   (issue floor = warps x instructions per warp / (56 SM x 1.92 warp-inst/clk x 1.328 GHz))
++// In bandwidth terms width 5 reaches 226 GB/s, 37% of the 606 GB/s measured ceiling.  So the only
++// way to make this faster is to issue fewer instructions.
++//
++// Hence nwarps as a template parameter.  The K loop body is a fixed total amount of work regardless
++// of the warp count, but the prologue and the inter-warp reduction are per-warp overheads, so when
++// K is large enough, fewer warps with more K each means fewer instructions overall.  Solving for
++// the fixed cost C and loop body L from two measured shapes gives C = 2.09 L; at K = 4096 (two
++// iterations per thread) half of a warp's work was overhead.  At nwarps = 1 the shared-memory
++// inter-warp reduction (LDS/STS/SYNC) disappears entirely, because warp_reduce_sum leaves the total
++// in every lane -- no shared memory and no __syncthreads.
++//
++// minBlocksPerMultiprocessor caps registers, so it has to be scaled up as the block shrinks;
++// otherwise nwarps = 1 lets register use run free and resident blocks drop.  Multiplying by
++// (A16_NWARPS/nwarps) keeps the implied floor on resident threads per SM constant.
++template <int ncols_dst, int nwarps>
++static __global__ void __launch_bounds__(WARP_SIZE*nwarps, (ncols_dst >= 6 ? 2 : 4)*(A16_NWARPS/nwarps))
++mul_mat_vec_q4_1_a16(
++        const void * __restrict__ vx, const half2 * __restrict__ aq, const half2 * __restrict__ ads,
++        float * __restrict__ dst, const int nblocks, const int stride_row_x,
++        const int stride_col_aq, const int stride_col_ads, const int stride_col_dst) {
++#if defined(FP16_AVAILABLE)
++    const int row0     = blockIdx.x*A16_ROWS;
++    const int tid      = threadIdx.x + threadIdx.y*WARP_SIZE;
++    const int nthreads = WARP_SIZE*nwarps;
++
++    const block_q4_1 * x = (const block_q4_1 *) vx;
++
++    const half2 magic_lo = __float2half2_rn(1024.0f);
++    const half2 magic_hi = __float2half2_rn(  64.0f);
++
++    float sumf[ncols_dst][A16_ROWS] = {{0.0f}};
++
++    // block_q4_1 is 20 bytes, so `&x[(row0+i)*stride_row_x + kb]` becomes a per-row 64-bit
++    // multiply (a 32-bit index times 20, i.e. an XMAD chain).  Hoisting each row's base out and
++    // adding a byte offset built once from kb removes the multiplies.
++    const char * const xbase = (const char *) &x[row0*stride_row_x];
++    int rowoff[A16_ROWS];
++#pragma unroll
++    for (int i = 0; i < A16_ROWS; ++i) {
++        rowoff[i] = i*stride_row_x*(int) sizeof(block_q4_1);
++    }
++
++    for (int t = tid; t < 2*nblocks; t += nthreads) {
++        const int kb = t >> 1;
++        const int kh = t &  1;
++        const int koff = kb*(int) sizeof(block_q4_1);
++
++        half2 a[ncols_dst][8];
++        float yd[ncols_dst];
++        float ys[ncols_dst];
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++            const half2 * ap = aq + (size_t) j*stride_col_aq + kb*(A16_QK/2) + kh*8;
++#pragma unroll
++            for (int c2 = 0; c2 < 2; ++c2) {
++                const int4 av = *((const int4 *) (ap + 4*c2));
++                a[j][4*c2 + 0] = *((const half2 *) &av.x);
++                a[j][4*c2 + 1] = *((const half2 *) &av.y);
++                a[j][4*c2 + 2] = *((const half2 *) &av.z);
++                a[j][4*c2 + 3] = *((const half2 *) &av.w);
++            }
++            const half2 ds = ads[j*stride_col_ads + kb];
++            yd[j] = __low2float(ds);
++            ys[j] = __high2float(ds)*0.5f;
++        }
++
++#pragma unroll
++        for (int i = 0; i < A16_ROWS; ++i) {
++            const block_q4_1 * b = (const block_q4_1 *) (xbase + (rowoff[i] + koff));
++            const float2 dm = __half22float2(b->dm);
++            const int * wq = (const int *) b->qs;
++
++            half2 w[8];
++#pragma unroll
++            for (int k = 0; k < 2; ++k) {
++                const int w32  = wq[2*kh + k];
++                const int w32s = w32 >> 8;
++                int t0, t1, t2, t3;
++                asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t0) : "r"(w32),  "n"(0x000f000f), "n"(0x64006400));
++                asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t1) : "r"(w32),  "n"(0x00f000f0), "n"(0x54005400));
++                asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t2) : "r"(w32s), "n"(0x000f000f), "n"(0x64006400));
++                asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(t3) : "r"(w32s), "n"(0x00f000f0), "n"(0x54005400));
++                w[4*k + 0] = __hsub2(*((const half2 *) &t0), magic_lo);
++                w[4*k + 1] = __hsub2(*((const half2 *) &t1), magic_hi);
++                w[4*k + 2] = __hsub2(*((const half2 *) &t2), magic_lo);
++                w[4*k + 3] = __hsub2(*((const half2 *) &t3), magic_hi);
++            }
++
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                half2 s = make_half2(0.0f, 0.0f);
++#pragma unroll
++                for (int c2 = 0; c2 < 2; ++c2) {
++#pragma unroll
++                    for (int c = 0; c < 4; ++c) {
++                        s = __hfma2(w[4*c2 + c], a[j][4*c2 + c], s);
++                    }
++                }
++                const float af = __half2float(__hadd(__low2half(s), __high2half(s)));
++                sumf[j][i] += yd[j]*(dm.x*af + dm.y*ys[j]);
++            }
++        }
++    }
++
++    // warp_reduce_sum is a __shfl_xor_sync butterfly, so the total ends up in every lane.  With a
++    // single warp the storing lane can be rotated per row, so no shared memory and no
++    // __syncthreads are needed.
++    if constexpr (nwarps == 1) {
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++            for (int i = 0; i < A16_ROWS; ++i) {
++                const float v = warp_reduce_sum(sumf[j][i]);
++                if (threadIdx.x == i) {
++                    dst[j*stride_col_dst + row0 + i] = v;
++                }
++            }
++        }
++    } else {
++        __shared__ float tmp[nwarps][ncols_dst][A16_ROWS];
++
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++            for (int i = 0; i < A16_ROWS; ++i) {
++                const float v = warp_reduce_sum(sumf[j][i]);
++                if (threadIdx.x == 0) {
++                    tmp[threadIdx.y][j][i] = v;
++                }
++            }
++        }
++
++        __syncthreads();
++
++        if (threadIdx.y != 0) {
++            return;
++        }
++
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++            for (int i = 0; i < A16_ROWS; ++i) {
++                if (threadIdx.x == i) {
++                    float s = 0.0f;
++#pragma unroll
++                    for (int w = 0; w < nwarps; ++w) {
++                        s += tmp[w][j][i];
++                    }
++                    dst[j*stride_col_dst + row0 + i] = s;
++                }
++            }
++        }
++    }
++#else
++    GGML_UNUSED_VARS(vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
++    NO_DEVICE_CODE;
++#endif // FP16_AVAILABLE
++}
++
++bool ggml_cuda_mmvq_f16_sm60_supported(
++        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst,
++        const void * fusion) {
++
++    if (fusion || ids) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_Q4_1 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // No DP4A but fast fp16 means GP100 only.  Everywhere else the upstream kernel is faster.
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_PASCAL || cc >= GGML_CUDA_CC_DP4A) {
++        return false;
++    }
++    // Leave the channel / sample dimensions to upstream; Q4_1 tensors do not use them.
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
++        return false;
++    }
++    if (src0->ne[0] % A16_QK != 0 || src0->ne[1] % A16_ROWS != 0) {
++        return false;
++    }
++    // Width 1 is limited by the DRAM read of the weights (the LM head reaches 99.8% of the
++    // bandwidth ceiling): making the arithmetic entirely free moves it by only +1.06%.  This path
++    // costs twice as many activation bytes as int8, which at width 1 is -6.8%, so it is off by
++    // default there.  Measured ratio against upstream (llama-batched-bench, 9B):
++    //   width 1 -> 0.932 / 2 -> 0.994 / 3 -> 1.045 / 4 -> 1.114 / 5 -> 1.114
++    // The range is overridable so the two kernels can be compared in one binary
++    // (GGML_A16_NCOLS_MIN / _MAX).
++    static const int ncols_min = getenv("GGML_A16_NCOLS_MIN") ? atoi(getenv("GGML_A16_NCOLS_MIN")) : 2;
++    static const int ncols_max = getenv("GGML_A16_NCOLS_MAX") ? atoi(getenv("GGML_A16_NCOLS_MAX")) : 8;
++    if (src1->ne[1] < ncols_min || src1->ne[1] > ncols_max || src1->ne[1] > 8) {
++        return false;
++    }
++    if (!ggml_is_contiguous(dst)) {
++        return false;
++    }
++    return true;
++}
++
++// Fewer warps means less per-warp overhead, but 2 is optimal rather than 1: with one warp per
++// block the grid fits inside the register-limited resident block count (115 registers = 17
++// blocks/SM at width 5) and the last wave ends up partial.  At gridX = 3072 that is 3.23 waves
++// (81% efficiency) against 6.86 waves (98%) for nwarps = 2.  Measured us/call (nw4 / nw2 / nw1):
++//
++//   gridX 3072 w5   136.21 /  113.11  / 116.73     gridX  1024 w5    91.94 /   88.72  /   97.07
++//   gridX 2048 w5    93.97 /   78.98  /  80.65     gridX 62080 w5  2563.80 / 2061.52  / 2132.64
++//   gridX  256 w5    19.40 /   15.24  /  14.78     gridX     8 w5     7.17 /    8.05  /   10.28
++//
++// Only for tiny tensors with a two-digit gridX (ssm_alpha / ssm_beta, 32 rows) are more warps
++// faster: those cannot fill 56 SMs at all, so parallelism matters more than per-warp overhead.
++static int a16_pick_nwarps(const int nblocks, const int nblocks_grid) {
++    static const int forced = getenv("GGML_A16_NWARPS") ? atoi(getenv("GGML_A16_NWARPS")) : 0;
++    if (forced == 1 || forced == 2 || forced == 4) {
++        return forced;
++    }
++    static const int small_grid = getenv("GGML_A16_SMALL_GRID") ? atoi(getenv("GGML_A16_SMALL_GRID")) : 64;
++
++    int nw = nblocks_grid < small_grid ? A16_NWARPS : 2;
++    // Drop warps when K is too small to keep them busy (the K loop runs 2*nblocks steps total).
++    while (nw > 1 && 2*nblocks < WARP_SIZE*nw) {
++        nw /= 2;
++    }
++    return nw;
++}
++
++template <int ncols_dst>
++static void launch_a16(
++        const void * vx, const half2 * aq, const half2 * ads, float * dst, const int nblocks, const int nrows,
++        const int stride_row_x, const int stride_col_aq, const int stride_col_ads, const int stride_col_dst,
++        cudaStream_t stream) {
++    const dim3 grid(nrows/A16_ROWS, 1, 1);
++    switch (a16_pick_nwarps(nblocks, nrows/A16_ROWS)) {
++        case 1:
++            mul_mat_vec_q4_1_a16<ncols_dst, 1><<<grid, dim3(WARP_SIZE, 1, 1), 0, stream>>>(
++                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
++            break;
++        case 2:
++            mul_mat_vec_q4_1_a16<ncols_dst, 2><<<grid, dim3(WARP_SIZE, 2, 1), 0, stream>>>(
++                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
++            break;
++        default:
++            mul_mat_vec_q4_1_a16<ncols_dst, A16_NWARPS><<<grid, dim3(WARP_SIZE, A16_NWARPS, 1), 0, stream>>>(
++                vx, aq, ads, dst, nblocks, stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst);
++            break;
++    }
++}
++
++void ggml_cuda_mmvq_f16_sm60(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++
++    cudaStream_t stream = ctx.stream();
++
++    const int64_t ne00 = src0->ne[0];
++    const int64_t ne01 = src0->ne[1];
++    const int64_t ne11 = src1->ne[1];
++
++    const int nblocks = ne00/A16_QK;
++
++    // The pool is a stack allocator, so allocation and release must nest LIFO.  Destructors run in
++    // reverse declaration order, which is why these two are declared in this order.
++    ggml_cuda_pool_alloc<half2> aq (ctx.pool(), (size_t) ne11*nblocks*(A16_QK/2));
++    ggml_cuda_pool_alloc<half2> ads(ctx.pool(), (size_t) ne11*nblocks);
++    {
++        const int64_t s11 = src1->nb[1]/ggml_type_size(src1->type);
++        const int nthreads = nblocks*A16_QG;
++        const dim3 grid((nthreads + A16_QBLOCK - 1)/A16_QBLOCK, ne11, 1);
++        // src1 need not be contiguous, so use float4 loads only when each row starts on a 16 B
++        // boundary.  The scalar fallback costs little: 2.36 us at 4096x5, 2.87 us at 12288x5.
++        static const bool vec4_off = getenv("GGML_A16_QVEC") && atoi(getenv("GGML_A16_QVEC")) == 0;
++        const bool vec4 = !vec4_off && s11 % 4 == 0 && ((uintptr_t) src1->data) % 16 == 0;
++        if (vec4) {
++            quantize_a16<true> <<<grid, A16_QBLOCK, 0, stream>>>((const float *) src1->data, aq.get(), ads.get(), s11, nblocks);
++        } else {
++            quantize_a16<false><<<grid, A16_QBLOCK, 0, stream>>>((const float *) src1->data, aq.get(), ads.get(), s11, nblocks);
++        }
++    }
++
++    const int stride_row_x   = ne00/ggml_blck_size(src0->type);
++    const int stride_col_aq  = nblocks*(A16_QK/2);
++    const int stride_col_ads = nblocks;
++    const int stride_col_dst = dst->nb[1]/ggml_type_size(dst->type);
++
++#define A16_CASE(N) case N: launch_a16<N>(src0->data, aq.get(), ads.get(), (float *) dst->data, nblocks, ne01, \
++                                          stride_row_x, stride_col_aq, stride_col_ads, stride_col_dst, stream); break;
++    switch (ne11) {
++        A16_CASE(1) A16_CASE(2) A16_CASE(3) A16_CASE(4)
++        A16_CASE(5) A16_CASE(6) A16_CASE(7) A16_CASE(8)
++        default: GGML_ABORT("unsupported ncols_dst");
++    }
++#undef A16_CASE
++}
+diff --git a/ggml/src/ggml-cuda/mmvq-f16-sm60.cuh b/ggml/src/ggml-cuda/mmvq-f16-sm60.cuh
+new file mode 100644
+index 0000000..8bdebd1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-f16-sm60.cuh
+@@ -0,0 +1,12 @@
++#pragma once
++
++#include "common.cuh"
++
++// Q4_1 GEMV specialised for sm_60 (GP100): no DP4A, but full-rate HFMA2.
++// Returns false when the shape or type does not qualify; the caller then falls back to plain MMVQ.
++bool ggml_cuda_mmvq_f16_sm60_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst,
++    const void * fusion);
++
++void ggml_cuda_mmvq_f16_sm60(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index a2a8695..a418d0a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "mmvq-f16-sm60.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -1319,6 +1320,13 @@ void ggml_cuda_mul_mat_vec_q(
+         }
+     }
+ 
++    // sm_60 has no DP4A but full-rate HFMA2, so for Q4_1 a dedicated kernel that expands the
++    // nibbles to half2 with LOP3 magic constants beats the generic path.
++    if (ggml_cuda_mmvq_f16_sm60_supported(src0, src1, ids, dst, fusion)) {
++        ggml_cuda_mmvq_f16_sm60(ctx, src0, src1, dst);
++        return;
++    }
++
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+     char * src1_q8_1_d = nullptr;
+     {

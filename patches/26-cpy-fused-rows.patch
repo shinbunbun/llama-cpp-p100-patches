@@ -1,0 +1,101 @@
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index c10a065..670154e 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -90,6 +90,44 @@ struct cpy_fused_ptrs {
+     char *       cdst[CUDA_CPY_FUSE_MAX];
+ };
+ 
++// When dim0 is contiguous and the higher dimensions are dense, iterating by row reduces the index
++// arithmetic to one multiply per row.  Paying six fastdiv per element was the actual bottleneck
++// (1.9x in a microbenchmark).  NE0 > 0 is a compile-time column count; 0 means take it at runtime.
++template <int NE0>
++static __global__ void cpy_rows_fused(const cpy_fused_ptrs p, const int nrows, const int ne0_rt,
++                                      const int64_t src_row_stride, const int64_t dst_row_stride) {
++    ggml_cuda_pdl_lc();
++    const int row = blockDim.x*blockIdx.x + threadIdx.x;
++    if (row >= nrows) {
++        return;
++    }
++
++    // Unroll so the indices are constants: a runtime index spills the struct to local memory
++    // (same reason as in the fused variant)
++    const char * cx   = p.cx[0];
++    char *       cdst = p.cdst[0];
++    const int    ky   = (int) blockIdx.y;
++#pragma unroll
++    for (int k = 1; k < CUDA_CPY_FUSE_MAX; ++k) {
++        if (ky == k) { cx = p.cx[k]; cdst = p.cdst[k]; }
++    }
++
++    const float * s = (const float *) (cx   + row*src_row_stride);
++    float *       d = (float *)       (cdst + row*dst_row_stride);
++
++    ggml_cuda_pdl_sync();
++    if constexpr (NE0 > 0) {
++#pragma unroll
++        for (int c = 0; c < NE0; ++c) {
++            d[c] = s[c];
++        }
++    } else {
++        for (int c = 0; c < ne0_rt; ++c) {
++            d[c] = s[c];
++        }
++    }
++}
++
+ template <cpy_kernel_t cpy_1>
+ static __global__ void cpy_scalar_fastdiv_fused(const cpy_fused_ptrs p, const int ne,
+                                   const uint3 fd_s0, const uint3 fd_s1, const uint3 fd_s2,
+@@ -780,6 +818,51 @@ bool ggml_cuda_cpy_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes,
+         p.cdst[k] = (char *)       nodes[k]->src[1]->data;
+     }
+ 
++    // Take the cheap per-row path when dim0 is contiguous and the higher dimensions are dense:
++    // nb0 == element size for both src and dst, nb2 == ne1*nb1, nb3 == ne2*nb2.  Row r then sits at
++    // r*nb1 (r*nb11 for dst) and nothing else is needed.
++    static bool disable_rows = getenv("GGML_CUDA_DISABLE_CPY_ROWS") != nullptr &&
++                               std::atoi(getenv("GGML_CUDA_DISABLE_CPY_ROWS"));
++    const int64_t es = (int64_t) ggml_element_size(src0);
++
++    // "Row form" means dim0 is contiguous and the higher dimensions are dense with respect to the
++    // dim1 stride, so row r sits at r*nb1.  src and dst only have to agree on the element count, so
++    // if one side is in row form and the other is contiguous, row r's dst is simply r*ne0*es.
++    const bool src_rows = nb00 == es && nb02 == ne01*nb01 && nb03 == ne02*nb02;
++    const bool dst_rows = nb10 == es && nb12 == ne11*nb11 && nb13 == ne12*nb12;
++
++    int64_t row_ne0 = 0, row_src_stride = 0, row_dst_stride = 0;
++    if (!disable_rows && src_rows && ne00 > 0) {
++        if (dst_rows && ne10 == ne00) {
++            row_ne0 = ne00; row_src_stride = nb01; row_dst_stride = nb11;
++        } else if (ggml_is_contiguous(src1)) {
++            row_ne0 = ne00; row_src_stride = nb01; row_dst_stride = ne00*es;
++        }
++    }
++    if (row_ne0 == 0 && !disable_rows && dst_rows && ne10 > 0 && ggml_is_contiguous(src0)) {
++        row_ne0 = ne10; row_src_stride = ne10*es; row_dst_stride = nb11;
++    }
++
++    const int64_t nrows64 = row_ne0 > 0 ? ne / row_ne0 : 0;
++    if (row_ne0 > 0 && nrows64 > 0 && nrows64 <= INT_MAX && ne % row_ne0 == 0) {
++        const int64_t row_blocks = (nrows64 + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
++        const dim3 rgrid((unsigned int) row_blocks, (unsigned int) n, 1);
++        const ggml_cuda_kernel_launch_params rparams =
++            ggml_cuda_kernel_launch_params(rgrid, CUDA_CPY_BLOCK_SIZE, 0, ctx.stream());
++        const int nr = (int) nrows64;
++        switch (row_ne0) {
++            case 1: ggml_cuda_kernel_launch(cpy_rows_fused<1>, rparams, p, nr, 0, row_src_stride, row_dst_stride); break;
++            case 2: ggml_cuda_kernel_launch(cpy_rows_fused<2>, rparams, p, nr, 0, row_src_stride, row_dst_stride); break;
++            case 3: ggml_cuda_kernel_launch(cpy_rows_fused<3>, rparams, p, nr, 0, row_src_stride, row_dst_stride); break;
++            case 4: ggml_cuda_kernel_launch(cpy_rows_fused<4>, rparams, p, nr, 0, row_src_stride, row_dst_stride); break;
++            default:
++                ggml_cuda_kernel_launch(cpy_rows_fused<0>, rparams, p, nr, (int) row_ne0,
++                                        row_src_stride, row_dst_stride);
++                break;
++        }
++        return true;
++    }
++
+     const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+     GGML_ASSERT(num_blocks <= INT_MAX);
+     const dim3 grid((unsigned int) num_blocks, (unsigned int) n, 1);
