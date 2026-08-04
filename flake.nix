@@ -119,6 +119,34 @@
             '') patchSet.patches}
             touch $out
           '';
+
+          # The locked nixpkgs is part of the pin, not an implementation detail:
+          # the overlay and #llama-cpp-sm60 patch whatever llama-cpp nixpkgs
+          # provides, and the patches only apply to llamaCppVersion.  So a
+          # nixpkgs bump that moves llama-cpp is a rebase, not a lock update,
+          # and an automated lock bump must fail here rather than merge.
+          nixpkgs-llama-cpp-pin = pkgs.runCommand "nixpkgs-llama-cpp-pin" { } ''
+            actual=b${pkgs.llama-cpp.version}
+            expected=${patchSet.llamaCppVersion}
+            if [ "$actual" != "$expected" ]; then
+              echo "nixpkgs has llama-cpp $actual, but the patches are generated"
+              echo "against $expected and apply at zero fuzz only on that tag."
+              echo "Rebase the patch set (see README) instead of taking this lock."
+              exit 1
+            fi
+            touch $out
+          '';
+        }
+        # Compiles the patched tree in the real derivation.  CPU-only, so it
+        # covers patch application, the nixpkgs recipe, and the four host-side
+        # patches -- the CUDA sources are not built here, and nothing on a
+        # GitHub-hosted runner can measure a P100.
+        // lib.optionalAttrs (system == "x86_64-linux") {
+          llama-cpp-cpu =
+            (import nixpkgs {
+              inherit system;
+              overlays = [ self.overlays.default ];
+            }).llama-cpp;
         }
       );
 

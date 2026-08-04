@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Everything runs on GitHub-hosted runners with no secrets, so pull requests
+# from forks are safe to run.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast gate: the patches still apply at zero fuzz and zero offset, the list in
+  # nix/patches.nix still matches patches/, and nixpkgs still carries the tag the
+  # patches were generated against.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+      - run: nix flake check --no-build --all-systems
+      - run: nix build .#checks.x86_64-linux.patches-apply .#checks.x86_64-linux.nixpkgs-llama-cpp-pin --no-link --print-build-logs
+
+  # Slow gate: compiles the patched tree in the real derivation.  CPU-only, so it
+  # covers patch application, the nixpkgs recipe and the four host-side patches.
+  # The CUDA sources are not built here and no runner can measure a P100 --
+  # test-backend-ops and the throughput numbers stay manual, on the card.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+      - run: nix build .#checks.x86_64-linux.llama-cpp-cpu --no-link --print-build-logs

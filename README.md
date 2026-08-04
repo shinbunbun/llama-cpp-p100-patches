@@ -183,7 +183,10 @@ reusable than the patches.
 - `CUDA (delta-net)` patches only fire on models with a gated delta-net block
   (Qwen3-Next, Qwen3.5). Elsewhere they never fire; the only cost is the
   per-graph pattern match.
-- `nix flake check` proves the patches apply. It does not run llama.cpp's tests.
+- `nix flake check` proves that the patches apply, that nixpkgs still carries the
+  tag they were generated against, and that the patched tree compiles without
+  CUDA. It does not compile the CUDA sources, run llama.cpp's tests, or measure
+  anything — those need the card.
 
 ## Contributing
 
