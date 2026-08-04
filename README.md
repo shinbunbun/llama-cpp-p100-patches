@@ -26,6 +26,25 @@ Every patch has a measurement behind it, and the measurements — including the
 alternatives that were tried and rejected — are in the comments the patches add
 to the source.
 
+## What the set is worth
+
+Against stock `b10133` on the same card, same models, same server options:
+
+| Model | Stock | Patched | |
+|---|---:|---:|---:|
+| Qwen3.5 9B dense (Q4_1, MTP head Q4_1) | 76.99 t/s | **136.11 t/s** | **+76.8%** |
+| Qwen3.6 35B-A3B MoE (Q2_K_XL, dense layers Q5_1) | 67.01 t/s | **120.57 t/s** | **+79.9%** |
+
+End-to-end decode throughput from `llama-server`, geometric mean over three
+prompts, MTP speculative decoding (n-max 4, p-min 0.75) and a realistic sampler
+(temperature 0.7, top-p 0.8, top-k 20). Arms interleaved, order reversed for the
+second half, GPU cooled to ≤58 °C before each arm: six rounds for the dense model
+(SD 0.19% stock / 0.08% patched), four for the MoE (0.16% / 0.12%).
+
+This is the whole set against no patches. It is **not** the sum of the per-patch
+numbers below, which were each measured against the stack as it stood at the
+time and do not compose.
+
 ## Status
 
 - Generated against llama.cpp **`b10133`**, where they apply at **zero fuzz and
@@ -154,7 +173,7 @@ from the middle generally means rebasing the rest.
 ## Where the numbers come from
 
 - Tesla P100-PCIE-16GB (GP100, sm_60), CUDA 12.9, driver 580.x
-- Qwen3.5 9B dense and a 256-expert Qwen3.5-MoE (8 active, 41 layers), Q4_1 /
+- Qwen3.5 9B dense and Qwen3.6 35B-A3B (256 experts, 8 active, 41 layers), Q4_1 /
   Q5_1 / IQ-series weights
 - Speculative decoding via MTP, so the hot path is a width-5 verify batch
 - End-to-end throughput from `llama-server` over a fixed three-prompt set, with
