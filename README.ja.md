@@ -175,8 +175,9 @@ $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
 - `CUDA (delta-net)` のパッチは、gated delta-net を持つモデル (Qwen3-Next / Qwen3.5)
   でしか発火しない。それ以外のモデルでは発火しないだけで、コストはグラフごとの
   パターン照合だけである
-- `nix flake check` が保証するのはパッチが当たることだけで、llama.cpp のテストは
-  走らせていない
+- `nix flake check` が保証するのは、パッチが当たること、nixpkgs が生成時のタグを保って
+  いること、そして CUDA 抜きでパッチ適用後のツリーがコンパイルできることの 3 点である。
+  CUDA のソースはコンパイルせず、llama.cpp のテストも実測も行わない。これらにはカードが要る
 
 ## コントリビュート
 

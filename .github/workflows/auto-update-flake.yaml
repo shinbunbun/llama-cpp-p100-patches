@@ -1,0 +1,62 @@
+name: Auto-update flake.lock
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+# Uses GITHUB_TOKEN rather than a PAT, so nothing sensitive lives in this public
+# repository.  The trade-off is that a pull request opened by GITHUB_TOKEN does
+# not trigger ci.yaml, which is why the checks run here, before the pull request
+# is opened, against the updated lock.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+
+      # llama-cpp-src is a tag, so this only ever moves nixpkgs.
+      - run: nix flake update
+
+      - id: changes
+        run: |
+          if git diff --quiet -- flake.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The expected failure is nixpkgs moving llama-cpp off the pinned tag.
+      # That means the patch set needs a rebase (see README), not that this lock
+      # should be merged -- so fail the run and open nothing.
+      - if: steps.changes.outputs.changed == 'true'
+        run: nix flake check --no-build --all-systems
+
+      - if: steps.changes.outputs.changed == 'true'
+        run: |
+          nix build --no-link --print-build-logs \
+            .#checks.x86_64-linux.patches-apply \
+            .#checks.x86_64-linux.nixpkgs-llama-cpp-pin \
+            .#checks.x86_64-linux.llama-cpp-cpu
+
+      - if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          commit-message: "Auto-update flake.lock"
+          title: "Auto-update flake.lock"
+          body: |
+            `nix flake update`.
+
+            Verified before opening: the patches still apply at zero fuzz and
+            zero offset, nixpkgs still carries the tag they were generated
+            against, and the patched tree still compiles (CPU-only).
+
+            Not covered here: the CUDA build, `test-backend-ops`, and the
+            throughput numbers. Those need the card.
+          branch: auto/update-flake-lock
+          base: main
