@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-29 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
+30 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 developed and measured on a **Tesla P100 (GP100, sm_60)**.
 
 日本語版: [README.ja.md](README.ja.md)
@@ -14,11 +14,11 @@ has full-rate HFMA2 — so llama.cpp's quantized matmul paths fall back to
 emulation and cuBLAS, while the one instruction the card is genuinely good at
 goes unused. The patches named `sm60` exploit that asymmetry.
 
-**But only 7 of the 29 are gated to Pascal-era hardware.** One more changes an
-unconditional constant that every GPU sees. The remaining 21 are not
+**But only 7 of the 30 are gated to Pascal-era hardware.** One more changes an
+unconditional constant that every GPU sees. The remaining 22 are not
 hardware-scoped at all — kernel fusions, index-arithmetic fixes, two host-side
 sampler paths, two scheduler patches, a `top_k` that avoids sorting the whole
-vocabulary, and a lookup table staged in shared memory — though five of those
+vocabulary, and two lookup tables staged in shared memory — though five of those
 only fire on gated delta-net models and one needs a specific model feature.
 Every row in the table below carries a scope tag, and
 [docs/patches.md](docs/patches.md) is grouped by it.
@@ -42,10 +42,10 @@ prompts, MTP speculative decoding (n-max 4, p-min 0.75) and a realistic sampler
 second half, GPU cooled to ≤58 °C before each arm: six rounds for the dense model
 (SD 0.19% stock / 0.08% patched), four for the MoE (0.16% / 0.12%).
 
-Both runs predate patch 29. The dense model is all Q4_1/Q5_1, so it is
-unaffected; the MoE model carries 31.7% of its bytes in IQ3_XXS and picks up
-about 1% from patch 29 in a separate two-round A/B, so its figure is a slight
-underestimate.
+Both runs predate patches 29 and 30. The dense model is all Q4_1/Q5_1, so it is
+unaffected; the MoE model carries 31.7% of its bytes in IQ3_XXS and 47.9% in
+IQ2_XS, and picks up about 1% from patch 29 and 1.5% from patch 30 in separate
+two-round A/Bs, so its figure is a slight underestimate.
 
 This is the whole set against no patches. It is **not** the sum of the per-patch
 numbers below, which were each measured against the stack as it stood at the
@@ -109,6 +109,7 @@ each was measured against the stack as it stood at the time.
 | 27 | `fuse-concat-gather` | CUDA (delta-net) | +0.74% |
 | 28 | `top-k-partial` | CUDA | 7.6× kernel, ~1.1% of decode |
 | 29 | `mmvq-iq3xxs-grid-smem` | CUDA | +3.1–7.6% decode (dense), bit-identical |
+| 30 | `mmvq-ksigns-smem` | CUDA | +0.2–1.8% decode, −9.3% IQ3_XXS kernel, bit-identical |
 
 Scope tags, details, kill switches and the rejected alternatives:
 **[docs/patches.md](docs/patches.md)**.

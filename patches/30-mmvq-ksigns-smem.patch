@@ -1,0 +1,144 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index d53e08b..6620551 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -574,6 +574,10 @@ static __global__ void mul_mat_vec_q(
+     if constexpr (type == GGML_TYPE_IQ3_XXS) {
+         iq3xxs_grid_smem_init(tid, blockDim.x*blockDim.y);
+     }
++    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
++                  type == GGML_TYPE_IQ2_XS) {
++        ksigns_smem_init(tid, blockDim.x*blockDim.y);
++    }
+ 
+     const     int row0 = rows_per_cuda_block*blockIdx.x;
+     const     int blocks_per_row_x = ncols_x / qk;
+@@ -800,11 +804,14 @@ static __global__ void mul_mat_vec_q_moe(
+ 
+     const uint32_t token_idx   = threadIdx.y;
+ 
+-    // iq3xxs_grid_smem_init() has a __syncthreads(), so it must precede the early
+-    // return below.
++    // Must precede the early return below (contains a __syncthreads()).
+     if constexpr (type == GGML_TYPE_IQ3_XXS) {
+         iq3xxs_grid_smem_init(warp_size*threadIdx.y + threadIdx.x, blockDim.x*blockDim.y);
+     }
++    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS ||
++                  type == GGML_TYPE_IQ2_XS) {
++        ksigns_smem_init(warp_size*threadIdx.y + threadIdx.x, blockDim.x*blockDim.y);
++    }
+ 
+     const int      row0        = c_rows_per_block*blockIdx.x;
+     const int      blocks_per_row_x = ncols_x / qk;
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 6ff1735..61116c4 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -984,6 +984,49 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+ }
+ 
++// The per-byte sign masks depend only on the 7 bit field they are unpacked from, so
++// the whole unpack_ksigns / __vcmpne4 chain can be replaced by one table read.  That
++// chain is expensive on sm_60 specifically: there is no byte-wise SIMD compare and no
++// byte-wise SIMD subtract, so __vcmpne4 and __vsub4 are both expanded into several
++// LOP3/LOP32I, and s*0x01010101 becomes three XMAD.
++//
++// Every byte of iq2xxs_grid, iq2xs_grid and iq3xxs_grid is >= 4, so (g ^ 0xff) + 1 per
++// byte cannot carry into the next byte and a plain 32 bit add replaces __vsub4.
++//
++// Same rule as iq3xxs_grid_smem_init(): every kernel that reaches a vec_dot using this
++// must call ksigns_smem_init() before any early return, because of the __syncthreads().
++static __device__ __forceinline__ uint32_t * ksigns_smem() {
++    __shared__ uint32_t s_ksigns[256];
++    return s_ksigns;
++}
++
++static __device__ __forceinline__ void ksigns_smem_init(const int tid, const int nthreads) {
++    uint32_t * s_ksigns = ksigns_smem();
++    for (int u = tid; u < 128; u += nthreads) {
++        const uint32_t s = u | ((__popc(u) & 1) << 7);
++        uint32_t mask_l = 0;
++        uint32_t mask_h = 0;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            mask_l |= ((s >> (0 + i)) & 1) * (0xffu << (8*i));
++            mask_h |= ((s >> (4 + i)) & 1) * (0xffu << (8*i));
++        }
++        s_ksigns[u]       = mask_l;
++        s_ksigns[u + 128] = mask_h;
++    }
++    __syncthreads();
++}
++
++// unpack_ksigns truncates its argument to 8 bits and recovers the 8th sign from the
++// parity, in which bit 7 cancels, so only the low 7 bits of v matter here as well.
++static __device__ __forceinline__ void apply_ksigns(int & lo, int & hi, const uint32_t v) {
++    const uint32_t * s_ksigns = ksigns_smem();
++    const uint32_t mask_l = s_ksigns[(v & 0x7f)];
++    const uint32_t mask_h = s_ksigns[(v & 0x7f) + 128];
++    lo = (lo ^ mask_l) + (mask_l & 0x01010101);
++    hi = (hi ^ mask_h) + (mask_h & 0x01010101);
++}
++
+ #define VDR_IQ2_XXS_Q8_1_MMVQ 2
+ #define VDR_IQ2_XXS_Q8_1_MMQ  2
+ 
+@@ -1000,15 +1043,13 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
+ #pragma unroll
+     for (int k0 = 0; k0 < 8; k0 += 2) {
+         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
+-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
++        int grid0 = grid_pos.x;
++        int grid1 = grid_pos.y;
++        apply_ksigns(grid0, grid1, aux32 >> (7 * k0 / 2));
+ 
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
+         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+ 
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
+         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+     }
+@@ -1037,14 +1078,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
+-        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
++        int grid_l = grid_pos.x;
++        int grid_h = grid_pos.y;
++        apply_ksigns(grid_l, grid_h, q2[l0/2] >> 9);
+ 
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+-
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+ 
+         if (l0 < 4) {
+@@ -1148,17 +1186,11 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+     int sumi = 0;
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+-        const int2 grid_pos = make_int2(s_grid[q3[l0 + 0]], s_grid[q3[l0 + 1]]);
+-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+-
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        int grid_l = s_grid[q3[l0 + 0]];
++        int grid_h = s_grid[q3[l0 + 1]];
++        apply_ksigns(grid_l, grid_h, aux32 >> (7*l0/2));
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+-
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+-
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+ 
+         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
