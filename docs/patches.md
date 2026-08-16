@@ -2,7 +2,7 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-28 patches against llama.cpp `b10133`, grouped by scope below; the application
+29 patches against llama.cpp `b10133`, grouped by scope below; the application
 order is the file numbering. Order matters: several touch the same files, and
 later ones build on earlier ones.
 
@@ -331,6 +331,61 @@ Kill switch: `GGML_CUDA_DISABLE_TOP_K_PARTIAL`.
 
 > This one is worth attention beyond Pascal: **every CUDA 12.x user with GPU
 > sampling pays a full-vocabulary sort per token.**
+
+### 29 · `mmvq-iq3xxs-grid-smem` — `CUDA`
+
+`vec_dot_iq3_xxs_q8_1` reads `iq3xxs_grid` once per four weights, and the 32
+indices a warp holds are unrelated, so one load is broken into as many sectors
+as there are distinct addresses and replayed serially. An instruction count
+hides this: the loads are a handful of the ~946 instructions in the loop body,
+so counting them predicts a few percent where the measurement shows 40%.
+
+Staging the 1 KiB table in shared memory at the top of the kernel removes it.
+
+Isolated GEMV, K=5120, N=17408, only the lookup changed, µs/Mweight:
+
+| grid lives in | nc=1 | nc=2 | nc=3 |
+|---|---:|---:|---:|
+| global (stock) | 2.965 | 4.103 | 5.204 |
+| `__constant__` | 6.486 | 6.484 | 6.516 |
+| **shared** | **1.824** | **2.972** | **4.000** |
+| uniform index (control, wrong results) | 1.842 | 2.944 | 4.013 |
+
+Shared memory reaches the control: the lookup cost goes to zero rather than
+down. `__constant__` is 2.2× *slower* than stock, because the constant cache
+broadcasts one address per cycle and a divergent index serialises 32 ways.
+
+On a 27B dense model whose IQ3_XXS tensors carry 27% of the weights, with
+MTP speculative decoding on:
+
+| prompt | stock | patched | |
+|---|---:|---:|---:|
+| short (256 tokens generated, two rounds) | 27.03 / 27.04 | 29.08 / 29.10 | **+7.6%** |
+| 33k tokens | 18.70 | 19.80 | **+5.9%** |
+| 60k tokens | 15.51 | 15.99 | **+3.1%** |
+
+The gain shrinks with context because attention and the KV-to-f16 expansion
+take a growing share of the pass, leaving `mul_mat_vec_q` a smaller one.
+
+**Output is bit-identical** at every point: same generated-text hash, same
+accepted-draft count, same pass count, so there is no acceptance-rate term to
+confound the comparison. Peak VRAM is unchanged to the MiB.
+
+Registers fall too, since the grid address arithmetic disappears: the `nc=1`
+kernel goes 94 → 80, and shared memory per block grows by exactly 1024 bytes.
+
+`iq3xxs_grid_smem_init()` must be called before any early return, since it
+contains a `__syncthreads()`.
+
+The same divergent lookup exists in MMVQ for `iq2xxs_grid`, `iq2xs_grid`,
+`iq2s_grid`, `iq3s_grid` and `iq1s_grid_gpu`. None are touched here: those
+tables run from 2 KiB to 8 KiB, so what they would cost in occupancy is a
+different trade. MMQ reads this same 1 KiB table in `load_tiles_iq3_xxs`, which
+is not touched either.
+
+`mul_mat_vec_q_moe` gets the same initialisation because it shares the
+`vec_dot`, but that kernel only runs for MoE `MUL_MAT_ID` with more than one
+token, which none of the measurements above exercise.
 
 ---
 
