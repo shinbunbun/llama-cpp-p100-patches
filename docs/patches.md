@@ -356,7 +356,7 @@ down. `__constant__` is 2.2× *slower* than stock, because the constant cache
 broadcasts one address per cycle and a divergent index serialises 32 ways.
 
 On a 27B dense model whose IQ3_XXS tensors carry 27% of the weights, with
-MTP speculative decoding on:
+MTP speculative decoding on and greedy sampling (temperature 0, top-k 1):
 
 | prompt | stock | patched | |
 |---|---:|---:|---:|
@@ -395,6 +395,113 @@ and the pass count, so acceptance rate does not enter this comparison either.
 VRAM is unchanged. At +1.1% the effect is far smaller than the dense figures
 above, so take it as indicative; what it settles is that the added barrier and
 the 1 KiB fill cost nothing measurable on that path.
+
+### 30 · `mmvq-ksigns-smem` — `CUDA`
+
+The `vec_dot` for IQ2_XXS, IQ2_XS and IQ3_XXS turns a packed 7-bit sign field
+into two per-byte masks and applies them:
+
+```c
+const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));   // s * 0x01010101
+const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+```
+
+Every step of that is emulated on sm_60. There is no byte-wise SIMD compare and
+no byte-wise SIMD subtract, so `__vcmpne4` and `__vsub4` each expand into several
+`LOP3`/`LOP32I`, and the `s * 0x01010101` broadcast is a 32-bit integer multiply,
+three `XMAD`. The IQ3_XXS loop body is 120 `LOP32I` and 112 `LOP3` per 32
+weights, and nearly all of it is this.
+
+Deleting the sign application outright — wrong results, as a ceiling probe — is
+**−30.4%** on the isolated GEMV at K=5120, N=17408, `nc=1`. It was the largest
+single item left in that kernel after patch 29, ahead of the shared-memory grid
+lookup (12.5%), the dp4a emulation (8.1%) and the activation loads (4.1%).
+
+The masks depend only on the 7 bits they come from, so a 128-entry table filled
+once per block replaces the whole chain with one shared-memory load. Two facts
+keep it small and the application cheap:
+
+- The 8th sign is the parity of the other seven, so 128 entries cover it. The
+  garbage bit the stock code tolerates in the byte it truncates cancels the same
+  way it does there.
+- Every byte of `iq2xxs_grid`, `iq2xs_grid` and `iq3xxs_grid` is at least 4, so
+  `(g ^ 0xff) + 1` per byte cannot carry into the next byte, and a plain 32-bit
+  add replaces `__vsub4`.
+
+Layout matters more than it looks. Three were measured against stock on the
+isolated IQ3_XXS GEMV at K=5120, N=17408, and all three are bit-identical to it:
+
+| table layout | `nc=1` | `nc=2` | `nc=3` |
+|---|---:|---:|---:|
+| stock | 149.5 µs | 198.2 µs | 257.3 µs |
+| `uint4`, one 128-bit load | 130.9 | 202.3 | 247.5 |
+| `uint2`, one 64-bit load | 125.2 | 187.8 | 244.4 |
+| **two `uint32` from a flat 256-entry array** | **128.4** | **188.9** | **236.0** |
+| ceiling: no sign application (wrong results) | 103.9 | 153.1 | 214.0 |
+
+Keeping the stock chain and replacing only the multiply with `__byte_perm` is
+worth −1.9% / −2.6%, so the multiply is not where the cost is.
+
+`test-backend-ops -o MUL_MAT perf`, m=4096 k=14336, same flake for both arms,
+interleaved with the order reversed for the second round:
+
+| type | n=1 | n=2 | n=3 | n=4 |
+|---|---:|---:|---:|---:|
+| IQ3_XXS | **−21.1%** | **−9.5%** | **−9.3%** | **−8.7%** |
+| IQ2_XXS | −3.7% | −7.4% | −8.6% | −8.0% |
+| IQ2_XS | +0.3% | −9.2% | −7.2% | −7.2% |
+| IQ4_XS (control) | −0.2% | +0.1% | −0.0% | −0.1% |
+
+At `n=1` IQ3_XXS goes 99.65 → 78.62 µs and lands on IQ4_XS (78.44) and Q4_1
+(78.65): the type that costs 3.06 bits per weight now costs the same time per
+weight as the two that cost 4.25 and 5.00.
+
+IQ2_S is left alone. It packs its signs as two nibbles rather than a 7-bit
+field, and the low half of this table would serve it, but routing it through
+there regressed `n=2` by 6.5% across two rounds while helping `n=3` and `n=4`.
+
+`-o MUL_MAT` 1134/1134 and `-o MUL_MAT_ID` 790/790 pass.
+
+On a 27B dense model with 30% of its GPU-resident bytes in IQ3_XXS, MTP
+speculative decoding on and greedy sampling (temperature 0, top-k 1 — which is
+what makes the bit-identical check below possible), three rounds short / two
+rounds long with the order alternated:
+
+| prompt | 29 patches | +30 | |
+|---|---:|---:|---:|
+| short (256 generated) | 28.92 / 28.90 / 28.87 t/s | 29.43 / 29.40 / 29.43 | **+1.8%** |
+| 33k tokens | 19.97 / 19.86 | 19.92 / 19.98 | +0.2% |
+| 60k tokens | 16.32 / 16.13 | 16.35 / 16.48 | +1.2% |
+
+Output is bit-identical at every point — same generated-text hash, same
+accepted-draft count, same pass count — so no acceptance-rate term enters the
+comparison. Peak VRAM is unchanged to the MiB. Shared memory per block grows by
+1 KiB.
+
+The end-to-end figure is far smaller than the kernel figure, and 0.2–1.2% at
+long context, for the same reason as patch 29: attention and the KV-to-f16
+expansion take a growing share of a long-context pass.
+
+A 35B-A3B MoE carrying 47.9% IQ2_XS and 31.7% IQ3_XXS, which reaches the
+`mul_mat_vec_q_moe` kernel rather than `mul_mat_vec_q`, went 101.79 / 101.83 →
+103.74 / 102.83 t/s over two rounds with the order alternated — **+1.5%**, or
+19.05 → 18.78 ms per verify pass. Hash, accepted-draft count, pass count, verify
+width and VRAM all agree across the four runs. The gain is modest for a model
+that carries 80% of its bytes in these two types because only a few experts are
+read per token.
+
+`ksigns_smem_init()` must be called before any early return, since it contains a
+`__syncthreads()`. MMQ reads the same sign encoding in `load_tiles_iq2_xxs`,
+`load_tiles_iq2_xs` and `load_tiles_iq3_xxs`, and is not touched.
+
+> A harness note worth more than the patch. The first version of this
+> measurement used a stand-alone GEMV written with one output row per block. It
+> put the sign path at 4% of the kernel and the table at 3% *slower*.
+> `mul_mat_vec_q` uses four rows per block (patch 02), which changes what the
+> kernel is bound by; rewritten to match, the same two measurements read 30% and
+> 14% *faster*. A microbenchmark that does not reproduce the real kernel's
+> launch geometry can invert the sign of a result, not merely blunt it.
 
 ---
 
