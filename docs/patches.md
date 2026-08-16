@@ -387,11 +387,14 @@ is not touched either.
 `vec_dot`. That kernel only runs for MoE `MUL_MAT_ID` with more than one token,
 which a dense model never reaches, so it was measured on its own: a 35B-A3B MoE
 with 31.7% of its bytes in IQ3_XXS went 100.40 / 101.27 → 101.83 / 102.00 t/s
-against the 28-patch build, two rounds with the order alternated, output
-bit-identical and VRAM unchanged. Two rounds on a single greedy 256-token
-prompt is below the standard the other numbers here are held to, so take the
-+1.1% as indicative; what it settles is that the added barrier and the 1 KiB
-fill cost nothing on that path.
+against the 28-patch build, two rounds with the order alternated. MTP
+speculative decoding was on — 124 of 148 drafts accepted, verify width 2.12 —
+which is what puts more than one token through `MUL_MAT_ID` and reaches the
+kernel at all, and all four runs agree on the hash, the accepted-draft count
+and the pass count, so acceptance rate does not enter this comparison either.
+VRAM is unchanged. At +1.1% the effect is far smaller than the dense figures
+above, so take it as indicative; what it settles is that the added barrier and
+the 1 KiB fill cost nothing measurable on that path.
 
 ---
 
