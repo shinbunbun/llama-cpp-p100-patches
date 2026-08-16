@@ -1,0 +1,78 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 94d9405..d53e08b 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -570,6 +570,11 @@ static __global__ void mul_mat_vec_q(
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+ 
+     const     int tid = warp_size*threadIdx.y + threadIdx.x;
++
++    if constexpr (type == GGML_TYPE_IQ3_XXS) {
++        iq3xxs_grid_smem_init(tid, blockDim.x*blockDim.y);
++    }
++
+     const     int row0 = rows_per_cuda_block*blockIdx.x;
+     const     int blocks_per_row_x = ncols_x / qk;
+     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+@@ -794,6 +799,13 @@ static __global__ void mul_mat_vec_q_moe(
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+ 
+     const uint32_t token_idx   = threadIdx.y;
++
++    // iq3xxs_grid_smem_init() has a __syncthreads(), so it must precede the early
++    // return below.
++    if constexpr (type == GGML_TYPE_IQ3_XXS) {
++        iq3xxs_grid_smem_init(warp_size*threadIdx.y + threadIdx.x, blockDim.x*blockDim.y);
++    }
++
+     const int      row0        = c_rows_per_block*blockIdx.x;
+     const int      blocks_per_row_x = ncols_x / qk;
+     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index b9932bc..6ff1735 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1111,6 +1111,29 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+ #define VDR_IQ3_XXS_Q8_1_MMVQ 2
+ #define VDR_IQ3_XXS_Q8_1_MMQ  2
+ 
++// The 32 lanes of a warp index iq3xxs_grid independently, so a global load of it
++// is split into as many sectors as there are distinct addresses and replayed
++// serially; staging the 1 KiB table in shared memory leaves only bank conflicts.
++// __constant__ is worse than global here, because the constant cache broadcasts
++// one address per cycle and a divergent index serialises 32 ways.
++//
++// Every kernel that reaches vec_dot_iq3_xxs_q8_1 must call iq3xxs_grid_smem_init()
++// first, before any early return, because it contains a __syncthreads().  The
++// dispatch goes through a function-pointer table, so a missing call is not a
++// compile error: it reads uninitialised shared memory and returns wrong values.
++static __device__ __forceinline__ uint32_t * iq3xxs_grid_smem() {
++    __shared__ uint32_t s_grid[256];
++    return s_grid;
++}
++
++static __device__ __forceinline__ void iq3xxs_grid_smem_init(const int tid, const int nthreads) {
++    uint32_t * s_grid = iq3xxs_grid_smem();
++    for (int i = tid; i < 256; i += nthreads) {
++        s_grid[i] = iq3xxs_grid[i];
++    }
++    __syncthreads();
++}
++
+ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+@@ -1120,10 +1143,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+     const uint8_t * q3 = (const uint8_t *) &q3_packed;
+     const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+ 
++    const uint32_t * s_grid = iq3xxs_grid_smem();
++
+     int sumi = 0;
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
++        const int2 grid_pos = make_int2(s_grid[q3[l0 + 0]], s_grid[q3[l0 + 1]]);
+         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+ 
+         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
