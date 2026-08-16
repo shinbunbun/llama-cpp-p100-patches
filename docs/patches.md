@@ -384,8 +384,14 @@ different trade. MMQ reads this same 1 KiB table in `load_tiles_iq3_xxs`, which
 is not touched either.
 
 `mul_mat_vec_q_moe` gets the same initialisation because it shares the
-`vec_dot`, but that kernel only runs for MoE `MUL_MAT_ID` with more than one
-token, which none of the measurements above exercise.
+`vec_dot`. That kernel only runs for MoE `MUL_MAT_ID` with more than one token,
+which a dense model never reaches, so it was measured on its own: a 35B-A3B MoE
+with 31.7% of its bytes in IQ3_XXS went 100.40 / 101.27 → 101.83 / 102.00 t/s
+against the 28-patch build, two rounds with the order alternated, output
+bit-identical and VRAM unchanged. Two rounds on a single greedy 256-token
+prompt is below the standard the other numbers here are held to, so take the
++1.1% as indicative; what it settles is that the added barrier and the 1 KiB
+fill cost nothing on that path.
 
 ---
 

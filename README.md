@@ -42,9 +42,10 @@ prompts, MTP speculative decoding (n-max 4, p-min 0.75) and a realistic sampler
 second half, GPU cooled to ≤58 °C before each arm: six rounds for the dense model
 (SD 0.19% stock / 0.08% patched), four for the MoE (0.16% / 0.12%).
 
-Both runs predate patch 29 and have not been repeated with it. The dense model
-is all Q4_1/Q5_1, so it is unaffected; the MoE model carries 31.7% of its bytes
-in IQ3_XXS, so its figure is now a lower bound.
+Both runs predate patch 29. The dense model is all Q4_1/Q5_1, so it is
+unaffected; the MoE model carries 31.7% of its bytes in IQ3_XXS and picks up
+about 1% from patch 29 in a separate two-round A/B, so its figure is a slight
+underestimate.
 
 This is the whole set against no patches. It is **not** the sum of the per-patch
 numbers below, which were each measured against the stack as it stood at the
@@ -107,7 +108,7 @@ each was measured against the stack as it stood at the time.
 | 26 | `cpy-fused-rows` | CUDA | 1.9× kernel |
 | 27 | `fuse-concat-gather` | CUDA (delta-net) | +0.74% |
 | 28 | `top-k-partial` | CUDA | 7.6× kernel, ~1.1% of decode |
-| 29 | `mmvq-iq3xxs-grid-smem` | CUDA | +3.1–7.6% decode, bit-identical |
+| 29 | `mmvq-iq3xxs-grid-smem` | CUDA | +3.1–7.6% decode (dense), bit-identical |
 
 Scope tags, details, kill switches and the rejected alternatives:
 **[docs/patches.md](docs/patches.md)**.
