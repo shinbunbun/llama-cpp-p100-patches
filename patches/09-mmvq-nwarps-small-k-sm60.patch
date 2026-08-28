@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 29b1dcf83..5659460f7 100644
+index 29b1dcf83..e7d92773d 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -415,8 +415,32 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
@@ -122,7 +122,16 @@ index 29b1dcf83..5659460f7 100644
          constexpr std::array<ggml_type, 2> iq_slow_turing = {
              GGML_TYPE_IQ3_XXS,
              GGML_TYPE_IQ3_S,
-@@ -1002,9 +1050,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -996,15 +1044,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
+         };
++        // Pascal returned above, so the pre-Turing arm of the tests below is unreachable and
++        // slow_pascal no longer excludes anything: what a Pascal device gets is decided entirely
++        // by whether K needs fewer than the table's four warps.
+         constexpr std::array<ggml_type, 3> slow_pascal = {
+             GGML_TYPE_IQ3_S,
+             GGML_TYPE_Q2_K,
              GGML_TYPE_Q3_K,
          };
  
@@ -132,7 +141,7 @@ index 29b1dcf83..5659460f7 100644
          if (is_nvidia_turing_plus) {
              if (ncols_dst == 1 &&
                      std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
-@@ -1016,7 +1061,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1016,7 +1064,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
              use = false;
          }
  
@@ -149,7 +158,7 @@ index 29b1dcf83..5659460f7 100644
      };
  
      // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
-@@ -1058,11 +1111,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1058,11 +1114,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
  
              // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
              const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
@@ -164,7 +173,7 @@ index 29b1dcf83..5659460f7 100644
  
                  constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
  
-@@ -1075,12 +1128,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1075,12 +1131,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
                      stream);
              };
  

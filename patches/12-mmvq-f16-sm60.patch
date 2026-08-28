@@ -507,7 +507,7 @@ index 000000000..8bdebd11e
 +void ggml_cuda_mmvq_f16_sm60(
 +    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 6dc55b6dc..a51516c1b 100644
+index 87bbc39fe..bc10e3eab 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -516,7 +516,7 @@ index 6dc55b6dc..a51516c1b 100644
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -1431,6 +1432,13 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1434,6 +1435,13 @@ void ggml_cuda_mul_mat_vec_q(
          }
      }
  
