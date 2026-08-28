@@ -132,7 +132,7 @@
           # message below, not abort the evaluation of every other check alongside it.
           nixpkgs-llama-cpp-pin = pkgs.runCommand "nixpkgs-llama-cpp-pin" { } ''
             actual="${if (pkgs.llama-cpp.src.tag or null) == null then "(no tag)" else pkgs.llama-cpp.src.tag}"
-            expected=${patchSet.llamaCppTag}
+            expected="${patchSet.llamaCppTag}"
             if [ "$actual" != "$expected" ]; then
               echo "nixpkgs has llama-cpp $actual, but the patches are generated"
               echo "against $expected and apply at zero fuzz only on that tag."
