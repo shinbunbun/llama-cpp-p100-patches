@@ -53,7 +53,7 @@ time and do not compose.
 
 ## Status
 
-- Generated against llama.cpp **`b10133`**, where they apply at **zero fuzz and
+- Generated against llama.cpp **`v0.2.0`**, where they apply at **zero fuzz and
   zero offset** (`nix flake check` verifies both, and that the file list matches
   the ordered list in `nix/patches.nix`).
 - Not submitted upstream. Three are straightforward candidates — 11
@@ -132,7 +132,7 @@ llama-cpp-patched = pkgs.llama-cpp.overrideAttrs (old: {
 });
 ```
 
-or use the overlay — apply it **last**, and assume it needs a pristine `b10133`
+or use the overlay — apply it **last**, and assume it needs a pristine `v0.2.0`
 tree, because zero-fuzz patches reject against anything that has already
 rewritten the same lines:
 
@@ -151,7 +151,7 @@ code generation, so the flake pins `cudaPackages_12`.
 ### Without Nix
 
 ```console
-$ git clone --branch b10133 https://github.com/ggml-org/llama.cpp
+$ git clone --branch v0.2.0 https://github.com/ggml-org/llama.cpp
 $ cd llama.cpp
 $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
     patch -p1 -F0 < "$p" || { echo "FAILED: $p"; break; }
@@ -168,7 +168,7 @@ from the middle generally means rebasing the rest.
 
 ### Rebasing onto a newer llama.cpp
 
-1. Bump `llamaCppVersion` in `nix/patches.nix` **and** the `llama-cpp-src` input
+1. Bump `llamaCppTag` in `nix/patches.nix` **and** the `llama-cpp-src` input
    in `flake.nix` — they are separate literals and must be changed together.
 2. `nix flake check`. It fails on exactly the patches that no longer apply.
 3. For each failure decide which it is: **fixed upstream** — delete the patch,

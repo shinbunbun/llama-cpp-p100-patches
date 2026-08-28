@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 9bce8df..d23f297 100644
+index 19df607f3..29b1dcf83 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -110,28 +110,49 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+@@ -119,28 +119,49 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
  // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
  
  static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {

@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 8a0f4d3..41980db 100644
+index 707437ea3..371461501 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
-@@ -301,7 +301,32 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+@@ -314,7 +314,32 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
      }
  
      if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {

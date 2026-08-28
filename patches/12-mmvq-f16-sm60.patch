@@ -1,6 +1,6 @@
 diff --git a/ggml/src/ggml-cuda/mmvq-f16-sm60.cu b/ggml/src/ggml-cuda/mmvq-f16-sm60.cu
 new file mode 100644
-index 0000000..212133f
+index 000000000..212133f1d
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-f16-sm60.cu
 @@ -0,0 +1,484 @@
@@ -490,7 +490,7 @@ index 0000000..212133f
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq-f16-sm60.cuh b/ggml/src/ggml-cuda/mmvq-f16-sm60.cuh
 new file mode 100644
-index 0000000..8bdebd1
+index 000000000..8bdebd11e
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-f16-sm60.cuh
 @@ -0,0 +1,12 @@
@@ -507,7 +507,7 @@ index 0000000..8bdebd1
 +void ggml_cuda_mmvq_f16_sm60(
 +    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 77df297..94d9405 100644
+index 6858dd983..2249c0bbe 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -516,7 +516,7 @@ index 77df297..94d9405 100644
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -1324,6 +1325,13 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1423,6 +1424,13 @@ void ggml_cuda_mul_mat_vec_q(
          }
      }
  

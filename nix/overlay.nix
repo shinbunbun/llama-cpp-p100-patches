@@ -7,8 +7,8 @@
 final: prev:
 let
   patchSet = import ./patches.nix;
-  expected = patchSet.llamaCppVersion;
-  actual = "b" + prev.llama-cpp.version;
+  expected = patchSet.llamaCppTag;
+  actual = import ./upstream-tag.nix prev.llama-cpp;
 in
 {
   llama-cpp =

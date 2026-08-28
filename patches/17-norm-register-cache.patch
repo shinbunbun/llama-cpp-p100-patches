@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 09d9f3a..66c635b 100644
+index c3758cd50..5239f7ef4 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -127,10 +127,33 @@ static __global__ void rms_norm_f32(const float * x,

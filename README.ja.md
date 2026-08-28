@@ -51,7 +51,7 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 
 ## 状態
 
-- llama.cpp **`b10133`** に対して生成しており、**fuzz 0・オフセット 0** で適用できる
+- llama.cpp **`v0.2.0`** に対して生成しており、**fuzz 0・オフセット 0** で適用できる
   (`nix flake check` がこの両方と、`nix/patches.nix` の順序付きリストが `patches/` の
   中身と一致することを検証する)
 - upstream には未提出。明快な候補が 3 本ある。11 `penalties-direct` /
@@ -127,7 +127,7 @@ llama-cpp-patched = pkgs.llama-cpp.overrideAttrs (old: {
 });
 ```
 
-あるいは overlay を使う。ただし**最後に**適用し、`b10133` の無改変ツリーに当てること。
+あるいは overlay を使う。ただし**最後に**適用し、`v0.2.0` の無改変ツリーに当てること。
 fuzz 0 のパッチは、同じ行を先に書き換えたものがあると reject される:
 
 ```nix
@@ -145,7 +145,7 @@ sm_60 のコードが残らず、実行時に *"named symbol not found"* で落�
 ### Nix 以外
 
 ```console
-$ git clone --branch b10133 https://github.com/ggml-org/llama.cpp
+$ git clone --branch v0.2.0 https://github.com/ggml-org/llama.cpp
 $ cd llama.cpp
 $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
     patch -p1 -F0 < "$p" || { echo "FAILED: $p"; break; }
@@ -162,7 +162,7 @@ $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
 
 ### 新しい llama.cpp へのリベース
 
-1. `nix/patches.nix` の `llamaCppVersion` **と** `flake.nix` の `llama-cpp-src`
+1. `nix/patches.nix` の `llamaCppTag` **と** `flake.nix` の `llama-cpp-src`
    入力を上げる。この 2 つは別々のリテラルなので、必ず同時に変えること
 2. `nix flake check` を実行する。当たらなくなったパッチだけが落ちる
 3. 落ちたパッチごとに判断する。**upstream が直した**のであれば、パッチを削除し、

@@ -1,5 +1,5 @@
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 7b241e3..795b705 100644
+index 06dea1e1c..d87069c0c 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -9,6 +9,7 @@
@@ -10,7 +10,7 @@ index 7b241e3..795b705 100644
  #include <climits>
  #include <cmath>
  #include <cstring>
-@@ -108,6 +109,135 @@ struct ring_buffer {
+@@ -108,6 +109,145 @@ struct ring_buffer {
      std::vector<T> data;
  };
  
@@ -92,11 +92,21 @@ index 7b241e3..795b705 100644
 +// tokens, and with repeat >= 1 and non-negative freq/present the arithmetic is monotone
 +// non-increasing.  Anything past top-k sees exactly the same top-k either way, so it does not
 +// matter what it is.
-+static int common_sampler_prefilter_nkeep(const common_params_sampling & params, int n_vocab) {
++static int common_sampler_prefilter_nkeep(const common_params_sampling & params, const llama_vocab * vocab) {
 +    static const bool enabled = getenv("LLAMA_SAMPLER_PREFILTER")
 +        ? atoi(getenv("LLAMA_SAMPLER_PREFILTER")) != 0 : true;
 +
-+    if (!enabled || params.mirostat != 0 || params.top_k <= 0 || params.has_logit_bias()) {
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++
++    // common_sampler_init merges the model's suppress tokens into the logit_bias sampler and places
++    // it ahead of params.samplers, so a chain can reach top-k through logit_bias without the user
++    // asking for any bias.  A -INFINITY only lowers, but the count is not bounded by the margin, so
++    // both cases fall back rather than widen it.
++    int32_t n_suppress = 0;
++    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
++
++    if (!enabled || params.mirostat != 0 || params.top_k <= 0 ||
++        !params.logit_bias.empty() || n_suppress > 0) {
 +        return 0;
 +    }
 +
@@ -146,7 +156,7 @@ index 7b241e3..795b705 100644
  struct common_sampler {
      common_params_sampling params;
  
-@@ -121,13 +251,16 @@ struct common_sampler {
+@@ -121,13 +261,16 @@ struct common_sampler {
  
      llama_token_data_array cur_p;
  
@@ -164,7 +174,7 @@ index 7b241e3..795b705 100644
          const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
          const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
          const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
-@@ -152,9 +285,25 @@ struct common_sampler {
+@@ -152,9 +295,25 @@ struct common_sampler {
          } else {
              const auto * logits = llama_get_logits_ith(ctx, idx);
              GGML_ASSERT(logits != nullptr);
@@ -193,16 +203,16 @@ index 7b241e3..795b705 100644
              }
          }
  
-@@ -409,6 +558,8 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
+@@ -432,6 +591,8 @@ struct common_sampler * common_sampler_init(
          /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
          /* .cur     = */ {},
          /* .cur_p   = */ {},
-+        /* .pf_nkeep= */ common_sampler_prefilter_nkeep(params, llama_vocab_n_tokens(vocab)),
++        /* .pf_nkeep= */ common_sampler_prefilter_nkeep(params, vocab),
 +        /* .pf_idx  = */ {},
      };
  
      return result;
-@@ -561,7 +712,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+@@ -604,7 +765,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
      auto & chain = gsmpl->chain;
      auto & cur_p = gsmpl->cur_p; // initialized by set_logits
  

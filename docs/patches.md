@@ -2,7 +2,7 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-29 patches against llama.cpp `b10133`, grouped by scope below; the application
+30 patches against llama.cpp `v0.2.0`, grouped by scope below; the application
 order is the file numbering. Order matters: several touch the same files, and
 later ones build on earlier ones.
 

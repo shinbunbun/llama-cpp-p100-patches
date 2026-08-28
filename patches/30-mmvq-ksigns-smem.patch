@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index d53e08b..6620551 100644
+index 23debb3fb..7c89b556f 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -574,6 +574,10 @@ static __global__ void mul_mat_vec_q(
+@@ -640,6 +640,10 @@ static __global__ void mul_mat_vec_q(
      if constexpr (type == GGML_TYPE_IQ3_XXS) {
          iq3xxs_grid_smem_init(tid, blockDim.x*blockDim.y);
      }
@@ -13,7 +13,7 @@ index d53e08b..6620551 100644
  
      const     int row0 = rows_per_cuda_block*blockIdx.x;
      const     int blocks_per_row_x = ncols_x / qk;
-@@ -800,11 +804,14 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -866,11 +870,14 @@ static __global__ void mul_mat_vec_q_moe(
  
      const uint32_t token_idx   = threadIdx.y;
  
@@ -31,10 +31,10 @@ index d53e08b..6620551 100644
      const int      row0        = c_rows_per_block*blockIdx.x;
      const int      blocks_per_row_x = ncols_x / qk;
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index 6ff1735..61116c4 100644
+index b512972e5..2d1d22af9 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
-@@ -984,6 +984,49 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+@@ -1025,6 +1025,49 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
  }
  
@@ -84,7 +84,7 @@ index 6ff1735..61116c4 100644
  #define VDR_IQ2_XXS_Q8_1_MMVQ 2
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
-@@ -1000,15 +1043,13 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
+@@ -1041,15 +1084,13 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
  #pragma unroll
      for (int k0 = 0; k0 < 8; k0 += 2) {
          const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
@@ -103,7 +103,7 @@ index 6ff1735..61116c4 100644
          const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
          sumi = ggml_cuda_dp4a(grid1, u1, sumi);
      }
-@@ -1037,14 +1078,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
+@@ -1078,14 +1119,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
  #pragma unroll
      for (int l0 = 0; l0 < 8; l0 += 2) {
          const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
@@ -121,7 +121,7 @@ index 6ff1735..61116c4 100644
          const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
  
          if (l0 < 4) {
-@@ -1148,17 +1186,11 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+@@ -1189,17 +1227,11 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
      int sumi = 0;
  #pragma unroll
      for (int l0 = 0; l0 < 8; l0 += 2) {

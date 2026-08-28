@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index 8360e02..90620e9 100644
+index 771dd7494..7b62f19ec 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
 @@ -78,6 +78,61 @@ static __global__ void cpy_scalar_fastdiv(const char * cx, char * cdst, const in
@@ -154,7 +154,7 @@ index 8360e02..90620e9 100644
      const ggml_tensor * src0 = dst->src[0];
      ggml_cuda_cpy(ctx, src0, dst);
 diff --git a/ggml/src/ggml-cuda/cpy.cuh b/ggml/src/ggml-cuda/cpy.cuh
-index a7a87d8..d7dcdce 100644
+index a7a87d8fc..d7dcdce85 100644
 --- a/ggml/src/ggml-cuda/cpy.cuh
 +++ b/ggml/src/ggml-cuda/cpy.cuh
 @@ -4,4 +4,10 @@
@@ -169,10 +169,10 @@ index a7a87d8..d7dcdce 100644
 +
  void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 25f8b56..1d4cc49 100644
+index 25fb1760b..e3c9932b5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3146,6 +3146,126 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3275,6 +3275,126 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -299,7 +299,7 @@ index 25f8b56..1d4cc49 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -3170,6 +3290,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3299,6 +3419,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -350,7 +350,7 @@ index 25f8b56..1d4cc49 100644
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 66c635b..3588696 100644
+index 5239f7ef4..d3a4fbda4 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -340,6 +340,147 @@ static __global__ void l2_norm_f32(
@@ -502,7 +502,7 @@ index 66c635b..3588696 100644
          const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
          const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
 diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
-index a74f637..489d3d4 100644
+index a74f63767..489d3d4b8 100644
 --- a/ggml/src/ggml-cuda/norm.cuh
 +++ b/ggml/src/ggml-cuda/norm.cuh
 @@ -15,4 +15,10 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

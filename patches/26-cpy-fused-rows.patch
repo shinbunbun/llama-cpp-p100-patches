@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index 90620e9..be674ad 100644
+index 7b62f19ec..babb8aa8e 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
 @@ -90,6 +90,44 @@ struct cpy_fused_ptrs {
