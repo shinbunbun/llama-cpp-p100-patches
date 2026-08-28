@@ -178,6 +178,10 @@ from the middle generally means rebasing the rest.
    the same as a patch that is still worth having: several of these exist only
    because of a value upstream tuned for other hardware, and upstream may have
    retuned it.
+5. Land the consumers in the same change. `lib.llamaCppTag` and
+   `lib.upstreamTag` are the API: a consumer that reconstructs the tag from
+   `llama-cpp.version` breaks silently the moment upstream changes its version
+   scheme, which is what happened at `v0.2.0`.
 
 ## Where the numbers come from
 
