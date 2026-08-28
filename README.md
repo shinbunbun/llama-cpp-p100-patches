@@ -190,7 +190,8 @@ from the middle generally means rebasing the rest.
 5. Land the consumers in the same change. `lib.llamaCppTag` and
    `lib.upstreamTag` are the API: a consumer that reconstructs the tag from
    `llama-cpp.version` breaks silently the moment upstream changes its version
-   scheme, which is what happened at `v0.2.0`.
+   scheme, which is what happened at `v0.2.0`. `lib.upstreamTag` returns `null`
+   for a llama-cpp fetched by `rev`, so handle that rather than interpolating it.
 
 ## Where the numbers come from
 

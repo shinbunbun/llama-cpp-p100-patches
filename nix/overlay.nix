@@ -8,9 +8,7 @@ final: prev:
 let
   patchSet = import ./patches.nix;
   expected = patchSet.llamaCppTag;
-  # Deliberately not nix/upstream-tag.nix: that throws on a tagless src, which would
-  # turn this overlay's warning into a hard evaluation failure.
-  actual = prev.llama-cpp.src.tag or null;
+  actual = import ./upstream-tag.nix prev.llama-cpp;
 in
 {
   llama-cpp =

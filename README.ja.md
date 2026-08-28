@@ -181,7 +181,8 @@ $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
    存在しており、upstream がその値を見直している可能性がある
 5. 利用側も同じ変更に含める。API は `lib.llamaCppTag` と `lib.upstreamTag` である。
    `llama-cpp.version` からタグ名を組み立てている利用側は、upstream がバージョン体系を
-   変えた瞬間に黙って壊れる。`v0.2.0` で実際にそうなった
+   変えた瞬間に黙って壊れる。`v0.2.0` で実際にそうなった。`lib.upstreamTag` は `rev` で
+   取得された llama-cpp に対して `null` を返すので、そのまま文字列に埋めないこと
 
 ## 測定環境
 

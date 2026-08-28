@@ -130,9 +130,10 @@ two and each thread accumulates two terms instead of one. That is the same set
 of products in a different order, so the result is correct but **not
 bit-identical** there (for Q4_0, `ncols_x` in 1056..1536: `blocks_per_iter_1warp`
 is 16, so `need` reaches 3 at 33 blocks; 1024 is 32 blocks, which two warps cover
-exactly). At one or two warps
-the dropped warps contribute exact `+0.0f` and the per-lane term sets are
-unchanged, so those stay bit-identical.
+exactly). When `need` is 1 or 2 the dropped warps contribute exact `+0.0f` and
+the per-lane term sets are unchanged, so those stay bit-identical -- the
+predicate is `need`, not the launched warp count, which is 2 for `need` 2 and 3
+alike.
 
 ### 12 · `mmvq-f16-sm60` — `sm_60`
 
