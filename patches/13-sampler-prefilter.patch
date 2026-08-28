@@ -1,5 +1,5 @@
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 06dea1e1c..d87069c0c 100644
+index 06dea1e1c..52d9afac7 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -9,6 +9,7 @@
@@ -212,7 +212,27 @@ index 06dea1e1c..d87069c0c 100644
      };
  
      return result;
-@@ -604,7 +765,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+@@ -515,6 +676,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+         /* .prev    = */ gsmpl->prev,
+         /* .cur     = */ gsmpl->cur,
+         /* .cur_p   = */ gsmpl->cur_p,
++        /* .pf_nkeep= */ gsmpl->pf_nkeep,
++        /* .pf_idx  = */ {},
+     };
+ }
+ 
+@@ -535,6 +698,10 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     dst->cur        = src->cur;
+     dst->cur_p      = src->cur_p;
+     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
++    // pf_nkeep is derived from params, so it has to travel with them; pf_idx belongs to the
++    // logits dst has not built yet.
++    dst->pf_nkeep   = src->pf_nkeep;
++    dst->pf_idx.clear();
+     dst->t_total_us = src->t_total_us;
+ }
+ 
+@@ -604,7 +771,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
      auto & chain = gsmpl->chain;
      auto & cur_p = gsmpl->cur_p; // initialized by set_logits
  
