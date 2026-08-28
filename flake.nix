@@ -128,8 +128,10 @@
           # provides, and the patches only apply to llamaCppTag.  So a
           # nixpkgs bump that moves llama-cpp is a rebase, not a lock update,
           # and an automated lock bump must fail here rather than merge.
+          # Deliberately not nix/upstream-tag.nix: a tagless src has to fail this check with the
+          # message below, not abort the evaluation of every other check alongside it.
           nixpkgs-llama-cpp-pin = pkgs.runCommand "nixpkgs-llama-cpp-pin" { } ''
-            actual=${import ./nix/upstream-tag.nix pkgs.llama-cpp}
+            actual=${if (pkgs.llama-cpp.src.tag or null) == null then "(no tag)" else pkgs.llama-cpp.src.tag}
             expected=${patchSet.llamaCppTag}
             if [ "$actual" != "$expected" ]; then
               echo "nixpkgs has llama-cpp $actual, but the patches are generated"
