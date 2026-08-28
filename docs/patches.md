@@ -635,6 +635,13 @@ split and alloc entirely.
 | 8 | 295 | +1.35% | +132 MiB |
 | 16 | 301 | — | — |
 
+Slots are skipped entirely when the context carries backend samplers. A sampler
+object is shared across slots but caches `ggml_tensor` pointers into the graph it
+was last applied to (`penalties`' `inp_token_ids` / `inp_counts`, `dist`'s
+`inp_uniforms`), and `set_input` writes through them on every decode including a
+slot hit — so alternating slots would write one slot's inputs while another
+slot's graph runs.
+
 4 is the default because the asymmetry is severe: running out of VRAM means the
 model does not load, while 0.38 points — real, and well above the ±0.07%
 resolution established in [benchmarking.md](benchmarking.md), but small — is not

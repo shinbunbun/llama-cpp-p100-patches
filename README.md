@@ -60,9 +60,9 @@ time and do not compose.
   `penalties-direct`, 21 `sched-reset-lazy`, 28 `top-k-partial` are all
   architecture-independent, bit-identical, and fall back to the original path on
   any input they do not handle. Nothing but time has kept them out.
-- `test-backend-ops` passes on a P100 with the full set applied: 13,327 tests,
-  no failures — the same count and the same result as the unpatched build on the
-  same machine.
+- `test-backend-ops` passes on a P100 with the full set applied: on `v0.2.0`,
+  13,352 tests, no failures — the same count and the same result as the
+  unpatched `v0.2.0` build on the same machine.
 - Unless a patch says otherwise, its output is **bit-identical** to the
   unpatched build. Three do change output (03 above one row, 12 at the widths it
   takes, 15 by design) and say so with the evidence.
