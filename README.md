@@ -74,7 +74,10 @@ time and do not compose.
 - Unless a patch says otherwise, its output is **bit-identical** to the
   unpatched build. Four do change output (03 above one row, 09 where K needs
   three of the four warps, 12 at the widths it takes, 15 by design) and say so
-  with the evidence.
+  with the evidence. 22 is the one whose bit-identity is **measured rather than
+  argued**: its `n_tokens <= 4` default comes from a dense and an MoE model
+  staying identical there, not from a proof that a different compute-buffer
+  layout cannot change a fusion decision.
 - **This repository is expected to shrink.** Anything upstream fixes should be
   deleted here rather than carried forward; the value is in the measurements as
   much as in the code.
