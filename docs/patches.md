@@ -128,7 +128,9 @@ rows are iterated by the same threads, so the idle ones stay idle.
 Only 1, 2 and 4 warps are instantiated, so a K that needs three of the four gets
 two and each thread accumulates two terms instead of one. That is the same set
 of products in a different order, so the result is correct but **not
-bit-identical** there (for Q4_0, `ncols_x` in 1025..1536). At one or two warps
+bit-identical** there (for Q4_0, `ncols_x` in 1056..1536: `blocks_per_iter_1warp`
+is 16, so `need` reaches 3 at 33 blocks; 1024 is 32 blocks, which two warps cover
+exactly). At one or two warps
 the dropped warps contribute exact `+0.0f` and the per-lane term sets are
 unchanged, so those stay bit-identical.
 
