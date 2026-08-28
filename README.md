@@ -64,8 +64,9 @@ time and do not compose.
   13,352 tests, no failures — the same count and the same result as the
   unpatched `v0.2.0` build on the same machine.
 - Unless a patch says otherwise, its output is **bit-identical** to the
-  unpatched build. Three do change output (03 above one row, 12 at the widths it
-  takes, 15 by design) and say so with the evidence.
+  unpatched build. Four do change output (03 above one row, 09 where K needs
+  three of the four warps, 12 at the widths it takes, 15 by design) and say so
+  with the evidence.
 - **This repository is expected to shrink.** Anything upstream fixes should be
   deleted here rather than carried forward; the value is in the measurements as
   much as in the code.

@@ -125,6 +125,13 @@ Q3_K 106.59 → 48.27, IQ2_XS 24.00 → 20.76.
 **+1.29% MoE decode; dense unchanged within noise (+0.12%, floor ±0.17%).** Raising `rows_per_block` cannot fix this —
 rows are iterated by the same threads, so the idle ones stay idle.
 
+Only 1, 2 and 4 warps are instantiated, so a K that needs three of the four gets
+two and each thread accumulates two terms instead of one. That is the same set
+of products in a different order, so the result is correct but **not
+bit-identical** there (for Q4_0, `ncols_x` in 1025..1536). At one or two warps
+the dropped warps contribute exact `+0.0f` and the per-lane term sets are
+unchanged, so those stay bit-identical.
+
 ### 12 · `mmvq-f16-sm60` — `sm_60`
 
 A Q4_1 GEMV built on HFMA2, the largest patch here. Per issue slot HFMA2 is
