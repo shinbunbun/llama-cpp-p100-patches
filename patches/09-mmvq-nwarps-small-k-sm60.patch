@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 29b1dcf83..18aaa5aea 100644
+index 29b1dcf83..5659460f7 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -415,8 +415,32 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
@@ -132,16 +132,24 @@ index 29b1dcf83..18aaa5aea 100644
          if (is_nvidia_turing_plus) {
              if (ncols_dst == 1 &&
                      std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
-@@ -1016,7 +1061,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1016,7 +1061,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
              use = false;
          }
  
 -        return use;
++        // Above this point the only GENERIC device that computed a warp count is Pascal, and it
++        // has already returned.  For every other GENERIC device (Volta through Blackwell) a 1 here
++        // would be read by calc_nwarps as "one warp" and collapse a 4-warp block.  Upstream's flag
++        // is a no-op for them anyway: calc_rows_per_block returns 4 for ncols_dst == 1 either way.
++        if (table_id == MMVQ_PARAMETERS_GENERIC) {
++            return 0;
++        }
++
 +        return use ? 1 : 0;
      };
  
      // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
-@@ -1058,11 +1103,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1058,11 +1111,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
  
              // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
              const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
@@ -156,7 +164,7 @@ index 29b1dcf83..18aaa5aea 100644
  
                  constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
  
-@@ -1075,12 +1120,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1075,12 +1128,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
                      stream);
              };
  
