@@ -47,6 +47,14 @@ unaffected; the MoE model carries 31.7% of its bytes in IQ3_XXS and 47.9% in
 IQ2_XS, and picks up about 1% from patch 29 and 1.5% from patch 30 in separate
 two-round A/Bs, so its figure is a slight underestimate.
 
+**The table also predates the `v0.2.0` rebase**, and stock-vs-patched has not
+been re-taken on `v0.2.0`. What was measured for the rebase is the upgrade
+itself — the patched `b10133` build against the patched `v0.2.0` one, on the same
+card with `llama-bench` (`-ngl 56 -fa 1`, arms interleaved, first round discarded,
+three rounds each): 9B dense pp512 +1.15% / tg64 +0.15%, MoE pp512 −0.03% /
+tg64 +0.47%. That bounds the rebase as a non-regression; it does not restate what
+the set is worth against stock `v0.2.0`.
+
 This is the whole set against no patches. It is **not** the sum of the per-patch
 numbers below, which were each measured against the stack as it stood at the
 time and do not compose.
