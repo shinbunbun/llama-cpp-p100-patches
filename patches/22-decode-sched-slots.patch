@@ -1,5 +1,5 @@
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 52f8d5367..5fce4e399 100644
+index 52f8d5367..a6a56a937 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -603,6 +603,44 @@ void llama_context::sched_reserve() {
@@ -64,7 +64,7 @@ index 52f8d5367..5fce4e399 100644
  
          if (!mctx->apply()) {
              LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
-@@ -1329,29 +1368,88 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1329,29 +1368,95 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -73,7 +73,14 @@ index 52f8d5367..5fce4e399 100644
 +    // Route small ubatches (decode / draft) through a slot that owns its own scheduler.
 +    // Because each slot has its own scheduler, a hit skips build / reset / split / alloc
 +    // entirely, exactly like upstream's single-graph reuse.
-+    const bool use_slot = !dec_slots.empty() && (int) ubatch.n_tokens <= dec_max_tok;
++    //
++    // Backend samplers are excluded: a sampler object is shared across slots but caches
++    // ggml_tensor pointers into the graph it was last applied to (llama_sampler_penalties'
++    // inp_token_ids / inp_counts, llama_sampler_dist' inp_uniforms).  set_input writes
++    // through those pointers on every decode including a slot hit, so alternating slots
++    // would write one slot's inputs while another slot's graph executes.
++    const bool use_slot = !dec_slots.empty() && (int) ubatch.n_tokens <= dec_max_tok &&
++                          sampling.samplers.empty();
 +
 +    llm_graph_result *   res  = nullptr;
 +    ggml_backend_sched_t sch  = nullptr;
@@ -159,7 +166,7 @@ index 52f8d5367..5fce4e399 100644
  
          //const auto t_start_us = ggml_time_us();
  
-@@ -1365,10 +1463,49 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1365,10 +1470,49 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -213,7 +220,7 @@ index 52f8d5367..5fce4e399 100644
          }
      }
  
-@@ -1479,7 +1616,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1479,7 +1623,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
  
      // extract logits
      if (logits.data && t_logits) {
@@ -222,7 +229,7 @@ index 52f8d5367..5fce4e399 100644
          GGML_ASSERT(backend_res != nullptr);
          GGML_ASSERT(logits.data != nullptr);
  
-@@ -1488,7 +1625,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1488,7 +1632,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
  
      // extract embeddings
      if (embd.data && t_embd) {
@@ -231,7 +238,7 @@ index 52f8d5367..5fce4e399 100644
          GGML_ASSERT(backend_embd != nullptr);
  
          switch (cparams.pooling_type) {
-@@ -1543,7 +1680,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1543,7 +1687,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
  
      // extract nextn embeddings (hidden state before the final output norm)
      if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
@@ -240,7 +247,7 @@ index 52f8d5367..5fce4e399 100644
          GGML_ASSERT(backend_h != nullptr);
  
          const uint32_t n_embd = hparams.n_embd_out();
-@@ -1861,7 +1998,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1861,7 +2005,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          // extract logits
          if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
@@ -249,7 +256,7 @@ index 52f8d5367..5fce4e399 100644
              GGML_ASSERT(backend_res != nullptr);
              GGML_ASSERT(logits.data != nullptr);
  
-@@ -1876,7 +2013,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1876,7 +2020,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          // extract embeddings
          if (embd.data && t_embd && n_outputs > 0) {
@@ -258,7 +265,7 @@ index 52f8d5367..5fce4e399 100644
              GGML_ASSERT(backend_embd != nullptr);
  
              switch (cparams.pooling_type) {
-@@ -1944,7 +2081,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1944,7 +2088,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
              const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
  
              if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
@@ -267,7 +274,7 @@ index 52f8d5367..5fce4e399 100644
                  GGML_ASSERT(backend_h != nullptr);
  
                  const uint32_t n_embd  = hparams.n_embd_out();
-@@ -1959,10 +2096,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1959,10 +2103,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
              const auto stride = n_vocab;
  
              // async copy the sampling data from the backend to the host
@@ -282,7 +289,7 @@ index 52f8d5367..5fce4e399 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -2213,7 +2350,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+@@ -2213,7 +2357,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
          const size_t dst_offset = token_offset * row_floats;
          GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
  
@@ -291,7 +298,7 @@ index 52f8d5367..5fce4e399 100644
          GGML_ASSERT(backend != nullptr);
          ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
      }
-@@ -2410,6 +2547,7 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2410,6 +2554,7 @@ ggml_cgraph * llama_context::graph_reserve(
  
      // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
      gf_res_prev->reset();
@@ -299,7 +306,7 @@ index 52f8d5367..5fce4e399 100644
  
      // store the n_outputs as it is, and restore it afterwards
      // TODO: not sure if needed, might simplify in the future by removing this
-@@ -2448,6 +2586,22 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -2448,6 +2593,22 @@ ggml_cgraph * llama_context::graph_reserve(
      return gf;
  }
  
@@ -322,7 +329,7 @@ index 52f8d5367..5fce4e399 100644
  llm_graph_params llama_context::graph_params(
                          llm_graph_result * res,
                        const llama_ubatch & ubatch,
-@@ -2491,7 +2645,7 @@ ggml_status llama_context::graph_compute(
+@@ -2491,7 +2652,7 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
