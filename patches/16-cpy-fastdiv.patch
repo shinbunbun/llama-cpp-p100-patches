@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index eb5eb0e..8360e02 100644
+index fd7ffc0bc..771dd7494 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
 @@ -41,6 +41,43 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne

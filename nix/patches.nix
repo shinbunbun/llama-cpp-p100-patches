@@ -3,13 +3,13 @@
 # Order matters: several patches touch the same files, and later ones build on
 # earlier ones (for example 09 reinterprets a value that 02 introduced).
 #
-# `llamaCppVersion` is the upstream tag the patches are generated against.  They
+# `llamaCppTag` is the upstream tag the patches are generated against.  They
 # apply at zero fuzz and zero offset on that tag; `nix flake check` verifies
 # that, and that this list matches the contents of patches/.
 {
   # Keep in sync with inputs.llama-cpp-src.url in flake.nix -- flake inputs must
   # be literals, so the tag cannot be shared between the two.
-  llamaCppVersion = "b10133";
+  llamaCppTag = "v0.2.0";
 
   patches = [
     ../patches/01-vmad-dp4a-sm60.patch

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a7..db34813 100644
+index 1b431a724..db34813af 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -27,7 +27,9 @@ gated_delta_net_cuda(const float * q,
@@ -150,7 +150,7 @@ index 1b431a7..db34813 100644
 +    ggml_cuda_op_gated_delta_net_impl(ctx, dst, cache, fuse_beta_sigmoid);
 +}
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
-index f9bf437..00d9362 100644
+index f9bf43706..00d936213 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cuh
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
 @@ -9,6 +9,13 @@ struct ggml_cuda_gated_delta_net_fused_cache {
@@ -168,10 +168,10 @@ index f9bf437..00d9362 100644
  void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                                ggml_cuda_gated_delta_net_fused_cache cache);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e45fc97..5dec1bf 100644
+index a6176de84..53c8bdafd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3343,6 +3343,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3472,6 +3472,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  

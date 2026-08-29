@@ -2,7 +2,7 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-29 patches against llama.cpp `b10133`, grouped by scope below; the application
+30 patches against llama.cpp `v0.2.0`, grouped by scope below; the application
 order is the file numbering. Order matters: several touch the same files, and
 later ones build on earlier ones.
 
@@ -124,6 +124,16 @@ Q3_K 106.59 → 48.27, IQ2_XS 24.00 → 20.76.
 
 **+1.29% MoE decode; dense unchanged within noise (+0.12%, floor ±0.17%).** Raising `rows_per_block` cannot fix this —
 rows are iterated by the same threads, so the idle ones stay idle.
+
+Only 1, 2 and 4 warps are instantiated, so a K that needs three of the four gets
+two and each thread accumulates two terms instead of one. That is the same set
+of products in a different order, so the result is correct but **not
+bit-identical** there (for Q4_0, `ncols_x` in 1056..1536: `blocks_per_iter_1warp`
+is 16, so `need` reaches 3 at 33 blocks; 1024 is 32 blocks, which two warps cover
+exactly). When `need` is 1 or 2 the dropped warps contribute exact `+0.0f` and
+the per-lane term sets are unchanged, so those stay bit-identical -- the
+predicate is `need`, not the launched warp count, which is 2 for `need` 2 and 3
+alike.
 
 ### 12 · `mmvq-f16-sm60` — `sm_60`
 
@@ -634,6 +644,22 @@ split and alloc entirely.
 | **4** (default) | 275 | **+0.97%** | +72 MiB |
 | 8 | 295 | +1.35% | +132 MiB |
 | 16 | 301 | — | — |
+
+Slots are skipped entirely when the context carries backend samplers. A sampler
+object is shared across slots but caches `ggml_tensor` pointers into the graph it
+was last applied to (`penalties`' `inp_token_ids` / `inp_counts`, `dist`'s
+`inp_uniforms`), and `set_input` writes through them on every decode including a
+slot hit — so alternating slots would write one slot's inputs while another
+slot's graph runs.
+
+The token cap is 4 because slot buffers are laid out differently from the main
+scheduler's, and `ggml_cuda_check_fusion_memory_ranges` decides fusion from the
+actual tensor addresses. topk-moe's exception (`ggml_nrows(node) <=
+GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK`, from patch 03) is why 5 is where the MoE
+flips — a verify batch of `n_draft + 1` falls just outside it — but it covers
+only the topk-moe call sites, so it explains the boundary rather than proving the
+bound. The bound itself is measured: at `n_tokens <= 4` both a dense and an MoE
+model stayed bit-identical.
 
 4 is the default because the asymmetry is severe: running out of VRAM means the
 model does not load, while 0.38 points — real, and well above the ±0.07%

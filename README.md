@@ -47,25 +47,37 @@ unaffected; the MoE model carries 31.7% of its bytes in IQ3_XXS and 47.9% in
 IQ2_XS, and picks up about 1% from patch 29 and 1.5% from patch 30 in separate
 two-round A/Bs, so its figure is a slight underestimate.
 
+**The table also predates the `v0.2.0` rebase**, and stock-vs-patched has not
+been re-taken on `v0.2.0`. What was measured for the rebase is the upgrade
+itself — the patched `b10133` build against the patched `v0.2.0` one, on the same
+card with `llama-bench` (`-ngl 56 -fa 1`, arms interleaved, first round discarded,
+three rounds each): 9B dense pp512 +1.15% / tg64 +0.15%, MoE pp512 −0.03% /
+tg64 +0.47%. That bounds the rebase as a non-regression; it does not restate what
+the set is worth against stock `v0.2.0`.
+
 This is the whole set against no patches. It is **not** the sum of the per-patch
 numbers below, which were each measured against the stack as it stood at the
 time and do not compose.
 
 ## Status
 
-- Generated against llama.cpp **`b10133`**, where they apply at **zero fuzz and
+- Generated against llama.cpp **`v0.2.0`**, where they apply at **zero fuzz and
   zero offset** (`nix flake check` verifies both, and that the file list matches
   the ordered list in `nix/patches.nix`).
 - Not submitted upstream. Three are straightforward candidates — 11
   `penalties-direct`, 21 `sched-reset-lazy`, 28 `top-k-partial` are all
   architecture-independent, bit-identical, and fall back to the original path on
   any input they do not handle. Nothing but time has kept them out.
-- `test-backend-ops` passes on a P100 with the full set applied: 13,327 tests,
-  no failures — the same count and the same result as the unpatched build on the
-  same machine.
+- `test-backend-ops` passes on a P100 with the full set applied: on `v0.2.0`,
+  13,352 tests, no failures — the same count and the same result as the
+  unpatched `v0.2.0` build on the same machine.
 - Unless a patch says otherwise, its output is **bit-identical** to the
-  unpatched build. Three do change output (03 above one row, 12 at the widths it
-  takes, 15 by design) and say so with the evidence.
+  unpatched build. Four do change output (03 above one row, 09 where K needs
+  three of the four warps, 12 at the widths it takes, 15 by design) and say so
+  with the evidence. 22 is the one whose bit-identity is **measured rather than
+  argued**: its `n_tokens <= 4` default comes from a dense and an MoE model
+  staying identical there, not from a proof that a different compute-buffer
+  layout cannot change a fusion decision.
 - **This repository is expected to shrink.** Anything upstream fixes should be
   deleted here rather than carried forward; the value is in the measurements as
   much as in the code.
@@ -132,7 +144,7 @@ llama-cpp-patched = pkgs.llama-cpp.overrideAttrs (old: {
 });
 ```
 
-or use the overlay — apply it **last**, and assume it needs a pristine `b10133`
+or use the overlay — apply it **last**, and assume it needs a pristine `v0.2.0`
 tree, because zero-fuzz patches reject against anything that has already
 rewritten the same lines:
 
@@ -151,7 +163,7 @@ code generation, so the flake pins `cudaPackages_12`.
 ### Without Nix
 
 ```console
-$ git clone --branch b10133 https://github.com/ggml-org/llama.cpp
+$ git clone --branch v0.2.0 https://github.com/ggml-org/llama.cpp
 $ cd llama.cpp
 $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
     patch -p1 -F0 < "$p" || { echo "FAILED: $p"; break; }
@@ -168,7 +180,7 @@ from the middle generally means rebasing the rest.
 
 ### Rebasing onto a newer llama.cpp
 
-1. Bump `llamaCppVersion` in `nix/patches.nix` **and** the `llama-cpp-src` input
+1. Bump `llamaCppTag` in `nix/patches.nix` **and** the `llama-cpp-src` input
    in `flake.nix` — they are separate literals and must be changed together.
 2. `nix flake check`. It fails on exactly the patches that no longer apply.
 3. For each failure decide which it is: **fixed upstream** — delete the patch,
@@ -178,6 +190,11 @@ from the middle generally means rebasing the rest.
    the same as a patch that is still worth having: several of these exist only
    because of a value upstream tuned for other hardware, and upstream may have
    retuned it.
+5. Land the consumers in the same change. `lib.llamaCppTag` and
+   `lib.upstreamTag` are the API: a consumer that reconstructs the tag from
+   `llama-cpp.version` breaks silently the moment upstream changes its version
+   scheme, which is what happened at `v0.2.0`. `lib.upstreamTag` returns `null`
+   for a llama-cpp fetched by `rev`, so handle that rather than interpolating it.
 
 ## Where the numbers come from
 

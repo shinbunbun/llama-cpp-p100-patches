@@ -7,8 +7,8 @@
 final: prev:
 let
   patchSet = import ./patches.nix;
-  expected = patchSet.llamaCppVersion;
-  actual = "b" + prev.llama-cpp.version;
+  expected = patchSet.llamaCppTag;
+  actual = import ./upstream-tag.nix prev.llama-cpp;
 in
 {
   llama-cpp =
@@ -18,8 +18,9 @@ in
       prev.lib.warnIf (actual != expected)
         ''
           llama-cpp-p100-patches: the patches are generated against ${expected}, but
-          nixpkgs has ${actual}.  They apply at zero fuzz only on ${expected} and will
-          reject otherwise.  Pin nixpkgs to that tag, or rebase the patches.
+          nixpkgs has ${if actual == null then "no tag (fetched by rev)" else actual}.
+          They apply at zero fuzz only on ${expected} and will reject otherwise.
+          Pin nixpkgs to that tag, or rebase the patches.
         ''
         (
           prev.llama-cpp.overrideAttrs (old: {

@@ -7,7 +7,7 @@
     # Pinned only so `nix flake check` can verify the patches still apply at zero
     # fuzz.  Consumers are not forced onto this revision.
     llama-cpp-src = {
-      url = "github:ggml-org/llama.cpp/b10133";
+      url = "github:ggml-org/llama.cpp/v0.2.0";
       flake = false;
     };
   };
@@ -53,7 +53,10 @@
       #   llama-cpp.overrideAttrs (old: {
       #     patches = (old.patches or []) ++ inputs.llama-cpp-p100-patches.lib.patches;
       #   })
-      lib = { inherit (patchSet) patches llamaCppVersion; };
+      lib = {
+        inherit (patchSet) patches llamaCppTag;
+        upstreamTag = import ./nix/upstream-tag.nix;
+      };
 
       overlays.default = import ./nix/overlay.nix;
 
@@ -122,12 +125,14 @@
 
           # The locked nixpkgs is part of the pin, not an implementation detail:
           # the overlay and #llama-cpp-sm60 patch whatever llama-cpp nixpkgs
-          # provides, and the patches only apply to llamaCppVersion.  So a
+          # provides, and the patches only apply to llamaCppTag.  So a
           # nixpkgs bump that moves llama-cpp is a rebase, not a lock update,
           # and an automated lock bump must fail here rather than merge.
           nixpkgs-llama-cpp-pin = pkgs.runCommand "nixpkgs-llama-cpp-pin" { } ''
-            actual=b${pkgs.llama-cpp.version}
-            expected=${patchSet.llamaCppVersion}
+            actual="${
+              let t = import ./nix/upstream-tag.nix pkgs.llama-cpp; in if t == null then "(no tag)" else t
+            }"
+            expected="${patchSet.llamaCppTag}"
             if [ "$actual" != "$expected" ]; then
               echo "nixpkgs has llama-cpp $actual, but the patches are generated"
               echo "against $expected and apply at zero fuzz only on that tag."

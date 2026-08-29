@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
-index 6e834dd..8149a19 100644
+index 6e834ddbc..8149a1962 100644
 --- a/ggml/src/ggml-cuda/concat.cu
 +++ b/ggml/src/ggml-cuda/concat.cu
 @@ -211,8 +211,265 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -309,7 +309,7 @@ index 6e834dd..8149a19 100644
              case 8:
                  concat_cuda<uint64_t>(src0, src1, dst, dim, stream);
 diff --git a/ggml/src/ggml-cuda/concat.cuh b/ggml/src/ggml-cuda/concat.cuh
-index aa506a0..4369856 100644
+index aa506a05f..436985623 100644
 --- a/ggml/src/ggml-cuda/concat.cuh
 +++ b/ggml/src/ggml-cuda/concat.cuh
 @@ -2,4 +2,16 @@
@@ -330,10 +330,10 @@ index aa506a0..4369856 100644
 +
  void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cf07696..626b0f1 100644
+index 0b3669dbe..6d543c8de 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3359,6 +3359,55 @@ static bool ggml_cuda_node_reads(const ggml_tensor * n, const ggml_tensor * t) {
+@@ -3488,6 +3488,55 @@ static bool ggml_cuda_node_reads(const ggml_tensor * n, const ggml_tensor * t) {
      return false;
  }
  
@@ -389,7 +389,7 @@ index cf07696..626b0f1 100644
  // If the deferred GET_ROWS belongs to this gdn, build the fold description for it
  static bool ggml_cuda_take_deferred_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * gdn,
                                             ggml_cuda_gated_delta_net_fused_gather & out) {
-@@ -3424,38 +3473,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3553,38 +3602,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                      break;      // something reads it before gdn does, so it cannot be deferred
                  }
              }

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index 9681cd2..e64a692 100644
+index 9681cd293..e64a69241 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
 @@ -48,6 +48,233 @@ static int next_power_of_2(int x) {

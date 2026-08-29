@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e73a7b8..cb1336b 100644
+index a8a1c09ca..8451ae7df 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2877,8 +2877,12 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+@@ -2975,8 +2975,12 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
      };
  
      bool is_ok = true;
@@ -18,7 +18,7 @@ index e73a7b8..cb1336b 100644
      }
  
 diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
-index c8cec70..f7d16a1 100644
+index c8cec70bb..f7d16a16c 100644
 --- a/ggml/src/ggml-cuda/topk-moe.cu
 +++ b/ggml/src/ggml-cuda/topk-moe.cu
 @@ -87,7 +87,15 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
@@ -190,7 +190,7 @@ index c8cec70..f7d16a1 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/topk-moe.cuh b/ggml/src/ggml-cuda/topk-moe.cuh
-index 091ef02..6c2b1c0 100644
+index 091ef02a4..6c2b1c0c9 100644
 --- a/ggml/src/ggml-cuda/topk-moe.cuh
 +++ b/ggml/src/ggml-cuda/topk-moe.cuh
 @@ -3,6 +3,11 @@
