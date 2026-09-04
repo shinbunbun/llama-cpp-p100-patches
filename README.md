@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-30 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
+31 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 developed and measured on a **Tesla P100 (GP100, sm_60)**.
 
 日本語版: [README.ja.md](README.ja.md)
@@ -14,7 +14,7 @@ has full-rate HFMA2 — so llama.cpp's quantized matmul paths fall back to
 emulation and cuBLAS, while the one instruction the card is genuinely good at
 goes unused. The patches named `sm60` exploit that asymmetry.
 
-**But only 7 of the 30 are gated to Pascal-era hardware.** One more changes an
+**But only 8 of the 31 are gated to Pascal-era hardware.** One more changes an
 unconditional constant that every GPU sees. The remaining 22 are not
 hardware-scoped at all — kernel fusions, index-arithmetic fixes, two host-side
 sampler paths, two scheduler patches, a `top_k` that avoids sorting the whole
@@ -122,6 +122,7 @@ each was measured against the stack as it stood at the time.
 | 28 | `top-k-partial` | CUDA | 7.6× kernel, ~1.1% of decode |
 | 29 | `mmvq-iq3xxs-grid-smem` | CUDA | +3.1–7.6% decode (dense), bit-identical |
 | 30 | `mmvq-ksigns-smem` | CUDA | +0.2–1.8% decode, −9.3% IQ3_XXS kernel, bit-identical |
+| 31 | `fattn-f16-kv-chunk` | pre-Turing | −960 MiB compute buffer at ctx 262,144 (1,152 → 192), decode unchanged |
 
 Scope tags, details, kill switches and the rejected alternatives:
 **[docs/patches.md](docs/patches.md)**.

@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-[llama.cpp](https://github.com/ggml-org/llama.cpp) の性能パッチ 30 本。
+[llama.cpp](https://github.com/ggml-org/llama.cpp) の性能パッチ 31 本。
 **Tesla P100 (GP100, sm_60)** 上で開発し、実測した。
 
 English: [README.md](README.md)
@@ -14,7 +14,7 @@ $ nix build github:shinbunbun/llama-cpp-p100-patches#llama-cpp-sm60
 cuBLAS に落ちる一方で、このカードが本当に得意な命令は使われないままになる。
 名前に `sm60` が付くパッチは、この非対称性を突いたものである。
 
-**とはいえ、30 本のうち Pascal 世代に限定されているのは 7 本だけである。** もう 1 本は
+**とはいえ、31 本のうち Pascal 世代に限定されているのは 8 本だけである。** もう 1 本は
 アーキテクチャで分岐しない定数を変えるので、全 GPU に影響する。残る 22 本はハードウェアに
 依存しない。内訳はカーネル融合、添字計算の修正、ホスト側のサンプラー経路 2 本、
 スケジューラ 2 本、語彙全体のソートを避ける `top_k`、そして参照テーブル 2 種の共有メモリ化で
@@ -115,6 +115,7 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 | 28 | `top-k-partial` | CUDA | カーネル 7.6 倍、decode の約 1.1% |
 | 29 | `mmvq-iq3xxs-grid-smem` | CUDA | decode +3.1〜7.6% (dense)、出力ビット一致 |
 | 30 | `mmvq-ksigns-smem` | CUDA | decode +0.2〜1.8%、カーネル IQ3_XXS −9.3%、出力ビット一致 |
+| 31 | `fattn-f16-kv-chunk` | pre-Turing | ctx 262,144 で計算バッファ −960 MiB (1,152 → 192)、decode 不変 |
 
 適用範囲タグの定義、詳細、停止スイッチ、棄却した代案は
 **[docs/patches.ja.md](docs/patches.ja.md)** を参照。

@@ -42,5 +42,6 @@
     ../patches/28-top-k-partial.patch
     ../patches/29-mmvq-iq3xxs-grid-smem.patch
     ../patches/30-mmvq-ksigns-smem.patch
+    ../patches/31-fattn-f16-kv-chunk.patch
   ];
 }

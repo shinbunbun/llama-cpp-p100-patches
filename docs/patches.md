@@ -2,7 +2,7 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-30 patches against llama.cpp `v0.2.0`, grouped by scope below; the application
+31 patches against llama.cpp `v0.2.0`, grouped by scope below; the application
 order is the file numbering. Order matters: several touch the same files, and
 later ones build on earlier ones.
 
@@ -157,6 +157,66 @@ not this number.
 Knobs: `GGML_A16_NCOLS_MIN` / `GGML_A16_NCOLS_MAX` restrict the width range so
 the two kernels can be compared inside one binary; `GGML_A16_NWARPS`,
 `GGML_A16_QVEC`, `GGML_A16_SMALL_GRID` override the derived choices.
+
+### 31 · `fattn-f16-kv-chunk` — `pre-Turing`
+
+The tile flash-attention kernel (the path without tensor cores) reads K and V
+as F16, so with a quantized KV cache `launch_fattn` first converts the whole
+cache into a scratch buffer. ggml-alloc sizes that scratch at graph reservation
+for the **maximum** context: 4 bytes per token per KV column, 4 KiB/token for a
+4-head × 256 KV — 320 MiB at ctx 81,920 and 1,024 MiB at 262,144, paid whether
+the context is used or not, on top of the KV cache itself.
+
+The patch converts in chunks of 16,384 tokens, runs the kernel once per chunk
+with at least two parallel blocks so it writes unnormalized partials plus
+(max, sum), and folds each chunk into a running accumulator with an
+online-softmax merge kernel. The scratch is bounded by the chunk: 64 MiB.
+`GGML_CUDA_FA_F16_KV_CHUNK` sets the chunk in tokens (rounded up to 256);
+`0` disables chunking.
+
+Measured with a 27B model (64 layers, 16 with full attention, q4_0 KV, ubatch
+128, `LLAMA_DEC_SLOTS=0`), CUDA0 compute buffer:
+
+| ctx | before | after |
+|---:|---:|---:|
+| 81,920 | 360 MiB | 104 MiB |
+| 262,144 | 1,152 MiB | 192 MiB |
+
+Regression check at ctx 81,920 with every layer on the GPU: prefill 11k
+101.0 → 101.1, 40k 90.6 → 88.6, 66k 82.6 → 81.3 t/s; decode 20.46 → 20.39,
+14.78 → 14.68, 12.42 → 12.36 t/s; peak VRAM 14,043 → 13,787 MiB, flat across
+eight requests of mixed depth and length. Prefill gives up about 2% at depth to
+the extra launches (13 chunks × 16 layers per ubatch at 210k); decode goes
+through the vec kernel and is untouched.
+
+What the 960 MiB buys at ctx 262,144: fitting the model needed 14 of its 48
+SSM blocks (170 MiB each) on the CPU; with the patch, 8. Decode 11k 8.36 →
+11.04, 40k 7.47 → 9.54, 210k 4.33 → 4.93 t/s; prefill at 210k 52.2 → 53.0 t/s;
+peak 15,629 → 15,687 MiB with 582 MiB free.
+
+`test-backend-ops -o FLASH_ATTN_EXT` passes 2,938/2,938 both at
+`GGML_CUDA_FA_F16_KV_CHUNK=256` (290 cases with quantized KV and prefill-sized
+batches go through the chunked path) and at the default. Output is **not
+bit-identical** once the KV is longer than the chunk — the softmax is
+accumulated in a different order — and identical below it, where the code path
+is the original one. The mma kernel (Turing and later) uses stream-k and is
+excluded: it keeps the full-size scratch.
+
+Rejected: allocating the conversion from the pool instead of the compute
+buffer. That only turns a fixed cost into one proportional to the depth in use,
+and the VMM pool never shrinks, so the ceiling is the same.
+
+Regression check on the two README models, by the procedure in
+[benchmarking.md](benchmarking.md) (one binary with `GGML_CUDA_FA_F16_KV_CHUNK=0`
+as the off arm, the 30-patch build as control, arms interleaved, order reversed
+for the second half, ≤ 58 °C before every run, four rounds with the first
+discarded). Under the README conditions (`-ngl 56 -fa 1`, F16 KV) the
+conversion never runs and all three arms agree within 0.1%. With q4_0 KV at
+24k depth the chunked prefill costs 0.54% (9B) / 0.30% (35B-A3B) on pp512;
+decode is unchanged (vec kernel) — a −1.2% that showed up on the MoE only when
+a prefill test preceded the decode test in the same process vanished with
+`GGML_CUDA_DISABLE_FUSION=1` and with tg-only runs, i.e. it is the
+layout-dependent fusion decision described in benchmarking.md, not the kernel.
 
 ---
 
