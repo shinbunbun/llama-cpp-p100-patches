@@ -4,8 +4,8 @@
 
 29 patches, grouped by scope below; the application order is the file
 numbering. Order matters: several touch the same files, and later ones build
-on earlier ones. 28 are generated against llama.cpp `v0.4.0`; patch 31 is
-still on `v0.2.0` and has not been rebased yet (see [patches.nix](../nix/patches.nix)
+on earlier ones. All 29 are generated against llama.cpp `v0.4.0`, where they
+apply at zero fuzz and zero offset (see [patches.nix](../nix/patches.nix)
 and the top-level README for the current `llamaCppTag`).
 
 Every patch carries its full reasoning — including the measurements that

@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-31 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
+29 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 developed and measured on a **Tesla P100 (GP100, sm_60)**.
 
 日本語版: [README.ja.md](README.ja.md)
@@ -14,8 +14,8 @@ has full-rate HFMA2 — so llama.cpp's quantized matmul paths fall back to
 emulation and cuBLAS, while the one instruction the card is genuinely good at
 goes unused. The patches named `sm60` exploit that asymmetry.
 
-**But only 8 of the 31 are gated to Pascal-era hardware.** One more changes an
-unconditional constant that every GPU sees. The remaining 22 are not
+**But only 7 of the 29 are gated to Pascal-era hardware.** One more changes an
+unconditional constant that every GPU sees. The remaining 21 are not
 hardware-scoped at all — kernel fusions, index-arithmetic fixes, two host-side
 sampler paths, two scheduler patches, a `top_k` that avoids sorting the whole
 vocabulary, and two lookup tables staged in shared memory — though five of those
@@ -61,11 +61,9 @@ time and do not compose.
 
 ## Status
 
-- 28 of the 29 patches are generated against llama.cpp **`v0.4.0`**, where they
+- All 29 patches are generated against llama.cpp **`v0.4.0`**, where they
   apply at **zero fuzz and zero offset** (`nix flake check` verifies both, and
-  that the file list matches the ordered list in `nix/patches.nix`). Patch 31
-  is still generated against `v0.2.0` and has not been rebased yet — expect
-  `nix flake check` to fail on it until that happens.
+  that the file list matches the ordered list in `nix/patches.nix`).
 - Not submitted upstream. Three are straightforward candidates — 11
   `penalties-direct`, 21 `sched-reset-lazy`, 28 `top-k-partial` are all
   architecture-independent, bit-identical, and fall back to the original path on
@@ -96,10 +94,8 @@ each was measured against the stack as it stood at the time.
 |---:|---|---|---|
 | 01 | `vmad-dp4a-sm60` | sm_60 | +6.5–6.8% decode |
 | 02 | `mmvq-rows-per-block-sm60` | pre-Turing | +23.0% (llama-bench tg32, Q4_0) |
-| 03 | `topk-moe-multirow` | CUDA | +2.8–6.1% decode |
 | 04 | `concat-non-cont-flat` | CUDA | 18.0 → 4.7 µs kernel |
 | 05 | `mmvf-f32-pascal` | pre-Turing | +3.7–4.3% |
-| 06 | `mmq-mul-mat-id-sm60` | sm_60 | MoE prefill +20–41%, −200 MiB VRAM |
 | 07 | `mmvq-moe-rows-sm60` | all archs | +1.9% decode |
 | 08 | `mmvq-mmid-batch-sm60` | pre-Volta | +2.2% |
 | 09 | `mmvq-nwarps-small-k-sm60` | pre-Turing | +1.29% MoE decode |

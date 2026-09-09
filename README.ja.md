@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-[llama.cpp](https://github.com/ggml-org/llama.cpp) の性能パッチ 31 本。
+[llama.cpp](https://github.com/ggml-org/llama.cpp) の性能パッチ 29 本。
 **Tesla P100 (GP100, sm_60)** 上で開発し、実測した。
 
 English: [README.md](README.md)
@@ -14,8 +14,8 @@ $ nix build github:shinbunbun/llama-cpp-p100-patches#llama-cpp-sm60
 cuBLAS に落ちる一方で、このカードが本当に得意な命令は使われないままになる。
 名前に `sm60` が付くパッチは、この非対称性を突いたものである。
 
-**とはいえ、31 本のうち Pascal 世代に限定されているのは 8 本だけである。** もう 1 本は
-アーキテクチャで分岐しない定数を変えるので、全 GPU に影響する。残る 22 本はハードウェアに
+**とはいえ、29 本のうち Pascal 世代に限定されているのは 7 本だけである。** もう 1 本は
+アーキテクチャで分岐しない定数を変えるので、全 GPU に影響する。残る 21 本はハードウェアに
 依存しない。内訳はカーネル融合、添字計算の修正、ホスト側のサンプラー経路 2 本、
 スケジューラ 2 本、語彙全体のソートを避ける `top_k`、そして参照テーブル 2 種の共有メモリ化で
 ある。ただしこのうち 5 本は gated delta-net を持つモデルでしか発火せず、1 本は特定の
@@ -59,10 +59,9 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 
 ## 状態
 
-- 29 本中 28 本は llama.cpp **`v0.4.0`** に対して生成しており、**fuzz 0・オフセット 0**
+- 29 本すべてを llama.cpp **`v0.4.0`** に対して生成しており、**fuzz 0・オフセット 0**
   で適用できる (`nix flake check` がこの両方と、`nix/patches.nix` の順序付きリストが
-  `patches/` の中身と一致することを検証する)。パッチ31 のみ `v0.2.0` のままリベース未了
-  で、`nix flake check` はそこで失敗する
+  `patches/` の中身と一致することを検証する)
 - upstream には未提出。明快な候補が 3 本ある。11 `penalties-direct` /
   21 `sched-reset-lazy` / 28 `top-k-partial` はいずれもアーキテクチャ非依存で、
   出力はビット一致、扱えない入力では元の経路にフォールバックする。出していないのは
@@ -88,10 +87,8 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 |---:|---|---|---|
 | 01 | `vmad-dp4a-sm60` | sm_60 | decode +6.5〜6.8% |
 | 02 | `mmvq-rows-per-block-sm60` | pre-Turing | +23.0% (llama-bench tg32, Q4_0) |
-| 03 | `topk-moe-multirow` | CUDA | decode +2.8〜6.1% |
 | 04 | `concat-non-cont-flat` | CUDA | カーネル 18.0 → 4.7 µs |
 | 05 | `mmvf-f32-pascal` | pre-Turing | +3.7〜4.3% |
-| 06 | `mmq-mul-mat-id-sm60` | sm_60 | MoE prefill +20〜41%、VRAM −200 MiB |
 | 07 | `mmvq-moe-rows-sm60` | all archs | decode +1.9% |
 | 08 | `mmvq-mmid-batch-sm60` | pre-Volta | +2.2% |
 | 09 | `mmvq-nwarps-small-k-sm60` | pre-Turing | MoE decode +1.29% |
