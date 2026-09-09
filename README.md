@@ -65,9 +65,13 @@ time and do not compose.
   apply at **zero fuzz and zero offset** (`nix flake check` verifies both, and
   that the file list matches the ordered list in `nix/patches.nix`).
 - Not submitted upstream. Three are straightforward candidates — 11
-  `penalties-direct`, 21 `sched-reset-lazy`, 28 `top-k-partial` are all
-  architecture-independent, bit-identical, and fall back to the original path on
-  any input they do not handle. Nothing but time has kept them out.
+  `penalties-direct` and 21 `sched-reset-lazy` are architecture-independent,
+  bit-identical, and fall back to the original path on any input they do not
+  handle. 28 `top-k-partial` is the same, but "architecture-independent" holds
+  for CUDA only: on HIP builds without `cub::DeviceTopK` it now pre-empts
+  upstream's own radix top-k rather than a full sort (see
+  [docs/patches.md](docs/patches.md)). Nothing but time has kept any of them
+  out.
 - `test-backend-ops` passed on a P100 with the full set applied on `v0.2.0`
   (13,352 tests, no failures, matching the unpatched `v0.2.0` build on the same
   machine); this has not been re-taken on `v0.4.0`.

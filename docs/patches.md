@@ -367,6 +367,13 @@ candidates live in per-thread register arrays), for narrow rows, and for
 oversized grids.
 Kill switch: `GGML_CUDA_DISABLE_TOP_K_PARTIAL`.
 
+Since `v0.4.0`, upstream also ships `top_k_radix_cuda`, a HIP-only fallback
+(`!GGML_CUDA_USE_CUB && GGML_USE_HIP`, `ncols > 1024`) used when CUB is
+unavailable — this patch's guard runs before that branch, so on such a HIP
+build it pre-empts the radix top-k rather than a full sort. "Falls back to
+the existing sort" above, and the measurements below, are against the CUDA
+(no-CUB) full-sort baseline; they do not describe the HIP path.
+
 > This one is worth attention beyond Pascal: **every CUDA 12.x user with GPU
 > sampling pays a full-vocabulary sort per token.**
 
