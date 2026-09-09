@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 29b1dcf83..e7d92773d 100644
+index f7a2a1960..3b9579b5a 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -415,8 +415,32 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+@@ -427,8 +427,32 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #endif
  }
  
@@ -36,7 +36,7 @@ index 29b1dcf83..e7d92773d 100644
          switch (ncols_dst) {
              case 1:
              case 2:
-@@ -542,10 +566,17 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -554,10 +578,17 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
      return 1;
  }
  
@@ -55,7 +55,7 @@ index 29b1dcf83..e7d92773d 100644
                  if (small_k) {
                      return nwarps;
                  }
-@@ -555,7 +586,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+@@ -567,7 +598,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
                  // so several rows per block pay off.  Decode sweep (9B Q4_0, llama-bench tg32):
                  // 1 -> 46.9 / 2 -> 54.1 (+15.4%) / 4 -> 57.7 (+23.0%) / 8 -> 57.2 t/s.
                  // Turing+ / GCN are not measured here and keep the upstream value.
@@ -64,7 +64,7 @@ index 29b1dcf83..e7d92773d 100644
              case 2:
              case 3:
              case 4:
-@@ -579,7 +610,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+@@ -591,7 +622,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
      return 1;
  }
  
@@ -73,7 +73,7 @@ index 29b1dcf83..e7d92773d 100644
  __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
  static __global__ void mul_mat_vec_q(
          const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-@@ -875,7 +906,7 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -973,7 +1004,7 @@ static __global__ void mul_mat_vec_q_moe(
  template<ggml_type type>
  static std::pair<dim3, dim3> calc_launch_params(
          const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -82,7 +82,7 @@ index 29b1dcf83..e7d92773d 100644
      const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
      const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
      const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
-@@ -884,7 +915,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+@@ -982,7 +1013,7 @@ static std::pair<dim3, dim3> calc_launch_params(
      return {block_nums, block_dims};
  }
  
@@ -91,7 +91,7 @@ index 29b1dcf83..e7d92773d 100644
  static void mul_mat_vec_q_switch_fusion(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
-@@ -982,12 +1013,29 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1091,12 +1122,29 @@ static void mul_mat_vec_q_switch_ncols_dst(
      const int     blocks_per_row_x      = ncols_x / qk;
      const int     blocks_per_iter_1warp = vdr * warp_size / qi;
  
@@ -122,7 +122,7 @@ index 29b1dcf83..e7d92773d 100644
          constexpr std::array<ggml_type, 2> iq_slow_turing = {
              GGML_TYPE_IQ3_XXS,
              GGML_TYPE_IQ3_S,
-@@ -996,15 +1044,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1105,15 +1153,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
              GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
              GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
          };
@@ -141,7 +141,7 @@ index 29b1dcf83..e7d92773d 100644
          if (is_nvidia_turing_plus) {
              if (ncols_dst == 1 &&
                      std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
-@@ -1016,7 +1064,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1125,7 +1173,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
              use = false;
          }
  
@@ -158,7 +158,7 @@ index 29b1dcf83..e7d92773d 100644
      };
  
      // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
-@@ -1058,11 +1114,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1167,11 +1223,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
  
              // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
              const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
@@ -173,7 +173,7 @@ index 29b1dcf83..e7d92773d 100644
  
                  constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
  
-@@ -1075,12 +1131,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1184,12 +1240,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
                      stream);
              };
  

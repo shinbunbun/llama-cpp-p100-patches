@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 3d6310f3f..1fc2c523c 100644
+index 6862128e6..300447b71 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1821,6 +1821,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1881,6 +1881,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
      sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
      sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
  
@@ -15,7 +15,7 @@ index 3d6310f3f..1fc2c523c 100644
      const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
      const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
      sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
-@@ -1894,9 +1900,38 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+@@ -1954,9 +1960,38 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      // reset state for the next run
      if (!sched->is_reset) {

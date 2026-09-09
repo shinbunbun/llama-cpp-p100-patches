@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 19df607f3..29b1dcf83 100644
+index 492c3f011..f7a2a1960 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -119,28 +119,49 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {

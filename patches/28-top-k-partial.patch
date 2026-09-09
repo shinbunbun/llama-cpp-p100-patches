@@ -1,10 +1,10 @@
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index 9681cd293..e64a69241 100644
+index c7a0c8317..b2b07b2b4 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
-@@ -48,6 +48,233 @@ static int next_power_of_2(int x) {
+@@ -210,6 +210,233 @@ static void top_k_radix_cuda(
  
- #endif                            // CUB_TOP_K_AVAILABLE
+ #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
  
 +// Partial selection for small k.  Where cub::DeviceTopK (CCCL >= 3.2) is unavailable, the
 +// caller below falls back to fully sorting the row and taking the first k -- but obtaining k
@@ -236,7 +236,7 @@ index 9681cd293..e64a69241 100644
  void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0   = dst->src[0];
      const float *       src0_d = (const float *) src0->data;
-@@ -63,6 +290,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -225,6 +452,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const int64_t    nrows = ggml_nrows(src0);
      const int64_t    k     = dst->ne[0];
      ggml_cuda_pool & pool  = ctx.pool();
