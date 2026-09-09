@@ -236,15 +236,17 @@ index c7a0c8317..b2b07b2b4 100644
  void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0   = dst->src[0];
      const float *       src0_d = (const float *) src0->data;
-@@ -225,6 +452,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -225,6 +452,18 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const int64_t    nrows = ggml_nrows(src0);
      const int64_t    k     = dst->ne[0];
      ggml_cuda_pool & pool  = ctx.pool();
 +
 +#ifndef CUB_TOP_K_AVAILABLE
 +    // Without cub::DeviceTopK, CUDA builds fall through to "full sort, take the first k"
-+    // below; HIP builds instead reach upstream's own radix top-k. This guard runs before
-+    // either, so the 172 us -> low tens of us (n = 151936, k = 10) measurement is CUDA-only.
++    // below; HIP builds with ncols > 1024 instead reach upstream's own radix top-k
++    // (HIP builds at or under 1024 still fall through to the full sort, same as CUDA).
++    // This guard runs before either, so the 172 us -> low tens of us (n = 151936, k = 10)
++    // measurement is CUDA-only.
 +    if (ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX &&
 +        top_k_partial_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
 +        return;
