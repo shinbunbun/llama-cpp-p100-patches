@@ -690,11 +690,12 @@ slot's graph runs.
 The token cap is 4 because slot buffers are laid out differently from the main
 scheduler's, and `ggml_cuda_check_fusion_memory_ranges` decides fusion from the
 actual tensor addresses. topk-moe's exception (`ggml_nrows(node) <=
-GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK`, from patch 03) is why 5 is where the MoE
-flips — a verify batch of `n_draft + 1` falls just outside it — but it covers
-only the topk-moe call sites, so it explains the boundary rather than proving the
-bound. The bound itself is measured: at `n_tokens <= 4` both a dense and an MoE
-model stayed bit-identical.
+TOPK_MOE_ROWS_PER_BLOCK`, = 8 upstream on `v0.4.0`) means a verify batch of
+`n_draft + 1 = 5` still falls inside it — the exception's own edge is at
+`n_tokens = 9`, not 5 — so it does not explain the measured boundary: both a
+dense and an MoE model stayed bit-identical at `n_tokens <= 4` and changed
+output at `n_tokens = 5`. The `n_tokens <= 4` cap is that measurement, not
+something read off the topk-moe exception.
 
 4 is the default because the asymmetry is severe: running out of VRAM means the
 model does not load, while 0.38 points — real, and well above the ±0.07%
@@ -706,9 +707,9 @@ restores upstream behaviour.
 `ggml_cuda_check_fusion_memory_ranges` decides fusion from actual tensor
 addresses, so a different buffer layout changes which fusions fire and
 therefore changes the output. topk-moe skips that check at
-`nrows <= GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK` (= 4), and inside that bound the
-layout does not matter — measured bit-identical at `n_tokens <= 4`, changing at
-5 and above.
+`nrows <= TOPK_MOE_ROWS_PER_BLOCK` (= 8 on `v0.4.0`), but the default of 4 is
+not read off that bound — it is measured bit-identical at `n_tokens <= 4`,
+changing at 5 and above.
 
 ---
 

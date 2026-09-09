@@ -23,12 +23,12 @@ index 3cc27717e..ee2b95d36 100644
 +        //   the output (both results are correct, but they are not bit-identical).  Slot buffers
 +        //   are sized for decode and are laid out differently from the main scheduler's.
 +        //   topk-moe has an exception that skips the address check when
-+        //   ggml_nrows(node) <= GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK (= 4), which is why 5 is where
-+        //   the MoE flips: a verify batch of n_draft + 1 = 5 falls just outside it.  That
-+        //   exception covers only the topk-moe call sites, so it explains the boundary rather
-+        //   than proving the bound -- the other check_fusion_memory_ranges call sites pass
-+        //   is_topk_moe = false and are address-sensitive at any n_tokens.  The bound itself is
-+        //   measured: at n_tokens <= 4 both a dense and an MoE model stayed bit-identical.
++        //   ggml_nrows(node) <= TOPK_MOE_ROWS_PER_BLOCK (= 8), so a verify batch of
++        //   n_draft + 1 = 5 still falls inside it -- the exception's own edge is at
++        //   n_tokens = 9, not 5, so it does not explain where the measured bit-identity
++        //   boundary actually sits.  The other check_fusion_memory_ranges call sites pass
++        //   is_topk_moe = false and are address-sensitive at any n_tokens.  n_tokens <= 4
++        //   below is empirical: both a dense and an MoE model changed output at n_tokens = 5.
 +        const char * LLAMA_DEC_MAX_TOK = getenv("LLAMA_DEC_MAX_TOK");
 +        dec_max_tok = LLAMA_DEC_MAX_TOK ? atoi(LLAMA_DEC_MAX_TOK) : 4;
 +        // Only rejects values outside the range a ubatch can take; it is not a safety bound.
