@@ -55,6 +55,11 @@ three rounds each): 9B dense pp512 +1.15% / tg64 +0.15%, MoE pp512 −0.03% /
 tg64 +0.47%. That bounds the rebase as a non-regression; it does not restate what
 the set is worth against stock `v0.2.0`.
 
+**The `v0.4.0` rebase adds a further gap**: neither the stock-vs-patched table
+above nor the `v0.2.0` non-regression check has been re-taken against the tree
+this rebase ships, so both numbers are now one more unmeasured rebase removed
+from what actually runs.
+
 This is the whole set against no patches. It is **not** the sum of the per-patch
 numbers below, which were each measured against the stack as it stood at the
 time and do not compose.
@@ -77,11 +82,12 @@ time and do not compose.
   machine); this has not been re-taken on `v0.4.0`.
 - Unless a patch says otherwise, its output is **bit-identical** to the
   unpatched build. A few do change output (09 where K needs three of the four
-  warps, 12 at the widths it takes, 15 by design) and say so with the
-  evidence. 22 is the one whose bit-identity is **measured rather than
-  argued**: its `n_tokens <= 4` default comes from a dense and an MoE model
-  staying identical there, not from a proof that a different compute-buffer
-  layout cannot change a fusion decision.
+  warps, 12 at the widths it takes, 15 by design, 31 once the KV cache is
+  longer than its chunk length) and say so with the evidence. 22 is the one
+  whose bit-identity is **measured rather than argued**: its `n_tokens <= 4`
+  default comes from a dense and an MoE model staying identical there, not
+  from a proof that a different compute-buffer layout cannot change a fusion
+  decision.
 - **This repository is expected to shrink.** Anything upstream fixes should be
   deleted here rather than carried forward; the value is in the measurements as
   much as in the code.
