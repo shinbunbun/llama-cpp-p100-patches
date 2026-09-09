@@ -61,20 +61,22 @@ time and do not compose.
 
 ## Status
 
-- Generated against llama.cpp **`v0.2.0`**, where they apply at **zero fuzz and
-  zero offset** (`nix flake check` verifies both, and that the file list matches
-  the ordered list in `nix/patches.nix`).
+- 28 of the 29 patches are generated against llama.cpp **`v0.4.0`**, where they
+  apply at **zero fuzz and zero offset** (`nix flake check` verifies both, and
+  that the file list matches the ordered list in `nix/patches.nix`). Patch 31
+  is still generated against `v0.2.0` and has not been rebased yet — expect
+  `nix flake check` to fail on it until that happens.
 - Not submitted upstream. Three are straightforward candidates — 11
   `penalties-direct`, 21 `sched-reset-lazy`, 28 `top-k-partial` are all
   architecture-independent, bit-identical, and fall back to the original path on
   any input they do not handle. Nothing but time has kept them out.
-- `test-backend-ops` passes on a P100 with the full set applied: on `v0.2.0`,
-  13,352 tests, no failures — the same count and the same result as the
-  unpatched `v0.2.0` build on the same machine.
+- `test-backend-ops` passed on a P100 with the full set applied on `v0.2.0`
+  (13,352 tests, no failures, matching the unpatched `v0.2.0` build on the same
+  machine); this has not been re-taken on `v0.4.0`.
 - Unless a patch says otherwise, its output is **bit-identical** to the
-  unpatched build. Four do change output (03 above one row, 09 where K needs
-  three of the four warps, 12 at the widths it takes, 15 by design) and say so
-  with the evidence. 22 is the one whose bit-identity is **measured rather than
+  unpatched build. A few do change output (09 where K needs three of the four
+  warps, 12 at the widths it takes, 15 by design) and say so with the
+  evidence. 22 is the one whose bit-identity is **measured rather than
   argued**: its `n_tokens <= 4` default comes from a dense and an MoE model
   staying identical there, not from a proof that a different compute-buffer
   layout cannot change a fusion decision.
@@ -145,7 +147,7 @@ llama-cpp-patched = pkgs.llama-cpp.overrideAttrs (old: {
 });
 ```
 
-or use the overlay — apply it **last**, and assume it needs a pristine `v0.2.0`
+or use the overlay — apply it **last**, and assume it needs a pristine `v0.4.0`
 tree, because zero-fuzz patches reject against anything that has already
 rewritten the same lines:
 
@@ -164,7 +166,7 @@ code generation, so the flake pins `cudaPackages_12`.
 ### Without Nix
 
 ```console
-$ git clone --branch v0.2.0 https://github.com/ggml-org/llama.cpp
+$ git clone --branch v0.4.0 https://github.com/ggml-org/llama.cpp
 $ cd llama.cpp
 $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
     patch -p1 -F0 < "$p" || { echo "FAILED: $p"; break; }

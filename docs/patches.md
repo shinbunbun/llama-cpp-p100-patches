@@ -2,9 +2,11 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-31 patches against llama.cpp `v0.2.0`, grouped by scope below; the application
-order is the file numbering. Order matters: several touch the same files, and
-later ones build on earlier ones.
+29 patches, grouped by scope below; the application order is the file
+numbering. Order matters: several touch the same files, and later ones build
+on earlier ones. 28 are generated against llama.cpp `v0.4.0`; patch 31 is
+still on `v0.2.0` and has not been rebased yet (see [patches.nix](../nix/patches.nix)
+and the top-level README for the current `llamaCppTag`).
 
 Every patch carries its full reasoning — including the measurements that
 justify it and the alternatives that were tried and rejected — in the comments
@@ -67,22 +69,6 @@ F32 `mul_mat` fell into cuBLAS SGEMM — 5.9% of decode GPU time.
 The one workload whose output was checked is bit-identical (and 3.6% faster);
 the others were not checked. Note the edited branch is `cc < TURING`, so it also
 raises the limit for Volta, which was not measured.
-
-### 06 · `mmq-mul-mat-id-sm60` — `sm_60`
-
-MMQ is disabled wholesale without native DP4A. **That is correct for dense
-`MUL_MAT`**: measured across every quantization tested at n=512, MMQ runs at
-0.49–0.61× the cuBLAS path, and forcing it on costs a dense model 56% of its
-prefill.
-
-`MUL_MAT_ID` is different, because there the alternative is not cuBLAS but the
-sorted-gather fallback: two stream syncs, a host triple loop, and one `mul_mat`
-per expert. A 0.6× kernel wins easily.
-
-**MoE prefill +20–41%** (no regression from 34 to 23,908 prompt tokens), and
-~200 MiB less peak VRAM. Perplexity is statistically indistinguishable
-(paired ΔNLL +0.0028 ± 0.0029, t = 0.96); against a CPU-backend reference the
-patched build is *closer* (+0.038% vs +0.224%).
 
 ### 07 · `mmvq-moe-rows-sm60` — `all archs`
 
@@ -221,24 +207,6 @@ layout-dependent fusion decision described in benchmarking.md, not the kernel.
 ---
 
 ## Architecture-independent CUDA
-
-### 03 · `topk-moe-multirow` — `CUDA`
-
-The fused MoE router kernel is restricted to a single row because its outputs
-alias its logits input. It already maps `rows_per_block` (4) rows to one block
-and reads each row fully before writing, so one block-wide barrier makes the
-exception safe for every row a block owns.
-
-Speculative decoding verifies `n_draft + 1` rows and hit this head-on, falling
-back to a six-kernel chain (4.0% of decode GPU time versus 1.0% fused).
-
-**+2.8–6.1% decode.**
-
-**Output is not bit-identical above one row.** The fused kernel replaces the
-argsort chain, and the two could already disagree on expert selection — removing
-that mismatch is what raises the acceptance rate. The `n_rows == 1` path upstream
-already fuses is untouched and stays bit-identical. No perplexity was taken for
-this one.
 
 ### 04 · `concat-non-cont-flat` — `CUDA`
 
