@@ -1,17 +1,21 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index fc9e9a0d7..b6913aa48 100644
+index cfc169d..0710085 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3697,6 +3697,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3708,6 +3708,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
 +    // Fuse ADD -> UNARY -> MUL into one launch (Qwen3.5's gate preprocessing).  These three
 +    // launches are 0.65% of decode GPU time, dominated by launch overhead rather than work.
++    //
++    // Off by default: same unguarded-memory-range hazard as 19's pre-add fusion above (its
++    // prologue reads the bias add's inputs in the same kernel that writes the ADD's `dst`,
++    // without going through `ggml_cuda_check_fusion_memory_ranges`) -- see the comment there.
 +    if (node->op == GGML_OP_ADD) {
-+        static bool disable_aum = getenv("GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL") != nullptr &&
-+                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL"));
-+        if (!disable_aum) {
++        static bool enable_aum = getenv("GGML_CUDA_FUSE_ADD_UNARY_MUL") != nullptr &&
++                                 std::atoi(getenv("GGML_CUDA_FUSE_ADD_UNARY_MUL"));
++        if (enable_aum) {
 +            static const ggml_op aum_ops[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
 +            int idxs[3];
 +            if (ggml_cuda_collect_ops(cgraph, i, aum_ops, 3, idxs)) {
@@ -32,7 +36,7 @@ index fc9e9a0d7..b6913aa48 100644
          static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
                                   std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
 diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
-index d3e594878..ece72b0b7 100644
+index d3e5948..ece72b0 100644
 --- a/ggml/src/ggml-cuda/unary.cu
 +++ b/ggml/src/ggml-cuda/unary.cu
 @@ -702,6 +702,113 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
@@ -150,7 +154,7 @@ index d3e594878..ece72b0b7 100644
  
  void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
 diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
-index 04f3af644..9f187e091 100644
+index 04f3af6..9f187e0 100644
 --- a/ggml/src/ggml-cuda/unary.cuh
 +++ b/ggml/src/ggml-cuda/unary.cuh
 @@ -93,6 +93,11 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

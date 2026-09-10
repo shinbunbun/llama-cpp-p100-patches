@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index ccd74e4bc..93cd517c5 100644
+index ccd74e4..93cd517 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1458,14 +1458,24 @@ struct ggml_backend_cuda_context {
@@ -30,7 +30,7 @@ index ccd74e4bc..93cd517c5 100644
      void q8_1_cache_clear() {
          q8_1_cache_src1   = nullptr;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0337aa6ab..8754d2143 100644
+index 00d290c..c7fbde0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3730,9 +3730,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
@@ -52,7 +52,7 @@ index 0337aa6ab..8754d2143 100644
                      cuda_ctx->gdn_gather_node  = node;
                      cuda_ctx->gdn_gather_owner = gdn;
                      return GGML_CUDA_FUSE_DEFERRED;
-@@ -4616,7 +4622,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4631,7 +4637,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      // Only defer node execution when concurrent streams are not in use: reordering across streams
      // is unsafe.  The record is cleared per graph computation.
      const bool                   allow_defer = stream_ctx.concurrent_events.empty();

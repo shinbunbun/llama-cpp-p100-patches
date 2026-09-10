@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index b6b7237ed..4e7d8e6e1 100644
+index b6b7237..cfc169d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3545,6 +3545,73 @@ static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, in
@@ -76,17 +76,28 @@ index b6b7237ed..4e7d8e6e1 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -3603,6 +3670,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3603,6 +3670,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
 +    // Fuse the residual add into RMS_NORM: ADD -> RMS_NORM -> MUL in one launch.  The
 +    // `k_bin_bcast(add) -> rms_norm` pair is 3.11% of decode GPU time.  Upstream only fuses what
 +    // comes AFTER rms_norm (mul / add); the preceding residual add passed through untouched.
++    //
++    // Off by default.  This fusion (and 20's add+unary+mul) writes the ADD's `dst` while its own
++    // prologue still reads `add->src[0]`/`src[1]` in the same kernel that the epilogue uses to
++    // write the MUL's `dst` -- neither goes through `ggml_cuda_check_fusion_memory_ranges`, so
++    // ggml-alloc can carve the MUL output out of the ADD inputs' just-freed block and have one
++    // invocation's epilogue write land on memory a different invocation's prologue still needs to
++    // read. This produced non-deterministic MoE decode output on Tesla P100 (same seed, three
++    // runs, three different outputs); gating on "graph contains MUL_MAT_ID" is not sufficient
++    // either, since backend scheduler splits can put the MUL_MAT_ID on a different (e.g. CPU)
++    // split and leave this fusion's view of the graph looking dense. The real fix is upstream's
++    // own memory-range check; until then this only runs when explicitly requested.
 +    if (node->op == GGML_OP_ADD) {
-+        static bool disable_pre_add = getenv("GGML_CUDA_DISABLE_FUSE_PRE_ADD") != nullptr &&
-+                                      std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_PRE_ADD"));
-+        if (!disable_pre_add && !ggml_cuda_graph_is_moe(cgraph)) { // dense-only; see norm.cu
++        static bool enable_pre_add = getenv("GGML_CUDA_FUSE_PRE_ADD") != nullptr &&
++                                     std::atoi(getenv("GGML_CUDA_FUSE_PRE_ADD"));
++        if (enable_pre_add) {
 +            static const ggml_op pre_add_ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
 +            int idxs[3];
 +            if (ggml_cuda_collect_ops(cgraph, i, pre_add_ops, 3, idxs)) {
@@ -111,7 +122,7 @@ index b6b7237ed..4e7d8e6e1 100644
          static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
                                   std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index d3a4fbda4..d9fbcaf84 100644
+index d3a4fbd..57ccdce 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -73,7 +73,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
@@ -287,47 +298,10 @@ index d3a4fbda4..d9fbcaf84 100644
          }
      }
  }
-@@ -763,6 +830,103 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -763,6 +830,66 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
                            eps, stream);
  }
  
-+// Whether cgraph contains a GGML_OP_MUL_MAT_ID node, i.e. is an MoE graph.  v0.4.0 added a
-+// dedicated MoE weighted-reduction fusion (ggml_cuda_match_moe_weighted_reduction in
-+// ggml-cuda.cu, see its `is_experts` / `is_weights` / `split_mul` helpers) and an aliasing check
-+// (`logits_may_alias`, also in ggml-cuda.cu) that the pre-add RMS_NORM fusion below does not
-+// know about: like that fusion, it duplicates upstream's {RMS_NORM, MUL} fusion conditions
-+// instead of calling into them (see ggml_cuda_should_fuse_rms_norm_mul in ggml-cuda.cu), so it
-+// has no way to see the MoE fusion or the alias check added alongside it. Fusing
-+// ADD -> RMS_NORM -> MUL inside an MoE graph without accounting for those produced
-+// non-deterministic decode output on Tesla P100 (same seed, three runs, three different
-+// outputs) even though the fused kernel itself is correct in isolation -- the conflict is with
-+// the other MoE-graph fusion, not with this fusion alone. Until the pre-add fusion is rewritten
-+// to go through upstream's ggml_cuda_can_fuse / ggml_cuda_can_fuse_subgraph machinery instead of
-+// duplicating its checks, it is skipped whenever the graph contains any MUL_MAT_ID node (see the
-+// call site in ggml_cuda_try_fuse). Cached per graph (keyed by cgraph identity + node count and
-+// its first node, since llama.cpp reuses the same cgraph allocation across evaluations) because
-+// ggml_cuda_try_fuse runs once per node and a linear scan per call would be O(n^2) over a graph.
-+bool ggml_cuda_graph_is_moe(const ggml_cgraph * cgraph) {
-+    static thread_local const ggml_cgraph  * cached_cgraph  = nullptr;
-+    static thread_local int                  cached_n_nodes = -1;
-+    static thread_local const ggml_tensor  * cached_node0   = nullptr;
-+    static thread_local bool                 cached_is_moe  = false;
-+    const ggml_tensor * node0 = cgraph->n_nodes > 0 ? cgraph->nodes[0] : nullptr;
-+    if (cgraph != cached_cgraph || cgraph->n_nodes != cached_n_nodes || node0 != cached_node0) {
-+        cached_cgraph  = cgraph;
-+        cached_n_nodes = cgraph->n_nodes;
-+        cached_node0   = node0;
-+        cached_is_moe  = false;
-+        for (int j = 0; j < cgraph->n_nodes; ++j) {
-+            if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID) {
-+                cached_is_moe = true;
-+                break;
-+            }
-+        }
-+    }
-+    return cached_is_moe;
-+}
-+
 +// Fuse ADD -> RMS_NORM -> MUL into one launch.  The ADD's output (the next layer's residual) is
 +// still written, so no node is eliminated; the only requirement is that rms_norm's input is
 +// exactly the preceding ADD.
@@ -392,17 +366,13 @@ index d3a4fbda4..d9fbcaf84 100644
                                       ggml_tensor *               dst,
                                       ggml_tensor *               mul_tensor,
 diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
-index 489d3d4b8..a8f9e9207 100644
+index 489d3d4..83bae57 100644
 --- a/ggml/src/ggml-cuda/norm.cuh
 +++ b/ggml/src/ggml-cuda/norm.cuh
-@@ -8,6 +8,16 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+@@ -8,6 +8,12 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
  
  void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
  
-+// Whether cgraph contains a GGML_OP_MUL_MAT_ID node, i.e. is an MoE graph (implementation and
-+// rationale in norm.cu, next to its one caller: the pre-add RMS_NORM fusion below).
-+bool ggml_cuda_graph_is_moe(const ggml_cgraph * cgraph);
-+
 +// Fuse ADD -> RMS_NORM -> MUL into one launch (residual add folded into rms_norm's prologue)
 +void ggml_cuda_op_rms_norm_fused_pre_add(ggml_backend_cuda_context & ctx,
 +                                         ggml_tensor *               add_tensor,

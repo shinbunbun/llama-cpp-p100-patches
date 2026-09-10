@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 753712d33..ccd74e4bc 100644
+index 753712d..ccd74e4 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1448,6 +1448,24 @@ struct ggml_backend_cuda_context {
@@ -28,7 +28,7 @@ index 753712d33..ccd74e4bc 100644
      void q8_1_cache_clear() {
          q8_1_cache_src1   = nullptr;
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index db34813af..0f60ababf 100644
+index db34813..0f60aba 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -28,8 +28,12 @@ gated_delta_net_cuda(const float * q,
@@ -193,7 +193,7 @@ index db34813af..0f60ababf 100644
 +    ggml_cuda_op_gated_delta_net_impl(ctx, dst, cache, fuse_beta_sigmoid, gather);
  }
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
-index 00d936213..eb4a1f837 100644
+index 00d9362..eb4a1f8 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cuh
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
 @@ -9,12 +9,22 @@ struct ggml_cuda_gated_delta_net_fused_cache {
@@ -222,7 +222,7 @@ index 00d936213..eb4a1f837 100644
  // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
  void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 851ee2680..0337aa6ab 100644
+index ab2a442..00d290c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3612,8 +3612,50 @@ static bool ggml_cuda_should_fuse_rms_norm_mul(const ggml_tensor * rms_norm, con
@@ -394,7 +394,7 @@ index 851ee2680..0337aa6ab 100644
          }
      }
  
-@@ -4496,6 +4613,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4511,6 +4628,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
      ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
@@ -405,7 +405,7 @@ index 851ee2680..0337aa6ab 100644
      bool                         is_concurrent_event_active = false;
      ggml_cuda_concurrent_event * concurrent_event           = nullptr;
      bool                         should_launch_concurrent_events = false;
-@@ -4629,7 +4750,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4644,7 +4765,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
