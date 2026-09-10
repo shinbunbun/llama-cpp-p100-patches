@@ -66,11 +66,13 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 - 29 本すべてを llama.cpp **`v0.4.0`** に対して生成しており、**fuzz 0・オフセット 0**
   で適用できる (`nix flake check` がこの両方と、`nix/patches.nix` の順序付きリストが
   `patches/` の中身と一致することを検証する)
-- upstream には未提出。明快な候補が 3 本ある。11 `penalties-direct` と
+- upstream には未提出。明快な候補が 2 本ある。11 `penalties-direct` と
   21 `sched-reset-lazy` はアーキテクチャ非依存で、出力はビット一致、扱えない入力では
-  元の経路にフォールバックする。28 `top-k-partial` も同様だが「アーキテクチャ非依存」が
-  成り立つのは CUDA に限る。`cub::DeviceTopK` が無い HIP ビルドでは、フルソートではなく
-  upstream 自身の radix top-k を横取りする形になる (詳細は
+  元の経路にフォールバックする。28 `top-k-partial` は代わりに CUDA 専用で、`__shfl_xor_sync`
+  の呼び出しが cub の 3 引数形を取るのに対し HIP のベンダヘッダはこれを 4 引数マクロとして
+  定義しており、カーネル自体も全体を通じて 32 レーン warp を前提にしているため、ブロック
+  全体を `#if !defined(GGML_USE_HIP)` で囲み、HIP ビルドでは upstream 自身のフォールバック
+  (`ncols = 1024` 超では radix top-k、以下ではフルソート) をそのまま使わせている (詳細は
   [docs/patches.ja.md](docs/patches.ja.md))。出していないのは単に手が回っていないから
   にすぎない
 - 全パッチを当てたまま P100 で **`test-backend-ops` が通った**（`v0.2.0` で 13,352 件・

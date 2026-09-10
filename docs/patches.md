@@ -332,6 +332,25 @@ covers the ADD.
 **+0.72%**, bit-identical.
 Kill switch: `GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL`.
 
+**Known hazard, neither 19 nor 20 goes through
+`ggml_cuda_check_fusion_memory_ranges`.** Both fusions add a write the
+unfused graph does not have (the ADD's `dst`), and both read the prologue's
+inputs (`add->src[0]`/`src[1]`, for 19; the bias add's inputs, for 20) in the
+same kernel that writes the epilogue's output (the `MUL` node's `dst`).
+`add->src[*]` (19) goes out of scope at the ADD node, so once ggml-alloc
+carves the `MUL` output out of that now-freed block, a later allocation
+sharing part of that block can have its epilogue write land on memory the
+prologue of a *different* invocation still needs to read — a partial overlap
+upstream's check exists to catch (unfused, the three kernels run
+sequentially, so this is safe). It went unnoticed through `v0.2.0` and
+surfaced as non-deterministic output on `v0.4.0`'s MoE graphs, which is why
+19 disables itself on MoE (see above); the actual fix belongs upstream's own
+memory-range check, not a per-patch workaround. Note that
+`ggml_cuda_check_fusion_memory_ranges` itself only accepts a contiguous
+`(node_idx, node_count)` range, while `ggml_cuda_collect_ops` can return
+non-contiguous `idxs` — calling the check as-is does not close this on its
+own.
+
 ### 26 · `cpy-fused-rows` — `CUDA`
 
 One thread per **row** instead of per element for the fused copies, when dim 0
@@ -381,12 +400,15 @@ candidates live in per-thread register arrays), for narrow rows, and for
 oversized grids.
 Kill switch: `GGML_CUDA_DISABLE_TOP_K_PARTIAL`.
 
-Since `v0.4.0`, upstream also ships `top_k_radix_cuda`, a HIP-only fallback
-(`!GGML_CUDA_USE_CUB && GGML_USE_HIP`, `ncols > 1024`) used when CUB is
-unavailable — this patch's guard runs before that branch, so on such a HIP
-build it pre-empts the radix top-k rather than a full sort. "Falls back to
-the existing sort" above, and the measurements below, are against the CUDA
-(no-CUB) full-sort baseline; they do not describe the HIP path.
+CUDA-only: the whole block is guarded with `#if !defined(GGML_USE_HIP)`. Two
+reasons. `__shfl_xor_sync` here uses cub's 3-argument form, but
+`ggml-cuda/vendors/hip.h` `#define`s it as a 4-argument macro, so it fails to
+compile under HIP as written. And even past that, the kernels assume a
+32-lane warp throughout (`CUDA_TOP_K_WARPS`, `threadIdx.x & 31`/`>> 5`,
+`e*32`), which does not hold on AMD's 64-lane wavefronts. Since `v0.4.0`,
+upstream ships its own HIP-only fallback, `top_k_radix_cuda`
+(`!GGML_CUDA_USE_CUB && GGML_USE_HIP`, `ncols > 1024`), and this patch leaves
+that path — and the full sort below `ncols = 1024` — untouched on HIP.
 
 > This one is worth attention beyond Pascal: **every CUDA 12.x user with GPU
 > sampling pays a full-vocabulary sort per token.**

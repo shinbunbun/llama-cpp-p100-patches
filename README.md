@@ -69,14 +69,16 @@ time and do not compose.
 - All 29 patches are generated against llama.cpp **`v0.4.0`**, where they
   apply at **zero fuzz and zero offset** (`nix flake check` verifies both, and
   that the file list matches the ordered list in `nix/patches.nix`).
-- Not submitted upstream. Three are straightforward candidates — 11
+- Not submitted upstream. Two are straightforward candidates — 11
   `penalties-direct` and 21 `sched-reset-lazy` are architecture-independent,
   bit-identical, and fall back to the original path on any input they do not
-  handle. 28 `top-k-partial` is the same, but "architecture-independent" holds
-  for CUDA only: on HIP builds without `cub::DeviceTopK` it now pre-empts
-  upstream's own radix top-k rather than a full sort (see
-  [docs/patches.md](docs/patches.md)). Nothing but time has kept any of them
-  out.
+  handle. 28 `top-k-partial` is CUDA-only instead: its `__shfl_xor_sync` call
+  takes cub's 3-argument form, which the HIP vendor header maps to a
+  4-argument macro, and its kernels assume a 32-lane warp throughout, so the
+  whole block is guarded off with `#if !defined(GGML_USE_HIP)` and HIP builds
+  keep using upstream's own fallback (its radix top-k above `ncols = 1024`, a
+  full sort at or under it) untouched (see [docs/patches.md](docs/patches.md)).
+  Nothing but time has kept any of them out.
 - `test-backend-ops` passed on a P100 with the full set applied on `v0.2.0`
   (13,352 tests, no failures, matching the unpatched `v0.2.0` build on the same
   machine); this has not been re-taken on `v0.4.0`.
