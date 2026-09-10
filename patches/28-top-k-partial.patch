@@ -1,14 +1,20 @@
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index c7a0c8317..b2b07b2b4 100644
+index c7a0c8317..023810604 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
-@@ -210,6 +210,233 @@ static void top_k_radix_cuda(
+@@ -210,6 +210,241 @@ static void top_k_radix_cuda(
  
  #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
  
++#if !defined(GGML_USE_HIP)
++
 +// Partial selection for small k, obtaining the k largest elements without a full sort.
-+// Where cub::DeviceTopK (CCCL >= 3.2) is unavailable, upstream's own fallback differs by
-+// build -- see the guard below for CUDA vs. HIP and what this patch pre-empts on each.
++// CUDA only: __shfl_xor_sync below takes cub's 3-argument form, but the HIP vendor header
++// (ggml-cuda/vendors/hip.h) maps it to a 4-argument macro, so this fails to compile under
++// GGML_USE_HIP.  The kernels also assume a 32-lane warp throughout (CUDA_TOP_K_WARPS,
++// threadIdx.x & 31 / >> 5, e*32), which does not hold on AMD's 64-lane wavefronts even once
++// the call compiles.  HIP keeps using upstream's own fallback (top_k_radix_cuda above, or the
++// full sort) unconditionally -- see the #if !defined(GGML_USE_HIP) guard around this block.
 +//
 +// Comparisons use the same monotonic uint32 mapping cub uses, not float, and break ties toward
 +// the smaller index (cub's radix sort is stable, so the original order -- ascending index -- is
@@ -233,25 +239,28 @@ index c7a0c8317..b2b07b2b4 100644
 +    return true;
 +}
 +
++#endif // !defined(GGML_USE_HIP)
++
  void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0   = dst->src[0];
      const float *       src0_d = (const float *) src0->data;
-@@ -225,6 +452,18 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -225,6 +460,19 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const int64_t    nrows = ggml_nrows(src0);
      const int64_t    k     = dst->ne[0];
      ggml_cuda_pool & pool  = ctx.pool();
 +
-+#ifndef CUB_TOP_K_AVAILABLE
-+    // Without cub::DeviceTopK, CUDA builds fall through to "full sort, take the first k"
-+    // below; HIP builds with ncols > 1024 instead reach upstream's own radix top-k
-+    // (HIP builds at or under 1024 still fall through to the full sort, same as CUDA).
-+    // This guard runs before either, so the 172 us -> low tens of us (n = 151936, k = 10)
-+    // measurement is CUDA-only.
++#if !defined(GGML_USE_HIP) && !defined(CUB_TOP_K_AVAILABLE)
++    // Without cub::DeviceTopK, CUDA builds otherwise fall through to "full sort, take the
++    // first k" below.  This guard runs before that, so the 172 us -> low tens of us
++    // (n = 151936, k = 10) measurement is CUDA-only; HIP builds never take this path (see
++    // the #if !defined(GGML_USE_HIP) around top_k_partial_cuda's definition above for why)
++    // and keep using upstream's own fallback (radix top-k above ncols = 1024, full sort at
++    // or under it).
 +    if (ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX &&
 +        top_k_partial_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
 +        return;
 +    }
-+#endif  // CUB_TOP_K_AVAILABLE
++#endif  // !defined(GGML_USE_HIP) && !defined(CUB_TOP_K_AVAILABLE)
  #ifdef CUB_TOP_K_AVAILABLE
      // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
      // https://github.com/NVIDIA/cccl/issues/6391
