@@ -118,7 +118,7 @@ each was measured against the stack as it stood at the time.
 | 16 | `cpy-fastdiv` | CUDA | −56% kernel, +0.82% |
 | 17 | `norm-register-cache` | CUDA | +0.71% / +0.95% |
 | 18 | `fuse-sibling-nodes` | CUDA | +1.06% |
-| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70% |
+| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70% (dense only; skipped on MoE, see docs) |
 | 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72% |
 | 21 | `sched-reset-lazy` | host | +0.94% |
 | 22 | `decode-sched-slots` | host | +0.97% (4 slots) |

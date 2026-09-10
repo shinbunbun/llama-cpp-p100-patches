@@ -279,7 +279,19 @@ upstream の融合は `rms_norm` の**後段**だけで、前段の残差加算�
 1 行 1 ブロックなので、加算はそのプロローグで済ませられる。
 
 `k_bin_bcast` が 5,514 → 1,872 発になり、代わりに `rms_norm_f32<1024>` が 6.53 → 8.19 µs に
-なる。差し引き **+0.70%**、出力はビット一致する。
+なる。差し引き **+0.70%**、出力はビット一致する（dense モデルで計測）。
+
+**v0.4.0 リベース以降は dense 限定。** この融合は upstream の `{RMS_NORM, MUL}` 融合条件を
+呼び出さず複製している。v0.4.0 で MoE 専用の重み付き縮約融合とエイリアス判定
+（`logits_may_alias`）が追加されたが、複製された条件はどちらも知らない。その結果
+MoE のグラフで `ADD → RMS_NORM → MUL` を条件を踏まえずに融合してしまい、融合カーネル
+自体は単体では正しいにもかかわらず、Tesla P100 実機で同一 seed / greedy でも decode 出力が
+非決定的になることを確認した（同一 seed で 3 回実行し 3 回とも別出力）。修正では、グラフに
+`MUL_MAT_ID`（＝MoE）が含まれる場合はこの融合をスキップするようにした。dense のグラフには
+影響しない。本来は upstream の `ggml_cuda_can_fuse` / `ggml_cuda_can_fuse_subgraph` に委譲する
+形へ書き直すべきで、複製という構造自体は残っている。詳細は `norm.cu` の
+`ggml_cuda_graph_is_moe` を参照。
+
 停止スイッチ: `GGML_CUDA_DISABLE_FUSE_PRE_ADD`。
 
 ### 20 · `fuse-add-unary-mul` — `CUDA`

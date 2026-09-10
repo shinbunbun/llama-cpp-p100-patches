@@ -305,7 +305,21 @@ decode GPU time. `rms_norm` maps one row to one block, so the add can be done
 in its prologue.
 
 `k_bin_bcast` 5,514 → 1,872 launches, at the cost of `rms_norm_f32<1024>` going
-6.53 → 8.19 µs. **+0.70%**, bit-identical.
+6.53 → 8.19 µs. **+0.70%**, bit-identical (measured on a dense model).
+
+**Dense-only since the v0.4.0 rebase.** This fusion duplicates upstream's
+`{RMS_NORM, MUL}` fusion conditions instead of calling into them. v0.4.0 added
+a dedicated MoE weighted-reduction fusion and an aliasing check
+(`logits_may_alias`) that the duplicated conditions know nothing about;
+fusing `ADD → RMS_NORM → MUL` inside an MoE graph without accounting for
+those produced non-deterministic decode output on Tesla P100 (same seed,
+three runs, three different outputs), even though the fused kernel is
+correct in isolation. The fix skips this fusion whenever the graph contains
+a `MUL_MAT_ID` node (i.e. is MoE); dense graphs are unaffected. The right
+long-term fix is to rewrite this fusion to go through upstream's
+`ggml_cuda_can_fuse` / `ggml_cuda_can_fuse_subgraph` instead of duplicating
+its checks — see `ggml_cuda_graph_is_moe` in `norm.cu` for the full account.
+
 Kill switch: `GGML_CUDA_DISABLE_FUSE_PRE_ADD`.
 
 ### 20 · `fuse-add-unary-mul` — `CUDA`
