@@ -82,7 +82,8 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
   KV キャッシュがチャンク長を超えた場合)、それぞれ根拠を添えて明示してある。22 だけは
   ビット一致の根拠が**論証ではなく実測**である。既定の `n_tokens <= 4` は dense と MoE で
   一致を確認したという事実であって、compute バッファのレイアウト差が融合判定を変えない
-  ことの証明ではない
+  ことの証明ではない。19・20 は**既定オフ**でデフォルトビルドには含まれない。有効化すると
+  dense ではビット一致するが、MoE では非決定的な decode 出力になる（docs/patches.ja.md参照）
 - **このリポジトリは縮んでいくことを前提にしている。** upstream が直したものは
   ここから消すべきであり、価値はコードだけでなく測定値の側にもある
 
@@ -111,8 +112,8 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 | 16 | `cpy-fastdiv` | CUDA | カーネル −56%、+0.82% |
 | 17 | `norm-register-cache` | CUDA | +0.71% / +0.95% |
 | 18 | `fuse-sibling-nodes` | CUDA | +1.06% |
-| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70%（dense限定。MoEではスキップ、詳細はdocs参照） |
-| 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72% |
+| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70%、**既定オフ**（`GGML_CUDA_FUSE_PRE_ADD=1`で有効化、詳細はdocs参照） |
+| 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72%、**既定オフ**（`GGML_CUDA_FUSE_ADD_UNARY_MUL=1`で有効化、詳細はdocs参照） |
 | 21 | `sched-reset-lazy` | host | +0.94% |
 | 22 | `decode-sched-slots` | host | +0.97% (枠 4) |
 | 23 | `fuse-gdn-beta-sigmoid` | CUDA (delta-net) | 起動 −4,080 発 |

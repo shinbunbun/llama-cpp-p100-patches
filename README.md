@@ -89,7 +89,9 @@ time and do not compose.
   whose bit-identity is **measured rather than argued**: its `n_tokens <= 4`
   default comes from a dense and an MoE model staying identical there, not
   from a proof that a different compute-buffer layout cannot change a fusion
-  decision.
+  decision. 19 and 20 are **off by default** and excluded from that default
+  build: enabled, they are bit-identical on a dense model but produce
+  non-deterministic MoE decode output (see docs/patches.md).
 - **This repository is expected to shrink.** Anything upstream fixes should be
   deleted here rather than carried forward; the value is in the measurements as
   much as in the code.
@@ -120,8 +122,8 @@ each was measured against the stack as it stood at the time.
 | 16 | `cpy-fastdiv` | CUDA | −56% kernel, +0.82% |
 | 17 | `norm-register-cache` | CUDA | +0.71% / +0.95% |
 | 18 | `fuse-sibling-nodes` | CUDA | +1.06% |
-| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70% (dense only; skipped on MoE, see docs) |
-| 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72% |
+| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70%, **off by default** (`GGML_CUDA_FUSE_PRE_ADD=1`, see docs) |
+| 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72%, **off by default** (`GGML_CUDA_FUSE_ADD_UNARY_MUL=1`, see docs) |
 | 21 | `sched-reset-lazy` | host | +0.94% |
 | 22 | `decode-sched-slots` | host | +0.97% (4 slots) |
 | 23 | `fuse-gdn-beta-sigmoid` | CUDA (delta-net) | −4,080 launches |

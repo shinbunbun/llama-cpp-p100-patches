@@ -307,20 +307,9 @@ in its prologue.
 `k_bin_bcast` 5,514 → 1,872 launches, at the cost of `rms_norm_f32<1024>` going
 6.53 → 8.19 µs. **+0.70%**, bit-identical (measured on a dense model).
 
-**Dense-only since the v0.4.0 rebase.** This fusion duplicates upstream's
-`{RMS_NORM, MUL}` fusion conditions instead of calling into them. v0.4.0 added
-a dedicated MoE weighted-reduction fusion and an aliasing check
-(`logits_may_alias`) that the duplicated conditions know nothing about;
-fusing `ADD → RMS_NORM → MUL` inside an MoE graph without accounting for
-those produced non-deterministic decode output on Tesla P100 (same seed,
-three runs, three different outputs), even though the fused kernel is
-correct in isolation. The fix skips this fusion whenever the graph contains
-a `MUL_MAT_ID` node (i.e. is MoE); dense graphs are unaffected. The right
-long-term fix is to rewrite this fusion to go through upstream's
-`ggml_cuda_can_fuse` / `ggml_cuda_can_fuse_subgraph` instead of duplicating
-its checks — see `ggml_cuda_graph_is_moe` in `norm.cu` for the full account.
-
-Kill switch: `GGML_CUDA_DISABLE_FUSE_PRE_ADD`.
+**Off by default since the v0.4.0 rebase.** See the hazard note after patch
+20 below for why, and what enabling it (`GGML_CUDA_FUSE_PRE_ADD=1`) actually
+does and does not guarantee.
 
 ### 20 · `fuse-add-unary-mul` — `CUDA`
 
@@ -329,27 +318,42 @@ requires `ggml_are_same_shape`, which fails once `n_tokens > 1`, and never
 covers the ADD.
 
 `k_bin_bcast` 1,872 → **0** launches; total kernels 54,326 → 52,454.
-**+0.72%**, bit-identical.
-Kill switch: `GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL`.
+**+0.72%**, bit-identical. Off by default, same as 19 — see below.
 
 **Known hazard, neither 19 nor 20 goes through
-`ggml_cuda_check_fusion_memory_ranges`.** Both fusions add a write the
-unfused graph does not have (the ADD's `dst`), and both read the prologue's
-inputs (`add->src[0]`/`src[1]`, for 19; the bias add's inputs, for 20) in the
-same kernel that writes the epilogue's output (the `MUL` node's `dst`).
-`add->src[*]` (19) goes out of scope at the ADD node, so once ggml-alloc
-carves the `MUL` output out of that now-freed block, a later allocation
-sharing part of that block can have its epilogue write land on memory the
-prologue of a *different* invocation still needs to read — a partial overlap
-upstream's check exists to catch (unfused, the three kernels run
-sequentially, so this is safe). It went unnoticed through `v0.2.0` and
-surfaced as non-deterministic output on `v0.4.0`'s MoE graphs, which is why
-19 disables itself on MoE (see above); the actual fix belongs upstream's own
+`ggml_cuda_check_fusion_memory_ranges`; both are opt-in.** Both fusions add a
+write the unfused graph does not have (the ADD's `dst`), and both read the
+prologue's inputs (`add->src[0]`/`src[1]`, for 19; the bias add's inputs, for
+20) in the same kernel that writes the epilogue's output (the `MUL` node's
+`dst`). `add->src[*]` (19) goes out of scope at the ADD node, so once
+ggml-alloc carves the `MUL` output out of that now-freed block, a later
+allocation sharing part of that block can have its epilogue write land on
+memory the prologue of a *different* invocation still needs to read — a
+partial overlap upstream's check exists to catch (unfused, the three kernels
+run sequentially, so this is safe). It went unnoticed through `v0.2.0` and
+surfaced as non-deterministic decode output on `v0.4.0`'s MoE graphs (same
+seed, three runs, three different outputs), even though the fused kernel is
+correct in isolation.
+
+The first fix tried was gating 19 off whenever the graph contains a
+`MUL_MAT_ID` node (i.e. is MoE). That is not sufficient: `ggml_backend_sched`
+can split a graph across backends (`--n-cpu-moe`, `-ot "exps=CPU"`), and a
+`MUL_MAT_ID` routed to a CPU split is invisible to a CUDA-side scan of the
+same graph, so the guard reads "dense" for a graph that is not. 20 never had
+this guard at all, and duplicates the same read-under-write shape for the
+gated delta-net's gate preprocessing — the architecture the non-determinism
+was actually observed on. Given that, both are now **off by default**
+(`GGML_CUDA_FUSE_PRE_ADD=1` / `GGML_CUDA_FUSE_ADD_UNARY_MUL=1` to opt in) —
+correct on a dense model (measured bit-identical), but not guaranteed safe on
+any graph the scheduler may split. The actual fix belongs upstream's own
 memory-range check, not a per-patch workaround. Note that
 `ggml_cuda_check_fusion_memory_ranges` itself only accepts a contiguous
 `(node_idx, node_count)` range, while `ggml_cuda_collect_ops` can return
-non-contiguous `idxs` — calling the check as-is does not close this on its
+non-contiguous `idxs` — calling the check as-is would not close this on its
 own.
+
+Enable switches (default off, unlike every other patch's kill switch):
+`GGML_CUDA_FUSE_PRE_ADD=1` (19), `GGML_CUDA_FUSE_ADD_UNARY_MUL=1` (20).
 
 ### 26 · `cpy-fused-rows` — `CUDA`
 
