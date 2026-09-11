@@ -136,6 +136,13 @@ each was measured against the stack as it stood at the time.
 | 30 | `mmvq-ksigns-smem` | CUDA | +0.2–1.8% decode, −9.3% IQ3_XXS kernel, bit-identical |
 | 31 | `fattn-f16-kv-chunk` | pre-Turing | −960 MiB compute buffer at ctx 262,144 (1,152 → 192), decode unchanged |
 
+Patches 19 and 20 are off by default. Their per-patch figures above were
+measured individually on a dense model; enabling both together is worth
+**+2.36% decode on a 35B-A3B MoE** (same build, toggled only by the two
+environment variables: 80.82 → 82.73 t/s, prompt processing unchanged).
+Treat that as the cost of leaving them off, and read the hazard note in
+docs/patches.md before turning them on.
+
 Scope tags, details, kill switches and the rejected alternatives:
 **[docs/patches.md](docs/patches.md)**.
 
