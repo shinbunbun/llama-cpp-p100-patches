@@ -79,9 +79,10 @@ time and do not compose.
   keep using upstream's own fallback (its radix top-k above `ncols = 1024`, a
   full sort at or under it) untouched (see [docs/patches.md](docs/patches.md)).
   Nothing but time has kept any of them out.
-- `test-backend-ops` passed on a P100 with the full set applied on `v0.2.0`
-  (13,352 tests, no failures, matching the unpatched `v0.2.0` build on the same
-  machine); this has not been re-taken on `v0.4.0`.
+- `test-backend-ops` passed on a P100 with the full set applied: 13,352 tests on
+  `v0.2.0`, matching the unpatched `v0.2.0` build on the same machine, and
+  14,744 on `v0.4.0`. No failures on either. The `v0.4.0` run has not been
+  compared against an unpatched build of that tag.
 - Unless a patch says otherwise, its output is **bit-identical** to the
   unpatched build. A few do change output (09 where K needs three of the four
   warps, 12 at the widths it takes, 15 by design, 31 once the KV cache is
@@ -140,8 +141,10 @@ Patches 19 and 20 are off by default. Their per-patch figures above were
 measured individually on a dense model; enabling both together is worth
 **+2.36% decode on a 35B-A3B MoE** (same build, toggled only by the two
 environment variables: 80.82 → 82.73 t/s, prompt processing unchanged).
-Treat that as the cost of leaving them off, and read the hazard note in
-docs/patches.md before turning them on.
+That is the upper bound on what leaving them off costs, but it is measured
+on exactly the configuration `docs/patches.md` reports as non-deterministic
+on MoE graphs, so read the hazard note there before treating it as
+throughput you can ship.
 
 Scope tags, details, kill switches and the rejected alternatives:
 **[docs/patches.md](docs/patches.md)**.
