@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-31 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
+29 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 developed and measured on a **Tesla P100 (GP100, sm_60)**.
 
 日本語版: [README.ja.md](README.ja.md)
@@ -14,8 +14,8 @@ has full-rate HFMA2 — so llama.cpp's quantized matmul paths fall back to
 emulation and cuBLAS, while the one instruction the card is genuinely good at
 goes unused. The patches named `sm60` exploit that asymmetry.
 
-**But only 8 of the 31 are gated to Pascal-era hardware.** One more changes an
-unconditional constant that every GPU sees. The remaining 22 are not
+**But only 7 of the 29 are gated to Pascal-era hardware.** One more changes an
+unconditional constant that every GPU sees. The remaining 21 are not
 hardware-scoped at all — kernel fusions, index-arithmetic fixes, two host-side
 sampler paths, two scheduler patches, a `top_k` that avoids sorting the whole
 vocabulary, and two lookup tables staged in shared memory — though five of those
@@ -55,29 +55,44 @@ three rounds each): 9B dense pp512 +1.15% / tg64 +0.15%, MoE pp512 −0.03% /
 tg64 +0.47%. That bounds the rebase as a non-regression; it does not restate what
 the set is worth against stock `v0.2.0`.
 
+**The `v0.4.0` rebase adds a further gap**: neither the stock-vs-patched table
+above nor the `v0.2.0` non-regression check has been re-taken against the tree
+this rebase ships, so both numbers are now one more unmeasured rebase removed
+from what actually runs.
+
 This is the whole set against no patches. It is **not** the sum of the per-patch
 numbers below, which were each measured against the stack as it stood at the
 time and do not compose.
 
 ## Status
 
-- Generated against llama.cpp **`v0.2.0`**, where they apply at **zero fuzz and
-  zero offset** (`nix flake check` verifies both, and that the file list matches
-  the ordered list in `nix/patches.nix`).
-- Not submitted upstream. Three are straightforward candidates — 11
-  `penalties-direct`, 21 `sched-reset-lazy`, 28 `top-k-partial` are all
-  architecture-independent, bit-identical, and fall back to the original path on
-  any input they do not handle. Nothing but time has kept them out.
-- `test-backend-ops` passes on a P100 with the full set applied: on `v0.2.0`,
-  13,352 tests, no failures — the same count and the same result as the
-  unpatched `v0.2.0` build on the same machine.
+- All 29 patches are generated against llama.cpp **`v0.4.0`**, where they
+  apply at **zero fuzz and zero offset** (`nix flake check` verifies both, and
+  that the file list matches the ordered list in `nix/patches.nix`).
+- Not submitted upstream. Two are straightforward candidates — 11
+  `penalties-direct` and 21 `sched-reset-lazy` are architecture-independent,
+  bit-identical, and fall back to the original path on any input they do not
+  handle. 28 `top-k-partial` is CUDA-only instead: its `__shfl_xor_sync` call
+  takes cub's 3-argument form, which the HIP vendor header maps to a
+  4-argument macro, and its kernels assume a 32-lane warp throughout, so the
+  whole block is guarded off with `#if !defined(GGML_USE_HIP)` and HIP builds
+  keep using upstream's own fallback (its radix top-k above `ncols = 1024`, a
+  full sort at or under it) untouched (see [docs/patches.md](docs/patches.md)).
+  Nothing but time has kept any of them out.
+- `test-backend-ops` passed on a P100 with the full set applied: 13,352 tests on
+  `v0.2.0`, matching the unpatched `v0.2.0` build on the same machine, and
+  14,744 on `v0.4.0`. No failures on either. The `v0.4.0` run has not been
+  compared against an unpatched build of that tag.
 - Unless a patch says otherwise, its output is **bit-identical** to the
-  unpatched build. Four do change output (03 above one row, 09 where K needs
-  three of the four warps, 12 at the widths it takes, 15 by design) and say so
-  with the evidence. 22 is the one whose bit-identity is **measured rather than
-  argued**: its `n_tokens <= 4` default comes from a dense and an MoE model
-  staying identical there, not from a proof that a different compute-buffer
-  layout cannot change a fusion decision.
+  unpatched build. A few do change output (09 where K needs three of the four
+  warps, 12 at the widths it takes, 15 by design, 31 once the KV cache is
+  longer than its chunk length) and say so with the evidence. 22 is the one
+  whose bit-identity is **measured rather than argued**: its `n_tokens <= 4`
+  default comes from a dense and an MoE model staying identical there, not
+  from a proof that a different compute-buffer layout cannot change a fusion
+  decision. 19 and 20 are **off by default** and excluded from that default
+  build: enabled, they are bit-identical on a dense model but produce
+  non-deterministic MoE decode output (see docs/patches.md).
 - **This repository is expected to shrink.** Anything upstream fixes should be
   deleted here rather than carried forward; the value is in the measurements as
   much as in the code.
@@ -94,10 +109,8 @@ each was measured against the stack as it stood at the time.
 |---:|---|---|---|
 | 01 | `vmad-dp4a-sm60` | sm_60 | +6.5–6.8% decode |
 | 02 | `mmvq-rows-per-block-sm60` | pre-Turing | +23.0% (llama-bench tg32, Q4_0) |
-| 03 | `topk-moe-multirow` | CUDA | +2.8–6.1% decode |
 | 04 | `concat-non-cont-flat` | CUDA | 18.0 → 4.7 µs kernel |
 | 05 | `mmvf-f32-pascal` | pre-Turing | +3.7–4.3% |
-| 06 | `mmq-mul-mat-id-sm60` | sm_60 | MoE prefill +20–41%, −200 MiB VRAM |
 | 07 | `mmvq-moe-rows-sm60` | all archs | +1.9% decode |
 | 08 | `mmvq-mmid-batch-sm60` | pre-Volta | +2.2% |
 | 09 | `mmvq-nwarps-small-k-sm60` | pre-Turing | +1.29% MoE decode |
@@ -110,8 +123,8 @@ each was measured against the stack as it stood at the time.
 | 16 | `cpy-fastdiv` | CUDA | −56% kernel, +0.82% |
 | 17 | `norm-register-cache` | CUDA | +0.71% / +0.95% |
 | 18 | `fuse-sibling-nodes` | CUDA | +1.06% |
-| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70% |
-| 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72% |
+| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70%, **off by default** (`GGML_CUDA_FUSE_PRE_ADD=1`, see docs) |
+| 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72%, **off by default** (`GGML_CUDA_FUSE_ADD_UNARY_MUL=1`, see docs) |
 | 21 | `sched-reset-lazy` | host | +0.94% |
 | 22 | `decode-sched-slots` | host | +0.97% (4 slots) |
 | 23 | `fuse-gdn-beta-sigmoid` | CUDA (delta-net) | −4,080 launches |
@@ -123,6 +136,15 @@ each was measured against the stack as it stood at the time.
 | 29 | `mmvq-iq3xxs-grid-smem` | CUDA | +3.1–7.6% decode (dense), bit-identical |
 | 30 | `mmvq-ksigns-smem` | CUDA | +0.2–1.8% decode, −9.3% IQ3_XXS kernel, bit-identical |
 | 31 | `fattn-f16-kv-chunk` | pre-Turing | −960 MiB compute buffer at ctx 262,144 (1,152 → 192), decode unchanged |
+
+Patches 19 and 20 are off by default. Their per-patch figures above were
+measured individually on a dense model; enabling both together is worth
+**+2.36% decode on a 35B-A3B MoE** (same build, toggled only by the two
+environment variables: 80.82 → 82.73 t/s, prompt processing unchanged).
+That is the upper bound on what leaving them off costs, but it is measured
+on exactly the configuration `docs/patches.md` reports as non-deterministic
+on MoE graphs, so read the hazard note there before treating it as
+throughput you can ship.
 
 Scope tags, details, kill switches and the rejected alternatives:
 **[docs/patches.md](docs/patches.md)**.
@@ -145,7 +167,7 @@ llama-cpp-patched = pkgs.llama-cpp.overrideAttrs (old: {
 });
 ```
 
-or use the overlay — apply it **last**, and assume it needs a pristine `v0.2.0`
+or use the overlay — apply it **last**, and assume it needs a pristine `v0.4.0`
 tree, because zero-fuzz patches reject against anything that has already
 rewritten the same lines:
 
@@ -164,7 +186,7 @@ code generation, so the flake pins `cudaPackages_12`.
 ### Without Nix
 
 ```console
-$ git clone --branch v0.2.0 https://github.com/ggml-org/llama.cpp
+$ git clone --branch v0.4.0 https://github.com/ggml-org/llama.cpp
 $ cd llama.cpp
 $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
     patch -p1 -F0 < "$p" || { echo "FAILED: $p"; break; }

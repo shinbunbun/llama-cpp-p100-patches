@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-[llama.cpp](https://github.com/ggml-org/llama.cpp) の性能パッチ 31 本。
+[llama.cpp](https://github.com/ggml-org/llama.cpp) の性能パッチ 29 本。
 **Tesla P100 (GP100, sm_60)** 上で開発し、実測した。
 
 English: [README.md](README.md)
@@ -14,8 +14,8 @@ $ nix build github:shinbunbun/llama-cpp-p100-patches#llama-cpp-sm60
 cuBLAS に落ちる一方で、このカードが本当に得意な命令は使われないままになる。
 名前に `sm60` が付くパッチは、この非対称性を突いたものである。
 
-**とはいえ、31 本のうち Pascal 世代に限定されているのは 8 本だけである。** もう 1 本は
-アーキテクチャで分岐しない定数を変えるので、全 GPU に影響する。残る 22 本はハードウェアに
+**とはいえ、29 本のうち Pascal 世代に限定されているのは 7 本だけである。** もう 1 本は
+アーキテクチャで分岐しない定数を変えるので、全 GPU に影響する。残る 21 本はハードウェアに
 依存しない。内訳はカーネル融合、添字計算の修正、ホスト側のサンプラー経路 2 本、
 スケジューラ 2 本、語彙全体のソートを避ける `top_k`、そして参照テーブル 2 種の共有メモリ化で
 ある。ただしこのうち 5 本は gated delta-net を持つモデルでしか発火せず、1 本は特定の
@@ -49,6 +49,10 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 これはリベースが退行でないことを示すだけで、`v0.2.0` の無改変に対してこのパッチ集が
 どれだけの価値かを言い直したものではない。
 
+**`v0.4.0` へのリベースにより、この差はさらに広がっている。** 上の無改変 vs パッチ適用の
+表も `v0.2.0` の非退行確認も、今回のリベース先のツリーに対しては取り直していないので、
+どちらも実際に動くツリーからもう一段リベース分だけ離れた数値になっている。
+
 **どちらもパッチ 29 / 30 より前の測定である。** dense のほうは Q4_1/Q5_1 だけなので
 影響を受けない。MoE のほうはバイトの 31.7% が IQ3_XXS、47.9% が IQ2_XS で、別々の
 2 周 A/B でパッチ 29 から 1% ほど、パッチ 30 から 1.5% 伸びるので、上の値はわずかに
@@ -59,20 +63,28 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 
 ## 状態
 
-- llama.cpp **`v0.2.0`** に対して生成しており、**fuzz 0・オフセット 0** で適用できる
-  (`nix flake check` がこの両方と、`nix/patches.nix` の順序付きリストが `patches/` の
-  中身と一致することを検証する)
-- upstream には未提出。明快な候補が 3 本ある。11 `penalties-direct` /
-  21 `sched-reset-lazy` / 28 `top-k-partial` はいずれもアーキテクチャ非依存で、
-  出力はビット一致、扱えない入力では元の経路にフォールバックする。出していないのは
-  単に手が回っていないからにすぎない
-- 全パッチを当てたまま P100 で **`test-backend-ops` が通る**。`v0.2.0` で 13,352 件・
-  失敗 0 で、同じ機械の無パッチ `v0.2.0` 版と件数も結果も一致する
+- 29 本すべてを llama.cpp **`v0.4.0`** に対して生成しており、**fuzz 0・オフセット 0**
+  で適用できる (`nix flake check` がこの両方と、`nix/patches.nix` の順序付きリストが
+  `patches/` の中身と一致することを検証する)
+- upstream には未提出。明快な候補が 2 本ある。11 `penalties-direct` と
+  21 `sched-reset-lazy` はアーキテクチャ非依存で、出力はビット一致、扱えない入力では
+  元の経路にフォールバックする。28 `top-k-partial` は代わりに CUDA 専用で、`__shfl_xor_sync`
+  の呼び出しが cub の 3 引数形を取るのに対し HIP のベンダヘッダはこれを 4 引数マクロとして
+  定義しており、カーネル自体も全体を通じて 32 レーン warp を前提にしているため、ブロック
+  全体を `#if !defined(GGML_USE_HIP)` で囲み、HIP ビルドでは upstream 自身のフォールバック
+  (`ncols = 1024` 超では radix top-k、以下ではフルソート) をそのまま使わせている (詳細は
+  [docs/patches.ja.md](docs/patches.ja.md))。出していないのは単に手が回っていないから
+  にすぎない
+- 全パッチを当てたまま P100 で **`test-backend-ops` が通った**（`v0.2.0` で 13,352 件・
+  失敗 0、同じ機械の無パッチ `v0.2.0` 版と件数も結果も一致。`v0.4.0` では 14,744 件・
+  失敗 0。ただし `v0.4.0` は無パッチ版との突き合わせを行っていない）
 - パッチ自身が断っていない限り、出力は無パッチ版と**ビット一致**する。出力が変わるのは
-  4 本だけで (03 は 1 行を超える場合、09 は K が 4 ワープ中 3 ワープ分を要する場合、
-  12 は通る幅で、15 は設計上)、それぞれ根拠を添えて明示してある。22 だけはビット一致の
-  根拠が**論証ではなく実測**である。既定の `n_tokens <= 4` は dense と MoE で一致を確認した
-  という事実であって、compute バッファのレイアウト差が融合判定を変えないことの証明ではない
+  少数で (09 は K が 4 ワープ中 3 ワープ分を要する場合、12 は通る幅で、15 は設計上、31 は
+  KV キャッシュがチャンク長を超えた場合)、それぞれ根拠を添えて明示してある。22 だけは
+  ビット一致の根拠が**論証ではなく実測**である。既定の `n_tokens <= 4` は dense と MoE で
+  一致を確認したという事実であって、compute バッファのレイアウト差が融合判定を変えない
+  ことの証明ではない。19・20 は**既定オフ**でデフォルトビルドには含まれない。有効化すると
+  dense ではビット一致するが、MoE では非決定的な decode 出力になる（docs/patches.ja.md参照）
 - **このリポジトリは縮んでいくことを前提にしている。** upstream が直したものは
   ここから消すべきであり、価値はコードだけでなく測定値の側にもある
 
@@ -87,10 +99,8 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 |---:|---|---|---|
 | 01 | `vmad-dp4a-sm60` | sm_60 | decode +6.5〜6.8% |
 | 02 | `mmvq-rows-per-block-sm60` | pre-Turing | +23.0% (llama-bench tg32, Q4_0) |
-| 03 | `topk-moe-multirow` | CUDA | decode +2.8〜6.1% |
 | 04 | `concat-non-cont-flat` | CUDA | カーネル 18.0 → 4.7 µs |
 | 05 | `mmvf-f32-pascal` | pre-Turing | +3.7〜4.3% |
-| 06 | `mmq-mul-mat-id-sm60` | sm_60 | MoE prefill +20〜41%、VRAM −200 MiB |
 | 07 | `mmvq-moe-rows-sm60` | all archs | decode +1.9% |
 | 08 | `mmvq-mmid-batch-sm60` | pre-Volta | +2.2% |
 | 09 | `mmvq-nwarps-small-k-sm60` | pre-Turing | MoE decode +1.29% |
@@ -103,8 +113,8 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 | 16 | `cpy-fastdiv` | CUDA | カーネル −56%、+0.82% |
 | 17 | `norm-register-cache` | CUDA | +0.71% / +0.95% |
 | 18 | `fuse-sibling-nodes` | CUDA | +1.06% |
-| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70% |
-| 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72% |
+| 19 | `fuse-pre-add-rms-norm` | CUDA | +0.70%、**既定オフ**（`GGML_CUDA_FUSE_PRE_ADD=1`で有効化、詳細はdocs参照） |
+| 20 | `fuse-add-unary-mul` | CUDA (delta-net) | +0.72%、**既定オフ**（`GGML_CUDA_FUSE_ADD_UNARY_MUL=1`で有効化、詳細はdocs参照） |
 | 21 | `sched-reset-lazy` | host | +0.94% |
 | 22 | `decode-sched-slots` | host | +0.97% (枠 4) |
 | 23 | `fuse-gdn-beta-sigmoid` | CUDA (delta-net) | 起動 −4,080 発 |
@@ -116,6 +126,12 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 | 29 | `mmvq-iq3xxs-grid-smem` | CUDA | decode +3.1〜7.6% (dense)、出力ビット一致 |
 | 30 | `mmvq-ksigns-smem` | CUDA | decode +0.2〜1.8%、カーネル IQ3_XXS −9.3%、出力ビット一致 |
 | 31 | `fattn-f16-kv-chunk` | pre-Turing | ctx 262,144 で計算バッファ −960 MiB (1,152 → 192)、decode 不変 |
+
+19・20 は既定オフである。表中の数値はそれぞれ単独で dense モデルを対象に測ったもので、
+両方を有効にすると **35B-A3B MoE の decode で +2.36%** になる (同一ビルドで 2 つの環境変数
+だけを切り替えた実測、80.82 → 82.73 t/s、プロンプト処理は不変)。これは既定オフにすることで
+失う量の上限だが、`docs/patches.ja.md` が MoE で非決定的になると記している構成そのもので
+測った値でもある。実際に使える速度とみなす前に、同ドキュメントの注意書きを読むこと。
 
 適用範囲タグの定義、詳細、停止スイッチ、棄却した代案は
 **[docs/patches.ja.md](docs/patches.ja.md)** を参照。
@@ -138,7 +154,7 @@ llama-cpp-patched = pkgs.llama-cpp.overrideAttrs (old: {
 });
 ```
 
-あるいは overlay を使う。ただし**最後に**適用し、`v0.2.0` の無改変ツリーに当てること。
+あるいは overlay を使う。ただし**最後に**適用し、`v0.4.0` の無改変ツリーに当てること。
 fuzz 0 のパッチは、同じ行を先に書き換えたものがあると reject される:
 
 ```nix
@@ -156,7 +172,7 @@ sm_60 のコードが残らず、実行時に *"named symbol not found"* で落�
 ### Nix 以外
 
 ```console
-$ git clone --branch v0.2.0 https://github.com/ggml-org/llama.cpp
+$ git clone --branch v0.4.0 https://github.com/ggml-org/llama.cpp
 $ cd llama.cpp
 $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
     patch -p1 -F0 < "$p" || { echo "FAILED: $p"; break; }

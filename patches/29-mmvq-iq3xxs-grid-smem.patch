@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index bc10e3eab..634f68f40 100644
+index f58f8e161..8a4f0f9ef 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -636,6 +636,11 @@ static __global__ void mul_mat_vec_q(
+@@ -648,6 +648,11 @@ static __global__ void mul_mat_vec_q(
      constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
  
      const     int tid = warp_size*threadIdx.y + threadIdx.x;
@@ -14,8 +14,8 @@ index bc10e3eab..634f68f40 100644
      const     int row0 = rows_per_cuda_block*blockIdx.x;
      const     int blocks_per_row_x = ncols_x / qk;
      constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
-@@ -860,6 +865,13 @@ static __global__ void mul_mat_vec_q_moe(
-     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -900,6 +905,13 @@ static __global__ void mul_mat_vec_q_moe(
+     }
  
      const uint32_t token_idx   = threadIdx.y;
 +
@@ -29,10 +29,10 @@ index bc10e3eab..634f68f40 100644
      const int      blocks_per_row_x = ncols_x / qk;
      constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index 0f039c735..b512972e5 100644
+index ec117c57d..07d2d6e01 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
-@@ -1152,6 +1152,29 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+@@ -1160,6 +1160,29 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
  #define VDR_IQ3_XXS_Q8_1_MMVQ 2
  #define VDR_IQ3_XXS_Q8_1_MMQ  2
  
@@ -62,7 +62,7 @@ index 0f039c735..b512972e5 100644
  static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -1161,10 +1184,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+@@ -1169,10 +1192,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
      const uint8_t * q3 = (const uint8_t *) &q3_packed;
      const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
  

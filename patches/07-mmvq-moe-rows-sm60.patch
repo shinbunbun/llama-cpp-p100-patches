@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 5f8b04efa..19df607f3 100644
+index 0579047bc..492c3f011 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -904,7 +904,20 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1002,7 +1002,20 @@ static void mul_mat_vec_q_moe_launch(
          const uint32_t ncols_dst, const uint32_t ids_stride,
          const int warp_size, const int nchannels_dst, cudaStream_t stream) {
  

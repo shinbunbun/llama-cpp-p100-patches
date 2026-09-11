@@ -2,9 +2,11 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-31 patches against llama.cpp `v0.2.0`, grouped by scope below; the application
-order is the file numbering. Order matters: several touch the same files, and
-later ones build on earlier ones.
+29 patches, grouped by scope below; the application order is the file
+numbering. Order matters: several touch the same files, and later ones build
+on earlier ones. All 29 are generated against llama.cpp `v0.4.0`, where they
+apply at zero fuzz and zero offset (see [patches.nix](../nix/patches.nix)
+and the top-level README for the current `llamaCppTag`).
 
 Every patch carries its full reasoning — including the measurements that
 justify it and the alternatives that were tried and rejected — in the comments
@@ -67,22 +69,6 @@ F32 `mul_mat` fell into cuBLAS SGEMM — 5.9% of decode GPU time.
 The one workload whose output was checked is bit-identical (and 3.6% faster);
 the others were not checked. Note the edited branch is `cc < TURING`, so it also
 raises the limit for Volta, which was not measured.
-
-### 06 · `mmq-mul-mat-id-sm60` — `sm_60`
-
-MMQ is disabled wholesale without native DP4A. **That is correct for dense
-`MUL_MAT`**: measured across every quantization tested at n=512, MMQ runs at
-0.49–0.61× the cuBLAS path, and forcing it on costs a dense model 56% of its
-prefill.
-
-`MUL_MAT_ID` is different, because there the alternative is not cuBLAS but the
-sorted-gather fallback: two stream syncs, a host triple loop, and one `mul_mat`
-per expert. A 0.6× kernel wins easily.
-
-**MoE prefill +20–41%** (no regression from 34 to 23,908 prompt tokens), and
-~200 MiB less peak VRAM. Perplexity is statistically indistinguishable
-(paired ΔNLL +0.0028 ± 0.0029, t = 0.96); against a CPU-backend reference the
-patched build is *closer* (+0.038% vs +0.224%).
 
 ### 07 · `mmvq-moe-rows-sm60` — `all archs`
 
@@ -222,24 +208,6 @@ layout-dependent fusion decision described in benchmarking.md, not the kernel.
 
 ## Architecture-independent CUDA
 
-### 03 · `topk-moe-multirow` — `CUDA`
-
-The fused MoE router kernel is restricted to a single row because its outputs
-alias its logits input. It already maps `rows_per_block` (4) rows to one block
-and reads each row fully before writing, so one block-wide barrier makes the
-exception safe for every row a block owns.
-
-Speculative decoding verifies `n_draft + 1` rows and hit this head-on, falling
-back to a six-kernel chain (4.0% of decode GPU time versus 1.0% fused).
-
-**+2.8–6.1% decode.**
-
-**Output is not bit-identical above one row.** The fused kernel replaces the
-argsort chain, and the two could already disagree on expert selection — removing
-that mismatch is what raises the acceptance rate. The `n_rows == 1` path upstream
-already fuses is untouched and stays bit-identical. No perplexity was taken for
-this one.
-
 ### 04 · `concat-non-cont-flat` — `CUDA`
 
 The non-contiguous concat kernel maps one block to each `(i1, i2, i3)` and
@@ -337,8 +305,11 @@ decode GPU time. `rms_norm` maps one row to one block, so the add can be done
 in its prologue.
 
 `k_bin_bcast` 5,514 → 1,872 launches, at the cost of `rms_norm_f32<1024>` going
-6.53 → 8.19 µs. **+0.70%**, bit-identical.
-Kill switch: `GGML_CUDA_DISABLE_FUSE_PRE_ADD`.
+6.53 → 8.19 µs. **+0.70%**, bit-identical (measured on a dense model).
+
+**Off by default since the v0.4.0 rebase.** See the hazard note after patch
+20 below for why, and what enabling it (`GGML_CUDA_FUSE_PRE_ADD=1`) actually
+does and does not guarantee.
 
 ### 20 · `fuse-add-unary-mul` — `CUDA`
 
@@ -347,8 +318,42 @@ requires `ggml_are_same_shape`, which fails once `n_tokens > 1`, and never
 covers the ADD.
 
 `k_bin_bcast` 1,872 → **0** launches; total kernels 54,326 → 52,454.
-**+0.72%**, bit-identical.
-Kill switch: `GGML_CUDA_DISABLE_FUSE_ADD_UNARY_MUL`.
+**+0.72%**, bit-identical. Off by default, same as 19 — see below.
+
+**Known hazard, neither 19 nor 20 goes through
+`ggml_cuda_check_fusion_memory_ranges`; both are opt-in.** Both fusions add a
+write the unfused graph does not have (the ADD's `dst`), and both read the
+prologue's inputs (`add->src[0]`/`src[1]`, for 19; the bias add's inputs, for
+20) in the same kernel that writes the epilogue's output (the `MUL` node's
+`dst`). `add->src[*]` (19) goes out of scope at the ADD node, so once
+ggml-alloc carves the `MUL` output out of that now-freed block, a later
+allocation sharing part of that block can have its epilogue write land on
+memory the prologue of a *different* invocation still needs to read — a
+partial overlap upstream's check exists to catch (unfused, the three kernels
+run sequentially, so this is safe). It went unnoticed through `v0.2.0` and
+surfaced as non-deterministic decode output on `v0.4.0`'s MoE graphs (same
+seed, three runs, three different outputs), even though the fused kernel is
+correct in isolation.
+
+The first fix tried was gating 19 off whenever the graph contains a
+`MUL_MAT_ID` node (i.e. is MoE). That is not sufficient: `ggml_backend_sched`
+can split a graph across backends (`--n-cpu-moe`, `-ot "exps=CPU"`), and a
+`MUL_MAT_ID` routed to a CPU split is invisible to a CUDA-side scan of the
+same graph, so the guard reads "dense" for a graph that is not. 20 never had
+this guard at all, and duplicates the same read-under-write shape for the
+gated delta-net's gate preprocessing — the architecture the non-determinism
+was actually observed on. Given that, both are now **off by default**
+(`GGML_CUDA_FUSE_PRE_ADD=1` / `GGML_CUDA_FUSE_ADD_UNARY_MUL=1` to opt in) —
+correct on a dense model (measured bit-identical), but not guaranteed safe on
+any graph the scheduler may split. The actual fix belongs upstream's own
+memory-range check, not a per-patch workaround. Note that
+`ggml_cuda_check_fusion_memory_ranges` itself only accepts a contiguous
+`(node_idx, node_count)` range, while `ggml_cuda_collect_ops` can return
+non-contiguous `idxs` — calling the check as-is would not close this on its
+own.
+
+Enable switches (default off, unlike every other patch's kill switch):
+`GGML_CUDA_FUSE_PRE_ADD=1` (19), `GGML_CUDA_FUSE_ADD_UNARY_MUL=1` (20).
 
 ### 26 · `cpy-fused-rows` — `CUDA`
 
@@ -398,6 +403,16 @@ Falls back to the existing sort for k > 16 (a hard implementation cap — the
 candidates live in per-thread register arrays), for narrow rows, and for
 oversized grids.
 Kill switch: `GGML_CUDA_DISABLE_TOP_K_PARTIAL`.
+
+CUDA-only: the whole block is guarded with `#if !defined(GGML_USE_HIP)`. Two
+reasons. `__shfl_xor_sync` here uses cub's 3-argument form, but
+`ggml-cuda/vendors/hip.h` `#define`s it as a 4-argument macro, so it fails to
+compile under HIP as written. And even past that, the kernels assume a
+32-lane warp throughout (`CUDA_TOP_K_WARPS`, `threadIdx.x & 31`/`>> 5`,
+`e*32`), which does not hold on AMD's 64-lane wavefronts. Since `v0.4.0`,
+upstream ships its own HIP-only fallback, `top_k_radix_cuda`
+(`!GGML_CUDA_USE_CUB && GGML_USE_HIP`, `ncols > 1024`), and this patch leaves
+that path — and the full sort below `ncols = 1024` — untouched on HIP.
 
 > This one is worth attention beyond Pascal: **every CUDA 12.x user with GPU
 > sampling pays a full-vocabulary sort per token.**
@@ -715,11 +730,12 @@ slot's graph runs.
 The token cap is 4 because slot buffers are laid out differently from the main
 scheduler's, and `ggml_cuda_check_fusion_memory_ranges` decides fusion from the
 actual tensor addresses. topk-moe's exception (`ggml_nrows(node) <=
-GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK`, from patch 03) is why 5 is where the MoE
-flips — a verify batch of `n_draft + 1` falls just outside it — but it covers
-only the topk-moe call sites, so it explains the boundary rather than proving the
-bound. The bound itself is measured: at `n_tokens <= 4` both a dense and an MoE
-model stayed bit-identical.
+TOPK_MOE_ROWS_PER_BLOCK`, = 8 upstream on `v0.4.0`) means a verify batch of
+`n_draft + 1 = 5` still falls inside it — the exception's own edge is at
+`n_tokens = 9`, not 5 — so it does not explain the measured boundary: both a
+dense and an MoE model stayed bit-identical at `n_tokens <= 4` and changed
+output at `n_tokens = 5`. The `n_tokens <= 4` cap is that measurement, not
+something read off the topk-moe exception.
 
 4 is the default because the asymmetry is severe: running out of VRAM means the
 model does not load, while 0.38 points — real, and well above the ±0.07%
@@ -731,9 +747,9 @@ restores upstream behaviour.
 `ggml_cuda_check_fusion_memory_ranges` decides fusion from actual tensor
 addresses, so a different buffer layout changes which fusions fire and
 therefore changes the output. topk-moe skips that check at
-`nrows <= GGML_CUDA_TOPK_MOE_ROWS_PER_BLOCK` (= 4), and inside that bound the
-layout does not matter — measured bit-identical at `n_tokens <= 4`, changing at
-5 and above.
+`nrows <= TOPK_MOE_ROWS_PER_BLOCK` (= 8 on `v0.4.0`), but the default of 4 is
+not read off that bound — it is measured bit-identical at `n_tokens <= 4`,
+changing at 5 and above.
 
 ---
 

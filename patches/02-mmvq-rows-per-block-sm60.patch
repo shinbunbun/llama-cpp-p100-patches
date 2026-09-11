@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 970534809..5f8b04efa 100644
+index f65e0fbcd..0579047bc 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -525,10 +525,27 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+@@ -537,10 +537,27 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
      if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
          switch (ncols_dst) {
              case 1:

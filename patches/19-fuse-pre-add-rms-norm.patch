@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e3c9932b5..f1f3f1c31 100644
+index b6b7237..cfc169d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3395,6 +3395,73 @@ static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, in
+@@ -3545,6 +3545,73 @@ static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, in
      return n;
  }
  
@@ -76,17 +76,28 @@ index e3c9932b5..f1f3f1c31 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -3441,6 +3508,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3603,6 +3670,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
 +    // Fuse the residual add into RMS_NORM: ADD -> RMS_NORM -> MUL in one launch.  The
 +    // `k_bin_bcast(add) -> rms_norm` pair is 3.11% of decode GPU time.  Upstream only fuses what
 +    // comes AFTER rms_norm (mul / add); the preceding residual add passed through untouched.
++    //
++    // Off by default.  This fusion (and 20's add+unary+mul) writes the ADD's `dst` while its own
++    // prologue still reads `add->src[0]`/`src[1]` in the same kernel that the epilogue uses to
++    // write the MUL's `dst` -- neither goes through `ggml_cuda_check_fusion_memory_ranges`, so
++    // ggml-alloc can carve the MUL output out of the ADD inputs' just-freed block and have one
++    // invocation's epilogue write land on memory a different invocation's prologue still needs to
++    // read. This produced non-deterministic MoE decode output on Tesla P100 (same seed, three
++    // runs, three different outputs); gating on "graph contains MUL_MAT_ID" is not sufficient
++    // either, since backend scheduler splits can put the MUL_MAT_ID on a different (e.g. CPU)
++    // split and leave this fusion's view of the graph looking dense. The real fix is upstream's
++    // own memory-range check; until then this only runs when explicitly requested.
 +    if (node->op == GGML_OP_ADD) {
-+        static bool disable_pre_add = getenv("GGML_CUDA_DISABLE_FUSE_PRE_ADD") != nullptr &&
-+                                      std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_PRE_ADD"));
-+        if (!disable_pre_add) {
++        static bool enable_pre_add = getenv("GGML_CUDA_FUSE_PRE_ADD") != nullptr &&
++                                     std::atoi(getenv("GGML_CUDA_FUSE_PRE_ADD"));
++        if (enable_pre_add) {
 +            static const ggml_op pre_add_ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
 +            int idxs[3];
 +            if (ggml_cuda_collect_ops(cgraph, i, pre_add_ops, 3, idxs)) {
@@ -111,7 +122,7 @@ index e3c9932b5..f1f3f1c31 100644
          static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
                                   std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index d3a4fbda4..57ccdceb2 100644
+index d3a4fbd..57ccdce 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -73,7 +73,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
@@ -355,7 +366,7 @@ index d3a4fbda4..57ccdceb2 100644
                                       ggml_tensor *               dst,
                                       ggml_tensor *               mul_tensor,
 diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
-index 489d3d4b8..83bae57ee 100644
+index 489d3d4..83bae57 100644
 --- a/ggml/src/ggml-cuda/norm.cuh
 +++ b/ggml/src/ggml-cuda/norm.cuh
 @@ -8,6 +8,12 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

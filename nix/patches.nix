@@ -9,15 +9,13 @@
 {
   # Keep in sync with inputs.llama-cpp-src.url in flake.nix -- flake inputs must
   # be literals, so the tag cannot be shared between the two.
-  llamaCppTag = "v0.2.0";
+  llamaCppTag = "v0.4.0";
 
   patches = [
     ../patches/01-vmad-dp4a-sm60.patch
     ../patches/02-mmvq-rows-per-block-sm60.patch
-    ../patches/03-topk-moe-multirow.patch
     ../patches/04-concat-non-cont-flat.patch
     ../patches/05-mmvf-f32-pascal.patch
-    ../patches/06-mmq-mul-mat-id-sm60.patch
     ../patches/07-mmvq-moe-rows-sm60.patch
     ../patches/08-mmvq-mmid-batch-sm60.patch
     ../patches/09-mmvq-nwarps-small-k-sm60.patch
