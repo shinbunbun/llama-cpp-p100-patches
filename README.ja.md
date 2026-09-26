@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-[llama.cpp](https://github.com/ggml-org/llama.cpp) の性能パッチ 29 本。
+[llama.cpp](https://github.com/ggml-org/llama.cpp) の性能パッチ 44 本。
 **Tesla P100 (GP100, sm_60)** 上で開発し、実測した。
 
 English: [README.md](README.md)
@@ -14,12 +14,17 @@ $ nix build github:shinbunbun/llama-cpp-p100-patches#llama-cpp-sm60
 cuBLAS に落ちる一方で、このカードが本当に得意な命令は使われないままになる。
 名前に `sm60` が付くパッチは、この非対称性を突いたものである。
 
-**とはいえ、29 本のうち Pascal 世代に限定されているのは 7 本だけである。** もう 1 本は
-アーキテクチャで分岐しない定数を変えるので、全 GPU に影響する。残る 21 本はハードウェアに
+**とはいえ、44 本のうち Pascal 世代に限定されているのは 8 本だけである。** もう 1 本は
+アーキテクチャで分岐しない定数を変えるので、全 GPU に影響する。残る 35 本はハードウェアに
 依存しない。内訳はカーネル融合、添字計算の修正、ホスト側のサンプラー経路 2 本、
-スケジューラ 2 本、語彙全体のソートを避ける `top_k`、そして参照テーブル 2 種の共有メモリ化で
-ある。ただしこのうち 5 本は gated delta-net を持つモデルでしか発火せず、1 本は特定の
-モデル機能を必要とする。
+スケジューラ 4 本、行全体のソートを避ける `top_k` 経路 2 本、仕事量に起動形状を合わせた
+gather カーネル、そして参照テーブル 2 種の共有メモリ化である。ただしこのうち 6 本は
+gated delta-net を持つモデルでしか発火せず、5 本は特定のモデルアーキテクチャを必要と
+する。
+
+パッチ 32〜46 は 1 つのワークロードから出ている。48 層の疎アテンション MoE を、ルー
+ティング重みをホストメモリに置いたまま 262,144 トークンの文脈で動かす構成である。
+効き方が offload の量に依存するため、**ほとんどが環境変数で既定オフ**にしてある。
 下の表の各行に適用範囲のタグを付けてあり、[docs/patches.ja.md](docs/patches.ja.md) は
 その分類で章立てしてある。
 
@@ -63,7 +68,7 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 
 ## 状態
 
-- 29 本すべてを llama.cpp **`v0.4.0`** に対して生成しており、**fuzz 0・オフセット 0**
+- 44 本すべてを llama.cpp **`v0.4.0`** に対して生成しており、**fuzz 0・オフセット 0**
   で適用できる (`nix flake check` がこの両方と、`nix/patches.nix` の順序付きリストが
   `patches/` の中身と一致することを検証する)
 - upstream には未提出。明快な候補が 2 本ある。11 `penalties-direct` と
@@ -77,10 +82,18 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
   にすぎない
 - 全パッチを当てたまま P100 で **`test-backend-ops` が通った**（`v0.2.0` で 13,352 件・
   失敗 0、同じ機械の無パッチ `v0.2.0` 版と件数も結果も一致。`v0.4.0` では 14,744 件・
-  失敗 0。ただし `v0.4.0` は無パッチ版との突き合わせを行っていない）
+  失敗 0。ただし `v0.4.0` は無パッチ版との突き合わせを行っていない）。どちらの実行も
+  パッチ 32〜46 より前のものである。32〜46 は対象モデルでの検証（パッチごとのビット一致
+  確認・パープレキシティ・長文脈ベンチ）で確かめており、`test-backend-ops` は取り直して
+  いない
 - パッチ自身が断っていない限り、出力は無パッチ版と**ビット一致**する。出力が変わるのは
   少数で (09 は K が 4 ワープ中 3 ワープ分を要する場合、12 は通る幅で、15 は設計上、31 は
-  KV キャッシュがチャンク長を超えた場合)、それぞれ根拠を添えて明示してある。22 だけは
+  KV キャッシュがチャンク長を超えた場合、35 は MUL_MAT_ID が MMQ から MMVQ に移るため、
+  36 は投機の検証バッチが cuBLAS を通らなくなるため、39 はリダクション順、41 は置き換える
+  ソートが値降順なのに対し出力がインデックス昇順であるため、44 は最新の位置が端数ブロックを
+  作っているあいだ、45 は詰め物版の flash attention を取った場合、46 は expert が CPU と
+  GPU のあいだを移動するため)、それぞれ根拠を添えて明示してある。このうち**既定で有効**な
+  のは 44 と 45 の 2 本である。22 だけは
   ビット一致の根拠が**論証ではなく実測**である。既定の `n_tokens <= 4` は dense と MoE で
   一致を確認したという事実であって、compute バッファのレイアウト差が融合判定を変えない
   ことの証明ではない。19・20 は**既定オフ**でデフォルトビルドには含まれない。有効化すると
@@ -126,6 +139,21 @@ MoE は 4 ラウンド (0.16% / 0.12%)。
 | 29 | `mmvq-iq3xxs-grid-smem` | CUDA | decode +3.1〜7.6% (dense)、出力ビット一致 |
 | 30 | `mmvq-ksigns-smem` | CUDA | decode +0.2〜1.8%、カーネル IQ3_XXS −9.3%、出力ビット一致 |
 | 31 | `fattn-f16-kv-chunk` | pre-Turing | ctx 262,144 で計算バッファ −960 MiB (1,152 → 192)、decode 不変 |
+| 32 | `sched-split-prefetch` | host | expert を offload した MoE で decode −9〜10%、**既定オフ** (`LLAMA_SCHED_PREFETCH=1`) |
+| 33 | `sched-weight-prefetch` | host | prefill −4.6〜6.6%、ctx 262,144 のピーク −1,222 MiB、**既定オフ** (`LLAMA_SCHED_WPF=<MiB>`) |
+| 34 | `mul-mat-id-negative-ids` | host | 46 の前提。単独では効果なし |
+| 35 | `mmvq-mmid-batch-cap` | CUDA | expert キャッシュ常駐時に ubatch あたり −4〜11%、**既定オフ** (`LLAMA_MMVQ_MMID_MAX=<n>`) |
+| 36 | `mmvq-chunk-large-batch` | CUDA | 投機バッチ後のプール −1,166 MiB、**既定オフ** (`GGML_CUDA_MMVQ_CHUNK_MIN_MIB=<MiB>`) |
+| 37 | `getrows-narrow-batched` | CUDA | prefill −9.4%、出力ビット一致、**既定オフ** (`GGML_CUDA_GETROWS_FLAT_MAX=<n>`) |
+| 38 | `getrows-q4-0-block` | CUDA | prefill −10.1%、出力ビット一致、**既定オフ** (`GGML_CUDA_GETROWS_Q4_0_BLK=1`) |
+| 39 | `gdn-lanes-per-column` | CUDA (delta-net) | prefill −4.5%、**既定オフ** (`GGML_GDN_LPC=16`) |
+| 40 | `mmq-iq4-nl-threads` | pre-Volta | IQ4_NL の MoE down 射影で +3〜4%、出力ビット一致 |
+| 41 | `top-k-radix-select` | CUDA | k = 2,051 で 133 → 74.8 µs、decode −2.3%、**既定オフ** (`GGML_CUDA_TOP_K_SELECT=1`) |
+| 42 | `qwen4exp-hc-exact` | model | decode −1%、出力ビット一致 |
+| 43 | `fuse-hc-combine` | CUDA | 層あたり約 40 回の要素演算を 2 本のカーネルへ、出力ビット一致 |
+| 44 | `qwen4exp-qsa-block-key-cache` | model | decode の深さ依存を除去 (ctx 262,144 で 384 MiB) |
+| 45 | `qwen4exp-qsa-sparse-gather` | model | 計算バッファ 3,773 → 1,063 MiB。`LLAMA_QSA_PAD=1` で prefill −7.8%・262k decode −18% |
+| 46 | `qwen4exp-moe-expert-cache` | model | 60 スロットで 40k decode 51.0 ms/token (48 スロットでは 55.2)、**既定オフ** (`LLAMA_MOE_CACHE=<スロット数>`) |
 
 19・20 は既定オフである。表中の数値はそれぞれ単独で dense モデルを対象に測ったもので、
 両方を有効にすると **35B-A3B MoE の decode で +2.36%** になる (同一ビルドで 2 つの環境変数

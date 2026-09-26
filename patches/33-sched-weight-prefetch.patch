@@ -1,0 +1,286 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index cc3f8cd36..f1c3569f6 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -353,6 +353,15 @@ extern "C" {
+     // Set a callback to be called for each resulting node during graph compute
+     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+ 
++    // Device memory the scheduler may borrow to upload offloaded weights ahead of use, in graphs that
++    // do not reference it. The epoch changes whenever the first *extent bytes may have been overwritten.
++    GGML_API void                 ggml_backend_sched_set_staging_area(ggml_backend_buffer_t buffer, size_t size);
++    GGML_API uint64_t             ggml_backend_sched_staging_epoch(size_t * extent);
++    // waits for the uploads that moved the epoch, which run outside any graph
++    GGML_API void                 ggml_backend_sched_staging_synchronize(void);
++    // drops the registration if it still names this buffer
++    GGML_API void                 ggml_backend_sched_clear_staging_area(ggml_backend_buffer_t buffer);
++
+     //
+     // Meta backend
+     //
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 2b0c869a3..e8fb076d8 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,6 +20,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <atomic>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -833,6 +834,19 @@ struct ggml_backend_sched {
+ 
+     int debug;
+ 
++    // upload the offloaded weights of the next splits while the current one computes [LLAMA_SCHED_WPF=<MiB>]
++    size_t                wpf_size;
++    ggml_backend_t        wpf_backend;
++    ggml_backend_buffer_t wpf_buf;
++    ggml_backend_event_t  wpf_ev_up;
++    ggml_backend_event_t  wpf_ev_free;
++    struct ggml_tensor *  wpf_src[8];
++    size_t                wpf_off[8];
++    bool                  wpf_done[8];
++    int                   wpf_n;
++    bool                  wpf_tried;
++    bool                  wpf_off_graph;
++
+     // run the GPU work that the next CPU split does not need while the CPU computes [LLAMA_SCHED_PREFETCH]
+     int prefetch;
+     ggml_backend_event_t prefetch_event[GGML_SCHED_MAX_BACKENDS];
+@@ -1661,6 +1675,158 @@ static bool sched_backend_is_cpu(ggml_backend_t backend) {
+     return ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+ }
+ 
++static ggml_backend_buffer_t g_stage_buf    = NULL;
++static size_t                g_stage_size   = 0;
++static std::atomic<uint64_t> g_stage_epoch  { 0 };
++static std::atomic<size_t>   g_stage_extent { 0 };
++static ggml_backend_t        g_stage_producer = NULL;
++
++void ggml_backend_sched_set_staging_area(ggml_backend_buffer_t buffer, size_t size) {
++    g_stage_buf  = buffer;
++    g_stage_size = buffer ? std::min(size, ggml_backend_buffer_get_size(buffer)) : 0;
++}
++
++// the staging uploads run on their own backend, which no graph-level synchronize covers
++void ggml_backend_sched_staging_synchronize(void) {
++    if (g_stage_producer) {
++        ggml_backend_synchronize(g_stage_producer);
++    }
++}
++
++void ggml_backend_sched_clear_staging_area(ggml_backend_buffer_t buffer) {
++    if (g_stage_buf == buffer) {
++        g_stage_buf  = NULL;
++        g_stage_size = 0;
++    }
++}
++
++uint64_t ggml_backend_sched_staging_epoch(size_t * extent) {
++    if (extent) {
++        *extent = g_stage_extent.load();
++    }
++    return g_stage_epoch.load();
++}
++
++static bool sched_is_offloaded_weight(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split, int backend_id, struct ggml_tensor * input) {
++    if (split->graph.n_nodes == 0 || !input->buffer || (input->flags & GGML_TENSOR_FLAG_INPUT) ||
++        ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_backend_buffer_is_host(input->buffer)) {
++        return false;
++    }
++    const ggml_tensor * node = split->graph.nodes[0];
++    return node->op == GGML_OP_MUL_MAT_ID && node->src[0] == tensor_copy(input, backend_id, sched->cur_copy);
++}
++
++static void sched_wpf_view(ggml_backend_sched_t sched, const ggml_tensor * like, size_t off, ggml_tensor * out) {
++    *out = *like;
++    out->op       = GGML_OP_NONE;
++    out->view_src = NULL;
++    out->view_offs = 0;
++    out->extra    = NULL;
++    for (int i = 0; i < GGML_MAX_SRC; ++i) {
++        out->src[i] = NULL;
++    }
++    out->buffer = sched->wpf_buf;
++    out->data   = (char *) ggml_backend_buffer_get_base(sched->wpf_buf) + off;
++}
++
++static bool sched_wpf_ready(ggml_backend_sched_t sched, ggml_backend_t gpu) {
++    if (!sched->wpf_tried) {
++        sched->wpf_tried = true;
++        const char * e = getenv("LLAMA_SCHED_WPF");
++        sched->wpf_size = e ? (size_t) atoll(e) << 20 : 0;
++        if (sched->wpf_size) {
++            ggml_backend_dev_t dev = ggml_backend_get_device(gpu);
++            sched->wpf_backend = ggml_backend_dev_init(dev, NULL);
++            if (g_stage_buf && ggml_backend_buffer_get_type(g_stage_buf) == ggml_backend_get_default_buffer_type(gpu)) {
++                sched->wpf_size = std::min(sched->wpf_size, g_stage_size);
++                sched->wpf_buf  = g_stage_buf;
++            } else {
++                sched->wpf_buf  = sched->wpf_backend ? ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(gpu), sched->wpf_size) : NULL;
++            }
++            sched->wpf_ev_up   = ggml_backend_event_new(dev);
++            sched->wpf_ev_free = ggml_backend_event_new(dev);
++            if (!sched->wpf_backend || !sched->wpf_buf || !sched->wpf_ev_up || !sched->wpf_ev_free) {
++                GGML_LOG_WARN("%s: weight prefetch disabled\n", __func__);
++                sched->wpf_size = 0;
++            } else if (sched->wpf_buf == g_stage_buf) {
++                g_stage_producer = sched->wpf_backend;
++            }
++        }
++    }
++    return sched->wpf_size > 0;
++}
++
++// the input was uploaded ahead of time: bring it over from the staging area instead of the host
++static bool sched_wpf_take(ggml_backend_sched_t sched, ggml_backend_t backend, struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
++    if (ggml_backend_get_device(backend) != ggml_backend_get_device(sched->wpf_backend)) {
++        return false;
++    }
++    for (int i = 0; i < sched->wpf_n; ++i) {
++        if (sched->wpf_src[i] != input || sched->wpf_done[i]) {
++            continue;
++        }
++        ggml_backend_event_wait(backend, sched->wpf_ev_up);
++        struct ggml_tensor v;
++        sched_wpf_view(sched, input, sched->wpf_off[i], &v);
++        ggml_backend_tensor_copy_async(backend, backend, &v, input_cpy);
++        sched->wpf_done[i] = true;
++        bool all = true;
++        for (int j = 0; j < sched->wpf_n; ++j) {
++            all = all && sched->wpf_done[j];
++        }
++        if (all) {
++            ggml_backend_event_record(sched->wpf_ev_free, backend);
++            sched->wpf_n = 0;
++        }
++        return true;
++    }
++    return false;
++}
++
++// called after split_id was queued: stage the offloaded weights of the splits that follow
++static void sched_wpf_stage(ggml_backend_sched_t sched, struct ggml_backend_sched_split * splits, int split_id) {
++    if (sched->wpf_n > 0) {
++        return;
++    }
++    size_t off = 0;
++    for (int j = split_id + 1; j < sched->n_splits && sched->wpf_n < 8; ++j) {
++        struct ggml_backend_sched_split * sp = &splits[j];
++        for (int k = 0; k < sp->n_inputs; ++k) {
++            struct ggml_tensor * in = sp->inputs[k];
++            if (!sched_is_offloaded_weight(sched, sp, sp->backend_id, in) ||
++                    ggml_backend_get_device(sched->backends[sp->backend_id]) != ggml_backend_get_device(sched->wpf_backend)) {
++                continue;
++            }
++            const size_t sz = GGML_PAD(ggml_nbytes(in), 256);
++            if (off + sz > sched->wpf_size || sched->wpf_n == 8) {
++                goto done;
++            }
++            sched->wpf_src[sched->wpf_n]  = in;
++            sched->wpf_off[sched->wpf_n]  = off;
++            sched->wpf_done[sched->wpf_n] = false;
++            sched->wpf_n++;
++            off += sz;
++        }
++    }
++done:
++    if (sched->wpf_n == 0) {
++        return;
++    }
++    if (sched->wpf_buf == g_stage_buf) {
++        size_t ext = g_stage_extent.load();
++        while (ext < off && !g_stage_extent.compare_exchange_weak(ext, off)) {
++        }
++        g_stage_epoch++;
++    }
++    ggml_backend_event_wait(sched->wpf_backend, sched->wpf_ev_free);
++    for (int i = 0; i < sched->wpf_n; ++i) {
++        struct ggml_tensor v;
++        sched_wpf_view(sched, sched->wpf_src[i], sched->wpf_off[i], &v);
++        ggml_backend_tensor_set_async(sched->wpf_backend, &v, sched->wpf_src[i]->data, 0, ggml_nbytes(sched->wpf_src[i]));
++    }
++    ggml_backend_event_record(sched->wpf_ev_up, sched->wpf_backend);
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1670,6 +1836,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     std::vector<ggml_bitset_t> used_ids;
+ 
+     int prev_backend_id = -1;
++    sched->wpf_n = 0;
++    sched->wpf_off_graph = false;
++    bool wpf = false;
++    for (int b = 0; b < sched->n_backends && !wpf; b++) {
++        if (!sched_backend_is_cpu(sched->backends[b])) {
++            wpf = sched_wpf_ready(sched, sched->backends[b]);
++        }
++    }
++    if (wpf && sched->wpf_buf == g_stage_buf) {
++        bool offload = false;
++        for (int i = 0; i < sched->n_splits && !offload; i++) {
++            for (int k = 0; k < splits[i].n_inputs && !offload; k++) {
++                offload = sched_is_offloaded_weight(sched, &splits[i], splits[i].backend_id, splits[i].inputs[k]);
++            }
++        }
++        for (int i = 0; i < sched->n_splits && offload && !sched->wpf_off_graph; i++) {
++            const struct ggml_cgraph * g = &splits[i].graph;
++            for (int n = 0; n < g->n_nodes && !sched->wpf_off_graph; n++) {
++                for (int j = 0; j < GGML_MAX_SRC; j++) {
++                    const ggml_tensor * t = g->nodes[n]->src[j];
++                    if (t && (t->buffer == g_stage_buf || (t->view_src && t->view_src->buffer == g_stage_buf))) {
++                        sched->wpf_off_graph = true;
++                        break;
++                    }
++                }
++            }
++        }
++        sched->wpf_off_graph = sched->wpf_off_graph || !offload;
++    }
+     sched->n_prefetched = 0;
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+@@ -1725,6 +1920,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     ggml_backend_synchronize(split_backend);
+                 }
+ 
++                if (sched->wpf_n > 0 && sched_wpf_take(sched, split_backend, input, input_cpy)) {
++                    continue;
++                }
++
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                 ggml_tensor * node = split->graph.nodes[0];
+                 if (split->graph.n_nodes > 0 &&
+@@ -1877,6 +2076,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 if (ec != GGML_STATUS_SUCCESS) {
+                     return ec;
+                 }
++                if (wpf && !sched->wpf_off_graph && !sched_backend_is_cpu(split_backend)) {
++                    sched_wpf_stage(sched, splits, split_id);
++                }
+             }
+         } else {
+             // similar to ggml_backend_compare_graph_backend
+@@ -2019,6 +2221,17 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+         }
+         ggml_backend_event_free(sched->prefetch_event[b]);
+     }
++    ggml_backend_event_free(sched->wpf_ev_up);
++    ggml_backend_event_free(sched->wpf_ev_free);
++    if (sched->wpf_buf && sched->wpf_buf != g_stage_buf) {
++        ggml_backend_buffer_free(sched->wpf_buf);
++    }
++    if (sched->wpf_backend) {
++        if (g_stage_producer == sched->wpf_backend) {
++            g_stage_producer = NULL;
++        }
++        ggml_backend_free(sched->wpf_backend);
++    }
+     ggml_gallocr_free(sched->galloc);
+     ggml_free(sched->ctx);
+     ggml_hash_set_free(&sched->hash_set);

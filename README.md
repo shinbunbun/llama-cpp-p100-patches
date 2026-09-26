@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-29 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
+44 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 developed and measured on a **Tesla P100 (GP100, sm_60)**.
 
 日本語版: [README.ja.md](README.ja.md)
@@ -14,12 +14,18 @@ has full-rate HFMA2 — so llama.cpp's quantized matmul paths fall back to
 emulation and cuBLAS, while the one instruction the card is genuinely good at
 goes unused. The patches named `sm60` exploit that asymmetry.
 
-**But only 7 of the 29 are gated to Pascal-era hardware.** One more changes an
-unconditional constant that every GPU sees. The remaining 21 are not
+**But only 8 of the 44 are gated to Pascal-era hardware.** One more changes an
+unconditional constant that every GPU sees. The remaining 35 are not
 hardware-scoped at all — kernel fusions, index-arithmetic fixes, two host-side
-sampler paths, two scheduler patches, a `top_k` that avoids sorting the whole
-vocabulary, and two lookup tables staged in shared memory — though five of those
-only fire on gated delta-net models and one needs a specific model feature.
+sampler paths, four scheduler patches, two `top_k` paths that avoid sorting a
+whole row, gather kernels whose launch geometry matches the work, and two lookup
+tables staged in shared memory — though six of those only fire on gated
+delta-net models and five need a specific model architecture.
+
+Patches 32–46 come from one workload: a 48-layer sparse-attention MoE with its
+routed experts in host memory, at a 262,144-token context. Most of them are
+**off by default** behind an environment variable, because what they are worth
+depends on how much of the model is offloaded.
 Every row in the table below carries a scope tag, and
 [docs/patches.md](docs/patches.md) is grouped by it.
 
@@ -66,7 +72,7 @@ time and do not compose.
 
 ## Status
 
-- All 29 patches are generated against llama.cpp **`v0.4.0`**, where they
+- All 44 patches are generated against llama.cpp **`v0.4.0`**, where they
   apply at **zero fuzz and zero offset** (`nix flake check` verifies both, and
   that the file list matches the ordered list in `nix/patches.nix`).
 - Not submitted upstream. Two are straightforward candidates — 11
@@ -82,11 +88,20 @@ time and do not compose.
 - `test-backend-ops` passed on a P100 with the full set applied: 13,352 tests on
   `v0.2.0`, matching the unpatched `v0.2.0` build on the same machine, and
   14,744 on `v0.4.0`. No failures on either. The `v0.4.0` run has not been
-  compared against an unpatched build of that tag.
+  compared against an unpatched build of that tag, and both runs predate
+  patches 32–46 — those were verified against the model they were written for
+  (bit-identity checks, perplexity and a long-context benchmark, per patch),
+  not with `test-backend-ops`.
 - Unless a patch says otherwise, its output is **bit-identical** to the
   unpatched build. A few do change output (09 where K needs three of the four
   warps, 12 at the widths it takes, 15 by design, 31 once the KV cache is
-  longer than its chunk length) and say so with the evidence. 22 is the one
+  longer than its chunk length, 35 where a MUL_MAT_ID moves from MMQ to MMVQ,
+  36 where a speculative verify batch stops going through cuBLAS, 39 by
+  reduction order, 41 because its permutation is index-ascending where the sort
+  it replaces was value-descending, 44 while the newest positions form a partial
+  block, 45 when the padded flash-attention kernel is taken, 46 because an
+  expert moves between the CPU and the GPU) and say so with the evidence. Of
+  those, 44 and 45 are the two that are **on by default**. 22 is the one
   whose bit-identity is **measured rather than argued**: its `n_tokens <= 4`
   default comes from a dense and an MoE model staying identical there, not
   from a proof that a different compute-buffer layout cannot change a fusion
@@ -136,6 +151,21 @@ each was measured against the stack as it stood at the time.
 | 29 | `mmvq-iq3xxs-grid-smem` | CUDA | +3.1–7.6% decode (dense), bit-identical |
 | 30 | `mmvq-ksigns-smem` | CUDA | +0.2–1.8% decode, −9.3% IQ3_XXS kernel, bit-identical |
 | 31 | `fattn-f16-kv-chunk` | pre-Turing | −960 MiB compute buffer at ctx 262,144 (1,152 → 192), decode unchanged |
+| 32 | `sched-split-prefetch` | host | −9–10% decode with offloaded MoE experts, **off by default** (`LLAMA_SCHED_PREFETCH=1`) |
+| 33 | `sched-weight-prefetch` | host | −4.6–6.6% prefill, −1,222 MiB peak at ctx 262,144, **off by default** (`LLAMA_SCHED_WPF=<MiB>`) |
+| 34 | `mul-mat-id-negative-ids` | host | enables 46; no effect on its own |
+| 35 | `mmvq-mmid-batch-cap` | CUDA | −4–11% per ubatch with a resident expert cache, **off by default** (`LLAMA_MMVQ_MMID_MAX=<n>`) |
+| 36 | `mmvq-chunk-large-batch` | CUDA | −1,166 MiB pool after a speculative batch, **off by default** (`GGML_CUDA_MMVQ_CHUNK_MIN_MIB=<MiB>`) |
+| 37 | `getrows-narrow-batched` | CUDA | −9.4% prefill, bit-identical, **off by default** (`GGML_CUDA_GETROWS_FLAT_MAX=<n>`) |
+| 38 | `getrows-q4-0-block` | CUDA | −10.1% prefill, bit-identical, **off by default** (`GGML_CUDA_GETROWS_Q4_0_BLK=1`) |
+| 39 | `gdn-lanes-per-column` | CUDA (delta-net) | −4.5% prefill, **off by default** (`GGML_GDN_LPC=16`) |
+| 40 | `mmq-iq4-nl-threads` | pre-Volta | +3–4% on an IQ4_NL MoE down projection, bit-identical |
+| 41 | `top-k-radix-select` | CUDA | 133 → 74.8 µs at k = 2,051, −2.3% decode, **off by default** (`GGML_CUDA_TOP_K_SELECT=1`) |
+| 42 | `qwen4exp-hc-exact` | model | −1% decode, bit-identical |
+| 43 | `fuse-hc-combine` | CUDA | two kernels for ~40 element-wise ops per layer, bit-identical |
+| 44 | `qwen4exp-qsa-block-key-cache` | model | removes decode's depth dependence (384 MiB at ctx 262,144) |
+| 45 | `qwen4exp-qsa-sparse-gather` | model | compute buffer 3,773 → 1,063 MiB; −7.8% prefill and −18% 262k decode with `LLAMA_QSA_PAD=1` |
+| 46 | `qwen4exp-moe-expert-cache` | model | decode 51.0 ms/token at 40k on 60 slots (55.2 on 48), **off by default** (`LLAMA_MOE_CACHE=<slots>`) |
 
 Patches 19 and 20 are off by default. Their per-patch figures above were
 measured individually on a dense model; enabling both together is worth

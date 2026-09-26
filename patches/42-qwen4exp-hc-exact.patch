@@ -1,0 +1,192 @@
+diff --git a/src/models/models.h b/src/models/models.h
+index 9b87a40d5..58fef0896 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -7,6 +7,8 @@
+ // note: almost all graphs require at least sqrtf, so include cmath globally
+ #include <cmath>
+ #include <map>
++#include <mutex>
++#include <unordered_set>
+ 
+ class llama_memory_hybrid_idx_context;
+ 
+@@ -2279,6 +2281,13 @@ struct llama_model_qwen4exp : public llama_model_base {
+     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+ 
+     class llm_graph_input_qsa;
++    // hc weights with the 1/hc factor folded in; exact, since hc is a power of two
++    mutable std::unordered_set<const ggml_tensor *> hc_prescaled;
++    mutable bool hc_fold_tried = false;
++    mutable std::once_flag hc_fold_once;
++
++    void hc_fold_impl() const;
++    void hc_fold() const { std::call_once(hc_fold_once, [this] { hc_fold_impl(); }); }
+ 
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+@@ -2300,8 +2309,11 @@ struct llama_model_qwen4exp : public llama_model_base {
+                     ggml_tensor * residual,
+                     ggml_tensor * block_out,
+                     ggml_tensor * inject,
++              const ggml_tensor * w_inject,
+                             int   il);
+ 
++        bool hc_prescaled(const ggml_tensor * w) const;
++
+         ggml_tensor * build_layer_attn(
+               llm_graph_input_attn_kv * inp_attn,
+   const llama_memory_hybrid_idx_context * mctx_hyb,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 1484c9b07..fd6709295 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -263,6 +263,67 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const
+ 
+ // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
+ // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
++bool llama_model_qwen4exp::graph::hc_prescaled(const ggml_tensor * w) const {
++    return static_cast<const llama_model_qwen4exp &>(model).hc_prescaled.count(w) > 0;
++}
++
++// Divides every scale of the tensor by 4 in place. Returns false, leaving the tensor untouched,
++// if any scale would round, which can only happen when it lands in the subnormal range.
++static bool qwen4exp_div4_exact(ggml_tensor * t) {
++    if (!t || !t->data || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
++        return false;
++    }
++    std::vector<uint8_t> buf(ggml_nbytes(t));
++    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
++    if (t->type == GGML_TYPE_Q8_0) {
++        const size_t bs = ggml_type_size(GGML_TYPE_Q8_0);
++        for (size_t o = 0; o < buf.size(); o += bs) {
++            ggml_fp16_t h;
++            memcpy(&h, &buf[o], sizeof(h));
++            const float q = ggml_fp16_to_fp32(h) * 0.25f;
++            const ggml_fp16_t hq = ggml_fp32_to_fp16(q);
++            if (ggml_fp16_to_fp32(hq) != q) {
++                return false;
++            }
++            memcpy(&buf[o], &hq, sizeof(hq));
++        }
++    } else if (t->type == GGML_TYPE_F32) {
++        for (size_t o = 0; o < buf.size(); o += sizeof(float)) {
++            float f;
++            memcpy(&f, &buf[o], sizeof(f));
++            const float q = f * 0.25f;
++            if (q * 4.0f != f) {
++                return false;
++            }
++            memcpy(&buf[o], &q, sizeof(q));
++        }
++    } else {
++        return false;
++    }
++    ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
++    return true;
++}
++
++void llama_model_qwen4exp::hc_fold_impl() const {
++    if (hc_fold_tried) {
++        return;
++    }
++    hc_fold_tried = true;
++    if (hparams.dsv4_hc_mult != 4) {
++        return;
++    }
++    std::vector<ggml_tensor *> ws = { hc_head_down };
++    for (const auto & l : layers) {
++        ws.insert(ws.end(), { l.hc_attn_down, l.hc_ffn_down, l.hc_attn_inject, l.hc_ffn_inject });
++    }
++    for (ggml_tensor * w : ws) {
++        if (qwen4exp_div4_exact(w)) {
++            hc_prescaled.insert(w);
++        }
++    }
++    LLAMA_LOG_INFO("%s: folded 1/hc into %zu of %zu hc weights\n", __func__, hc_prescaled.size(), ws.size());
++}
++
+ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         ggml_tensor *  x,
+         ggml_tensor *  w_norm,
+@@ -277,13 +338,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+ 
+     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
+     // the converter folded each gamma to (1 + w)
+-    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
++    // the gamma view is queued first so that RMS_NORM and MUL are adjacent and fuse
++    ggml_tensor * gamma = ggml_reshape_2d(ctx0, w_norm, n_embd, hc);
++    ggml_build_forward_expand(gf, gamma);
++    ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), gamma);
+     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+-    xn = ggml_mul(ctx0, xn, w_norm);
+     cb(xn, "hc_norm", il);
+ 
+     ggml_tensor * lo = build_lora_mm(w_down, xn);
+-    lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
++    if (!hc_prescaled(w_down)) {
++        lo = ggml_scale(ctx0, lo, 1.0f / (float) hc);
++    }
++    lo = ggml_silu(ctx0, lo);
+     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+     cb(gate, "hc_gate", il);
+ 
+@@ -291,14 +357,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+ 
+     // collapse the streams by their mean
+-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+-            ggml_row_size(gated->type, n_embd) * hc, 0);
+-    mixed = ggml_cont(ctx0, mixed);
+-    for (int64_t c = 1; c < hc; ++c) {
++    ggml_tensor * mixed = nullptr;
++    for (int64_t c = 0; c < hc; ++c) {
+         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                 ggml_row_size(gated->type, n_embd) * hc,
+                 ggml_row_size(gated->type, n_embd) * c);
+-        mixed = ggml_add(ctx0, mixed, s);
++        mixed = mixed ? ggml_add(ctx0, mixed, s) : s;
+     }
+     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+     cb(mixed, "hc_mixed", il);
+@@ -315,12 +379,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+         ggml_tensor * residual,
+         ggml_tensor * block_out,
+         ggml_tensor * inject,
++  const ggml_tensor * w_inject,
+         int           il) {
+     const int64_t hc = hparams.dsv4_hc_mult;
+     const int64_t nt = residual->ne[2];
+ 
+     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
++    ggml_tensor * w = ggml_sigmoid(ctx0, hc_prescaled(w_inject) ? inject : ggml_scale(ctx0, inject, 1.0f / (float) hc));
+     w = ggml_scale(ctx0, w, 2.0f);
+     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+ 
+@@ -337,6 +402,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+     llm_build_delta_net_base(params), model(model) {
+     const int64_t hc = hparams.dsv4_hc_mult;
+ 
++    static_cast<const llama_model_qwen4exp &>(model).hc_fold();
+     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
+ 
+     int sections[4];
+@@ -407,7 +473,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+         }
+ 
+-        res_hc = build_hc_combine(res_hc, cur, inject, il);
++        res_hc = build_hc_combine(res_hc, cur, inject, model.layers[il].hc_attn_inject, il);
+ 
+         cur = build_hc_mix(res_hc,
+                 model.layers[il].hc_ffn_norm,
+@@ -419,7 +485,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+         cur = build_layer_ffn(cur, il);
+         cb(cur, "ffn_out", il);
+ 
+-        res_hc = build_hc_combine(res_hc, cur, inject, il);
++        res_hc = build_hc_combine(res_hc, cur, inject, model.layers[il].hc_ffn_inject, il);
+ 
+         // "l_last" is the layer output name that build_cvec and imatrix look for
+         cb(res_hc, "l_last", il);

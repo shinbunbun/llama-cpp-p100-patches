@@ -1,0 +1,272 @@
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 023810604..61748a84b 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -378,6 +378,256 @@ static __global__ void __launch_bounds__(CUDA_TOP_K_BLOCK)
+     }
+ }
+ 
++// Radix select for large k.  The full segmented sort the CUB path falls back to is wasted work
++// when only k of ncols indices are wanted: at ncols = 40544, k = 2051 it costs 133 us against
++// the 162 KB the row actually occupies.
++//
++// Elements are compared as the 64-bit pack (ordered_key << 32) | ~idx, so a plain unsigned
++// descending order reproduces the stable sort's "key descending, index ascending" exactly, and
++// every pack in a row is distinct.  The k-th largest pack is therefore resolved to a single
++// element and no tie handling is left over.
++//
++// The output is index-ascending, not value-descending like the sort this replaces.  Consumers that
++// gather in top_k order see a different permutation, so the env var is the precondition: a gather
++// built on ascending indices is reproducible, an atomic-order one is not.
++#define CUDA_TOP_K_SEL_BITS   8
++#define CUDA_TOP_K_SEL_BINS   (1 << CUDA_TOP_K_SEL_BITS)
++#define CUDA_TOP_K_SEL_BLOCK  CUDA_TOP_K_SEL_BINS
++#define CUDA_TOP_K_SEL_MAXBPR 64
++
++struct top_k_sel_state {
++    uint64_t prefix;
++    uint64_t mask;
++    int      rank;
++};
++
++static __device__ __forceinline__ uint64_t top_k_sel_pack(const float v, const int i) {
++    const uint32_t b = __float_as_uint(v);
++    const uint32_t k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
++    return ((uint64_t) k << 32) | (uint32_t) ~(uint32_t) i;
++}
++
++static __global__ void k_top_k_sel_init(top_k_sel_state * states, const int nrows, const int k,
++                                        const uint64_t prefix0, const uint64_t mask0) {
++    const int row = blockIdx.x*blockDim.x + threadIdx.x;
++    if (row < nrows) {
++        states[row] = { prefix0, mask0, k };
++    }
++}
++
++static __global__ void __launch_bounds__(CUDA_TOP_K_SEL_BLOCK)
++    k_top_k_sel_hist(const float * __restrict__ x, const top_k_sel_state * __restrict__ states,
++                     int * __restrict__ hist, const int ncols, const int bpr, const int shift) {
++    __shared__ int h[CUDA_TOP_K_SEL_BINS];
++
++    const int row = blockIdx.x / bpr;
++    const int rb  = blockIdx.x % bpr;
++    const int tid = threadIdx.x;
++
++    h[tid] = 0;
++    __syncthreads();
++
++    const top_k_sel_state st  = states[row];
++    const float *         src = x + (int64_t) row*ncols;
++
++    for (int col = rb*CUDA_TOP_K_SEL_BLOCK + tid; col < ncols; col += bpr*CUDA_TOP_K_SEL_BLOCK) {
++        const uint64_t p = top_k_sel_pack(src[col], col);
++        if ((p & st.mask) == st.prefix) {
++            atomicAdd(&h[(int) ((p >> shift) & (CUDA_TOP_K_SEL_BINS - 1))], 1);
++        }
++    }
++    __syncthreads();
++
++    hist[((int64_t) row*bpr + rb)*CUDA_TOP_K_SEL_BINS + tid] = h[tid];
++}
++
++static __global__ void __launch_bounds__(CUDA_TOP_K_SEL_BLOCK)
++    k_top_k_sel_scan(const int * __restrict__ hist, top_k_sel_state * __restrict__ states,
++                     const int bpr, const int shift) {
++    __shared__ int h[CUDA_TOP_K_SEL_BINS];
++
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++
++    int c = 0;
++    for (int rb = 0; rb < bpr; ++rb) {
++        c += hist[((int64_t) row*bpr + rb)*CUDA_TOP_K_SEL_BINS + tid];
++    }
++    h[tid] = c;
++    __syncthreads();
++
++    // inclusive suffix sum: h[b] becomes the population of every bin at or above b
++    for (int s = 1; s < CUDA_TOP_K_SEL_BINS; s <<= 1) {
++        const int up = tid + s < CUDA_TOP_K_SEL_BINS ? h[tid + s] : 0;
++        __syncthreads();
++        h[tid] += up;
++        __syncthreads();
++    }
++
++    const int rank = states[row].rank;
++    __syncthreads();
++
++    // the winning bin is the lowest whose suffix still reaches rank
++    if (h[tid] >= rank && (tid + 1 == CUDA_TOP_K_SEL_BINS || h[tid + 1] < rank)) {
++        top_k_sel_state st = states[row];
++        st.rank    = rank - (tid + 1 == CUDA_TOP_K_SEL_BINS ? 0 : h[tid + 1]);
++        st.prefix |= (uint64_t) (uint32_t) tid << shift;
++        st.mask   |= (uint64_t) (CUDA_TOP_K_SEL_BINS - 1) << shift;
++        states[row] = st;
++    }
++}
++
++static __global__ void __launch_bounds__(CUDA_TOP_K_SEL_BLOCK)
++    k_top_k_sel_count(const float * __restrict__ x, const top_k_sel_state * __restrict__ states,
++                      int * __restrict__ cnt, const int ncols, const int chunk, const int bpr) {
++    __shared__ int s[CUDA_TOP_K_SEL_BLOCK];
++
++    const int row = blockIdx.x / bpr;
++    const int cb  = blockIdx.x % bpr;
++    const int tid = threadIdx.x;
++
++    const uint64_t cut = states[row].prefix;
++    const float *  src = x + (int64_t) row*ncols;
++    const int      beg = cb*chunk;
++    const int      end = min(beg + chunk, ncols);
++
++    int c = 0;
++    for (int col = beg + tid; col < end; col += CUDA_TOP_K_SEL_BLOCK) {
++        c += top_k_sel_pack(src[col], col) >= cut;
++    }
++    s[tid] = c;
++    __syncthreads();
++
++    for (int o = CUDA_TOP_K_SEL_BLOCK/2; o > 0; o >>= 1) {
++        if (tid < o) {
++            s[tid] += s[tid + o];
++        }
++        __syncthreads();
++    }
++    if (tid == 0) {
++        cnt[(int64_t) row*bpr + cb] = s[0];
++    }
++}
++
++static __global__ void __launch_bounds__(CUDA_TOP_K_SEL_MAXBPR)
++    k_top_k_sel_base(int * __restrict__ cnt, const int bpr) {
++    __shared__ int s[CUDA_TOP_K_SEL_MAXBPR];
++
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int own = tid < bpr ? cnt[(int64_t) row*bpr + tid] : 0;
++
++    s[tid] = own;
++    __syncthreads();
++    for (int o = 1; o < CUDA_TOP_K_SEL_MAXBPR; o <<= 1) {
++        const int v = tid >= o ? s[tid - o] : 0;
++        __syncthreads();
++        s[tid] += v;
++        __syncthreads();
++    }
++    if (tid < bpr) {
++        cnt[(int64_t) row*bpr + tid] = s[tid] - own;
++    }
++}
++
++// Chunks are contiguous and each one writes at its own scanned base, so the k indices come out in
++// ascending order whatever the block schedule is.
++static __global__ void __launch_bounds__(CUDA_TOP_K_SEL_BLOCK)
++    k_top_k_sel_write(const float * __restrict__ x, int * __restrict__ dst,
++                      const top_k_sel_state * __restrict__ states, const int * __restrict__ base,
++                      const int ncols, const int k, const int chunk, const int bpr) {
++    __shared__ int s[CUDA_TOP_K_SEL_BLOCK];
++
++    const int row = blockIdx.x / bpr;
++    const int cb  = blockIdx.x % bpr;
++    const int tid = threadIdx.x;
++
++    const uint64_t cut = states[row].prefix;
++    const float *  src = x + (int64_t) row*ncols;
++    int *          out = dst + (int64_t) row*k;
++    const int      beg = cb*chunk;
++    const int      end = min(beg + chunk, ncols);
++
++    int run = base[(int64_t) row*bpr + cb];
++
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++
++    for (int c0 = beg; c0 < end; c0 += CUDA_TOP_K_SEL_BLOCK) {
++        const int      col = c0 + tid;
++        const bool     f   = col < end && top_k_sel_pack(src[col], col) >= cut;
++        const uint32_t m   = __ballot_sync(0xffffffffu, f);
++
++        if (lane == 0) {
++            s[warp] = __popc(m);
++        }
++        __syncthreads();
++
++        int wbase = 0;
++        for (int w = 0; w < warp; ++w) {
++            wbase += s[w];
++        }
++        if (f) {
++            out[run + wbase + __popc(m & ((1u << lane) - 1))] = col;
++        }
++
++        int total = 0;
++        for (int w = 0; w < CUDA_TOP_K_SEL_BLOCK/32; ++w) {
++            total += s[w];
++        }
++        __syncthreads();
++        run += total;
++    }
++}
++
++static bool top_k_select_cuda(ggml_cuda_pool & pool, const float * src, int * dst,
++                              const int ncols, const int nrows, const int k, cudaStream_t stream) {
++    static const bool enabled = getenv("GGML_CUDA_TOP_K_SELECT") != nullptr &&
++                                std::atoi(getenv("GGML_CUDA_TOP_K_SELECT"));
++    if (!enabled || k < 1 || k >= ncols || ncols < CUDA_TOP_K_MIN_NCOLS || nrows < 1) {
++        return false;
++    }
++
++    // ~idx is constant in every byte above the highest index bit, so those rounds are settled up front
++    uint64_t prefix0 = 0;
++    uint64_t mask0   = 0;
++    for (int shift = 0; shift < 32; shift += CUDA_TOP_K_SEL_BITS) {
++        if (((uint32_t) (ncols - 1) >> shift) != 0) {
++            continue;
++        }
++        prefix0 |= (uint64_t) (CUDA_TOP_K_SEL_BINS - 1) << shift;
++        mask0   |= (uint64_t) (CUDA_TOP_K_SEL_BINS - 1) << shift;
++    }
++
++    const int bpr = std::min((ncols + CUDA_TOP_K_SEL_BLOCK - 1) / CUDA_TOP_K_SEL_BLOCK,
++                             CUDA_TOP_K_SEL_MAXBPR);
++
++    ggml_cuda_pool_alloc<top_k_sel_state> states_alloc(pool, nrows);
++    ggml_cuda_pool_alloc<int>             hist_alloc(pool, (size_t) nrows*bpr*CUDA_TOP_K_SEL_BINS);
++
++    top_k_sel_state * states = states_alloc.get();
++    int *             hist   = hist_alloc.get();
++
++    k_top_k_sel_init<<<(nrows + 255)/256, 256, 0, stream>>>(states, nrows, k, prefix0, mask0);
++
++    const dim3 grid(bpr*nrows);
++    for (int shift = 64 - CUDA_TOP_K_SEL_BITS; shift >= 0; shift -= CUDA_TOP_K_SEL_BITS) {
++        if (((mask0 >> shift) & (CUDA_TOP_K_SEL_BINS - 1)) == CUDA_TOP_K_SEL_BINS - 1) {
++            continue;
++        }
++        k_top_k_sel_hist<<<grid, CUDA_TOP_K_SEL_BLOCK, 0, stream>>>(src, states, hist, ncols, bpr, shift);
++        k_top_k_sel_scan<<<nrows, CUDA_TOP_K_SEL_BLOCK, 0, stream>>>(hist, states, bpr, shift);
++    }
++    const int chunk = (ncols + bpr - 1) / bpr;
++    int * cnt = hist;   // the histogram buffer is free once the passes are done
++
++    k_top_k_sel_count<<<grid, CUDA_TOP_K_SEL_BLOCK, 0, stream>>>(src, states, cnt, ncols, chunk, bpr);
++    k_top_k_sel_base<<<nrows, CUDA_TOP_K_SEL_MAXBPR, 0, stream>>>(cnt, bpr);
++    k_top_k_sel_write<<<grid, CUDA_TOP_K_SEL_BLOCK, 0, stream>>>(src, dst, states, cnt, ncols, k, chunk, bpr);
++
++    return true;
++}
++
+ static bool top_k_partial_cuda(ggml_cuda_pool & pool, const float * src, int * dst,
+                                const int ncols, const int nrows, const int k, cudaStream_t stream) {
+     static const bool disable = getenv("GGML_CUDA_DISABLE_TOP_K_PARTIAL") != nullptr &&
+@@ -472,6 +722,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         top_k_partial_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
+         return;
+     }
++    if (ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX &&
++        top_k_select_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
++        return;
++    }
+ #endif  // !defined(GGML_USE_HIP) && !defined(CUB_TOP_K_AVAILABLE)
+ #ifdef CUB_TOP_K_AVAILABLE
+     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented

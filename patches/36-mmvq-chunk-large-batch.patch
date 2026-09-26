@@ -1,0 +1,34 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 607b84e67..eb70ff106 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1870,6 +1870,29 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    // A speculative verify batch sends the LM head down the cuBLAS path, whose F16 copy of the
++    // vocab matrix stays resident in the pool afterwards. Column chunks through MMVQ need no copy.
++    static const int64_t chunk_min_mib = getenv("GGML_CUDA_MMVQ_CHUNK_MIN_MIB") ? atoll(getenv("GGML_CUDA_MMVQ_CHUNK_MIN_MIB")) : -1;
++    if (chunk_min_mib >= 0 && ggml_is_quantized(src0->type) && ggml_cuda_should_use_mmvq(src0->type, cc, MMVQ_MAX_BATCH_SIZE) &&
++            ne11 > MMVQ_MAX_BATCH_SIZE && ne11 <= 4*MMVQ_MAX_BATCH_SIZE &&
++            ne12 == 1 && ne13 == 1 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++            ggml_nelements(src0)*2 >= chunk_min_mib*1024*1024) {
++        for (int64_t c = 0; c < ne11; c += MMVQ_MAX_BATCH_SIZE) {
++            const int64_t n = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, ne11 - c);
++            ggml_tensor src1_c = *src1;
++            ggml_tensor dst_c  = *dst;
++            src1_c.ne[1] = n;
++            dst_c.ne[1]  = n;
++            src1_c.data  = (char *) src1->data + c*src1->nb[1];
++            dst_c.data   = (char *) dst->data  + c*dst->nb[1];
++            for (int i = 2; i < GGML_MAX_DIMS; ++i) {
++                src1_c.nb[i] = src1_c.nb[i-1]*src1_c.ne[i-1];
++                dst_c.nb[i]  = dst_c.nb[i-1]*dst_c.ne[i-1];
++            }
++            ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_c, nullptr, &dst_c);
++        }
++        return;
++    }
+     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+ }
+ 

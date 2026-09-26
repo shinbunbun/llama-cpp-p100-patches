@@ -2,15 +2,16 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-29 patches, grouped by scope below; the application order is the file
+44 patches, grouped by scope below; the application order is the file
 numbering. Order matters: several touch the same files, and later ones build
-on earlier ones. All 29 are generated against llama.cpp `v0.4.0`, where they
+on earlier ones. All 44 are generated against llama.cpp `v0.4.0`, where they
 apply at zero fuzz and zero offset (see [patches.nix](../nix/patches.nix)
 and the top-level README for the current `llamaCppTag`).
 
 Every patch carries its full reasoning — including the measurements that
 justify it and the alternatives that were tried and rejected — in the comments
-it adds to the source. This page is the index.
+it adds to the source. This page is the index. Patches 32–46 are the exception:
+their measurements live on this page rather than in the source.
 
 **Scope** classifies who benefits:
 
@@ -205,6 +206,18 @@ a prefill test preceded the decode test in the same process vanished with
 layout-dependent fusion decision described in benchmarking.md, not the kernel.
 
 ---
+
+### 40 · `mmq-iq4-nl-threads` — `pre-Volta`
+
+The MMQ tile table for Pascal and older is uniform at 256 threads per block
+across quantization types, and that uniformity was never measured without
+DP4A. IQ4_NL at 128 threads is **3–4% faster for an MoE down projection
+([640, 2560], IQ4_NL) at every token count measured**, and the kernel's error
+against a CPU F32 reference is bit-identical to the 256-thread build — the tile
+shape and the accumulation order do not change, only how many threads carry it.
+
+IQ3_XXS was swept the same way and keeps 256. Other architectures have their
+own tables and are untouched.
 
 ## Architecture-independent CUDA
 
@@ -590,6 +603,170 @@ read per token.
 
 ---
 
+### 35 · `mmvq-mmid-batch-cap` — `CUDA`
+
+`MUL_MAT_ID` only takes MMVQ up to `MMVQ_MAX_BATCH_SIZE` = 8 columns; wider
+batches go to MMQ, which needs DP4A, or to cuBLAS. The kernel itself has no
+such limit — the token index lives in `threadIdx.y` and the real constraint is
+`warp_size × ncols_dst <= 1024`. 8 is where Pascal measured MMQ to win, not a
+correctness bound. MMQ also cannot take a repeated id in one token
+(`mm_ids_helper` writes out of bounds), which the expert cache in patch 46 does
+deliberately, so that path must stay on MMVQ.
+
+`LLAMA_MMVQ_MMID_MAX=<n>` raises the cap to at most 32 (unset keeps upstream
+behaviour). `__launch_bounds__` is compile time, so a wider batch needs its own
+template instantiation; the default one is left alone to keep its register
+budget.
+
+This is what makes a resident expert cache survive speculative decoding: a
+verify batch is 1 + draft tokens, so every verify step exceeded the cap and ran
+without the cache. Cost of one ubatch of *n* tokens at 40k / 210k depth, cache
+off vs on with the cap raised (minimum of three, slots restored from the same
+state):
+
+| n | 40k off | 40k on | 210k off | 210k on |
+|---:|---:|---:|---:|---:|
+| 9 | 583.6 ms | **533.5** | 774.0 | **712.9** |
+| 17 | 844.8 | **814.4** | 1120.8 | **1013.0** |
+| 32 | 1187.8 | **1106.7** | 1425.2 | **1371.3** |
+
+**4–11% at every point measured**, VRAM identical. Greedy decode at matched
+acceptance (1.000) went 44.98 / 45.69 → 43.28 / 43.88 ms/token. A 26-question ×
+3-depth long-context benchmark scored the same as the capped build (61/78,
+McNemar p = 1.000 on every comparison).
+
+Throughput in t/s cannot be used for this comparison at all: the expert cache
+carries over between requests, so the same prompt takes a slightly different
+numerical path, which changes the generated tokens and the draft acceptance
+rate. The same arm varied 13.5–23.1 t/s until acceptance was held fixed.
+
+### 36 · `mmvq-chunk-large-batch` — `CUDA`
+
+A quantized `mul_mat` with 8 < ne11 <= 32 falls past MMVQ and MMQ into cuBLAS,
+which wants the whole weight dequantized to F16 in the pool — 1,212.5 MiB for a
+248,320 × 2,560 Q6_K LM head — and the pool never shrinks, so **one speculative
+verify batch keeps that resident for the rest of the process**. Cutting src1 and
+dst into 8-column views and looping MMVQ needs no copy at all.
+
+`GGML_CUDA_MMVQ_CHUNK_MIN_MIB=<MiB>` is the minimum F16 expansion that makes
+the split worthwhile; unset keeps the cuBLAS path. At 256 it takes the LM head
+and nothing else. The path is also gated on `ggml_cuda_should_use_mmvq`, since
+`supports_op` accepts quantization types the MMVQ switch has no kernel for and
+those must keep falling through to cuBLAS.
+
+| | pool peak | LM head request | 262k speculative decode |
+|---|---:|---:|---:|
+| before | 1,228 MiB | 1,212.5 MiB | 38.5 ms/token |
+| after | **62 MiB** | **0** | **37.3 ms/token** |
+
+The freed VRAM bought 12 more resident expert slots, worth a further −4.7%
+decode at 40k in the same tree.
+
+Output changes: the verify logits now go down the same MMVQ path as
+non-speculative decode instead of cuBLAS F16, so speculative and plain decode
+agree where they did not before. Three real tasks produced **identical draft
+counts, acceptance counts and generation lengths** (2,080 tokens total).
+
+### 37 · `getrows-narrow-batched` — `CUDA`
+
+`get_rows` puts one row in one block and splits the columns across the block's
+threads, so a 64-element row leaves 192 of 256 threads idle. The narrow-row
+kernel patch 14 added fixes that, but only fired for
+`ne00 <= 2 && ne11 == 1 && ne12 == 1`, which excludes every batched gather —
+including the per-query chunks of a sparse-attention indexer (`ne11 = 64`).
+
+Generalized to batched gathers (the index arithmetic is the generic kernel's)
+and routed to for any row width at or below `GGML_CUDA_GETROWS_FLAT_MAX`
+(unset = off; the existing condition stays). It only copies elements, so output
+is **bit-identical** (verified: max |dlogprob| = 0 over 80 top-5 samples).
+
+4,097-token append at 40k depth: 25.8 → **23.1 s (−10.4%)**. Fresh 40k prefill
+over three interleaved rounds: 231.7 → **210.0 s (−9.4%)**, distributions fully
+separated. Decode unchanged.
+
+### 38 · `getrows-q4-0-block` — `CUDA`
+
+The quantized `k_get_rows` has each thread read a 2-byte scale and one nibble
+and write two halves 16 elements apart; a block writes 1 KB. Gathering 131k
+rows × 512 elements from a q4_0 KV cache that way ran at **89 GB/s**, a fifth of
+what the card does in practice.
+
+Adds a q4_0 → F16 kernel with one thread per q4_0 block: 32 elements
+dequantized and written as four 16-byte stores of 64 contiguous bytes, so a
+warp's writes coalesce completely. The dequantization is `dequantize_q4_0`'s own
+expression, so output is **bit-identical**; unaligned destinations fall back.
+`GGML_CUDA_GETROWS_Q4_0_BLK=1`.
+
+Fresh 40k prefill, on top of patch 37: 208.3 → **187.3 s (−10.1%)**, three
+interleaved rounds, distributions separated. Decode unchanged (it gathers the
+same rows but far fewer of them).
+
+Together 37 and 38 take a fresh 40k prefill 231.7 → **187.3 s (−19.2%)**.
+GET_ROWS was 26.6% of prefill GPU time not because of arithmetic but because
+the launch geometry did not match the work.
+
+### 41 · `top-k-radix-select` — `CUDA`
+
+Patch 28 gives `top_k` a partial path for small k (k <= 16); above that it still
+falls back to CUB's full segmented sort. A sparse-attention indexer selects
+k = 2,051 of 40,544 scores, so it sorted all 40,544 to keep the first 2,051:
+**133 µs to read 162 KB** (161 µs at 210k depth, 65.6 ms for a 4,096-row prefill
+chunk).
+
+Adds a radix select for large k (`GGML_CUDA_TOP_K_SELECT=1`):
+
+- the comparison key is a 64-bit packed `(ordered_key << 32) | ~idx`, so
+  unsigned descending order *is* "key descending, index ascending" and matches
+  the stable sort. Packed values are unique within a row, so the k-th element is
+  a single element and **no tie-breaking is left**
+- 8-bit digits from the top; the bytes of `~idx` above the index's top bit are
+  constant, so those rounds are settled up front (6 rounds at 40,544)
+- bin scan is a 256-bin parallel suffix sum. A first version had thread 0 walk
+  the bins serially, which raced on `states[row].rank` at large `nrows`; one
+  barrier fixed it
+- the output is **index-ascending**: chunks map to contiguous ranges and are
+  packed with a warp ballot over a scanned base, so the result does not depend
+  on block execution order
+
+Index order is not cosmetic. An unordered (atomicAdd) output changed model
+output — max |dlogprob| 5.22 at 40k — because the sparse gather of patch 45
+collects K/V in top-k order, so flash attention's accumulation order follows it,
+and atomic order is not reproducible run to run. With ascending order: the
+selected set **matches the full sort on every shape**, including synthetic rows
+with 4 and 64 forced ties; two runs of the same server are **bit-identical**
+(max |dlogprob| 0 at 40k and 210k); and a 26-question × 3-depth long-context
+benchmark matches question for question (p = 1.000).
+
+Kernel 133 → **74.8 µs** at the decode shape, 65.6 → **28.6 ms** at 4,096 rows.
+End to end: decode 40k 48.6 → **47.5 ms (−2.3%)**, prefill of 2,050 tokens
+126.8 → **131.1 t/s (+3.4%)**, decode at 210k unchanged.
+
+### 43 · `fuse-hc-combine` — `CUDA`
+
+Hyper-connections surround every block with element-wise glue — around 40 small
+ops per layer. Two kernels take the two chains:
+
+- stream merge: `MUL(xn, gate)` → the four-stream `ADD` chain → `SCALE(1/hc)`
+- combine: `SIGMOID(inject)` → `SCALE(2)` → `MUL(repeat(block_out), ·)` →
+  `ADD(residual, ·)`
+
+Per-element operation order is the graph's own and `__fmul_rn` / `__fadd_rn`
+forbid FMA contraction, so output is **bit-identical** (64/64 decode tokens,
+16/16 prefill, max |dlogprob| = 0).
+
+`GGML_CUDA_DISABLE_FUSE_HC` is a bitmask kill switch: 1 disables the stream
+reduction, 2 the repeat-anchored combine, 4 the sigmoid-anchored one.
+
+Two hazards this had to handle, both found by wrong output rather than by
+reasoning: a fused kernel's input can die *after* the fusion's anchor node (the
+inject matmul's output was reallocated into the attention output that `REPEAT`
+reads), which is why the combine reads the materialized `REPEAT` output; and a
+fusion must not run when its output overlaps a source by bytes — only an
+in-place source at the same pointer and stride is allowed.
+
+Not isolated end to end: it was measured together with a slot-count increase
+and the reorder in patch 46 (decode 40k 55.2 → 49.2 ms for the three changes).
+
 ## Delta-net / gated-delta-net (Qwen3-Next, Qwen3.5)
 
 These are architecture-independent CUDA changes, but they only fire for models
@@ -646,6 +823,22 @@ Kill switches: `GGML_CUDA_DISABLE_CONCAT_ROWS`,
 `GGML_CUDA_DISABLE_FUSE_CONCAT_GATHER`.
 
 ---
+
+### 39 · `gdn-lanes-per-column` — `CUDA`
+
+The gated delta-net kernel spreads one state column over a whole warp, so every
+token pays a full warp reduction per column. Making lanes-per-column a template
+parameter and using 16 lanes halves the reductions per token and raises the
+FMA-to-shuffle ratio — but it also halves the parallelism, which only pays once
+there are enough tokens to hide it. Gated on the token count:
+`GGML_GDN_LPC=8|16` selects the lane count (unset = a full warp as before) and
+`GGML_GDN_LPC_MIN_TOK` the threshold (default 32).
+
+**Prefill −4.5%.** Decode is unchanged once the arms are temperature-matched;
+the first sweep showed a decode regression that was the GPU heating up. Output
+is not bit-identical — the reduction order changes — and a paired per-chunk
+perplexity comparison against the unchanged build gives t = +0.25, i.e. no
+detectable difference.
 
 ## Host side
 
@@ -753,6 +946,75 @@ changing at 5 and above.
 
 ---
 
+### 32 · `sched-split-prefetch` — `host`
+
+When a graph alternates GPU and CPU splits, the GPU sits idle through every CPU
+split even though part of the *preceding* GPU split produces nothing that split
+needs. This cuts the GPU split at the last node the next CPU split consumes,
+queues that head, starts the async copies of the CPU split's inputs, and queues
+the tail behind them, so the tail overlaps the CPU work. The copies are waited
+for with their own event, not by synchronizing the backend.
+
+Off by default (`LLAMA_SCHED_PREFETCH=1`). On a 48-layer MoE with 48 expert
+slots resident on the GPU and the remaining experts computed on the CPU:
+
+| | off | on |
+|---|---:|---:|
+| decode at 40k | 66.4 ms | **59.4 ms (−10%)** |
+| decode at 210k | 62.0 ms | **56.1 ms (−9%)** |
+
+What is overlapped is the tail of the GPU split — the cached experts' matmuls.
+An earlier revision measured **no effect at all** with 34 resident slots,
+because there was nothing large enough to hide; that is why this ships off and
+why a per-model measurement is the only way to know.
+
+### 33 · `sched-weight-prefetch` — `host`
+
+Prefill of an MoE model whose experts live in host memory spends its time in
+three back-to-back host-to-device transfers per layer with almost no compute
+between them (the three GPU splits of a layer are 1, 2 and 150–230 nodes). This
+uploads the *next* splits' offloaded expert weights on a separate backend and
+stream while the current split computes, then moves each into its input
+allocation with a device-to-device copy.
+
+The staging memory can be borrowed from a buffer that belongs to something else
+through a new API, `ggml_backend_sched_set_staging_area(buffer, size)`: the
+scheduler uses it only in graphs that do not reference it, and publishes an
+epoch counter and a high-water extent so the owner can see which bytes were
+clobbered and repair them. The uploads run on their own backend, which no
+graph-level synchronize covers, so the owner waits for them with
+`ggml_backend_sched_staging_synchronize()` before it repairs anything, and drops
+the registration with `ggml_backend_sched_clear_staging_area()` before the buffer
+goes away. Staging is confined to the device that owns the buffer: a split on
+another device would have to take the weight through a host copy, which does not
+honour the upload event. In the measured configuration the ~1 GB comes from an
+expert cache that prefill does not use.
+
+Off by default (`LLAMA_SCHED_WPF=<MiB>`; 1000 in the measured configuration).
+Appending to a 40k context, and a fresh 20k prompt:
+
+| | off | on |
+|---|---:|---:|
+| 1,025 tokens | 11.9 s | 11.8–12.0 (±0) |
+| 2,049 tokens | 17.4 s | **16.6 s (−4.6%)** |
+| 4,097 tokens | 29.0 s | **27.1 s (−6.6%)** |
+| fresh 20k | 123.4 s | **115.7 s (−6.2%)** |
+
+VRAM does not grow. The peak while filling a 262k context *fell*, 15,231 →
+14,009 MiB: the prefetch replaces a partial-copy path that synchronized the
+device to read `ids` on every split.
+
+### 34 · `mul-mat-id-negative-ids` — `host`
+
+`mul_mat_id` assumes every id selects a real expert row. Two changes let a
+negative id mean "this row contributes nothing": the CPU backend writes zeros
+for it instead of indexing out of bounds, and the scheduler's used-expert bitset
+skips it (and tolerates a split where no expert is used at all).
+
+No effect on its own — it is what lets patch 46 route the experts it did not
+cache to the CPU by masking them out of the GPU call with −1, and what keeps a
+graph where every expert of a layer missed the cache from asserting.
+
 ## Model-specific
 
 ### 15 · `mtp-draft-vocab` — `model`
@@ -794,3 +1056,161 @@ Off unless `LLAMA_MTP_DRAFT_VOCAB` points at a token list.
 Patch 14 (`getrows-narrow-rows`) is a prerequisite: the expansion back to
 `[n_vocab]` is a `get_rows` with `ne00 = 1`, which cost 278 µs and turned the
 whole thing **−29%** until that was fixed.
+
+Patches 42 and 44–46 target one architecture: a hybrid gated-delta-net /
+sparse-attention MoE (`qwen4exp`, i.e. Qwen3.8-Flash-Next) — 48 layers, 512
+experts with 10 used, a gated delta-net block in most layers and a quantized
+sparse-attention (QSA) path in the rest. The numbers below come from
+UD-IQ3_XXS weights, a q4_0 KV cache and a 262,144-token context on one P100,
+with the experts in host memory. Unlike the rest of the set they change what the
+graph computes, not only how a kernel runs, so each one names what it does to
+the output.
+
+Together with the host-side and CUDA patches above, they took decode from
+96 ms/token to 67 at 40k and from 201 to 68 at 210k, and a fresh 210k prefill
+from 52.5 to 27.8 minutes, against the same model on the published set alone.
+Long-context accuracy went 59/78 → 62/78 over the same span (26 questions at
+three depths, McNemar p = 1.000 on every comparison).
+
+### 42 · `qwen4exp-hc-exact` — `model`
+
+Hyper-connections are about 23% of decode GPU time on this model: four low-rank
+matmuls per layer plus the element-wise glue. Three changes, all
+**bit-identical**:
+
+- fold the `1/hc = 0.25` SCALE into the weights at load time — the Q8_0 `down`
+  block scales and the F32 `inject` values. A tensor is only folded if every
+  scale survives the division exactly (129 of 193 qualified); the rest keep the
+  original path
+- drop the `CONT` before the stream average: ADD reads a non-contiguous view
+  directly
+- expand the gamma reshape before the RMS norm, so RMS_NORM and MUL end up
+  adjacent and the existing fusion fires
+
+Worth about **−1% decode** (0.5 ms). Event-level profiles had made the glue look
+larger than it is; per-op host synchronization inflates small kernels.
+
+### 44 · `qwen4exp-qsa-block-key-cache` — `model`
+
+The sparse-attention indexer recomputes pooled, normalized and rotated block
+keys for the entire context on every ubatch, which makes decode cost grow with
+depth. This keeps them per layer as F32 `[128, n_kv/4]` — 384 MiB at ctx 262,144
+— and refreshes only the blocks whose cells changed. Invalidation hooks sit on
+`clear`, `seq_rm`, `seq_cp`, `seq_keep`, `seq_add`, `seq_div` and `state_read`.
+**Almost all of decode's depth dependence disappears.** `LLAMA_QSA_CACHE=0`
+disables it.
+
+Known limitation: the incremental refresh only writes *complete* blocks, so
+while the newest positions form a partial block — up to `ratio - 1` of them —
+that block is scored against whatever its cache row already held (zeros on a
+fresh context, the key of a longer previous context otherwise). The full-refresh
+path, which runs whenever the cache falls further behind than one ubatch, writes
+every block including the partial one. The accuracy figures on this page were
+taken with this behaviour in place.
+
+A block is only fixed once its cells are known: the cache is used for a single
+sequence whose cells hold positions 0..n−1 without gaps, so block *b* is
+position block *b*. Two traps worth recording: `ubatch.is_pos_2d()` is true for
+text input on an mrope model, so using it as the enable condition silently kept
+the cache from ever being used; and on the cached path the per-cell index
+tensors are never allocated (`data == null`), which faults in `set_input` unless
+the setter writes to scratch instead.
+
+### 45 · `qwen4exp-qsa-sparse-gather` — `model`
+
+Upstream ships this architecture with sparse attention stubbed out — `TODO:
+enable sparse attention`, the graph is dense flash attention with a top-k mask —
+and the upstream sparse path needs Turing mma, so Pascal with a q4_0 KV cache
+cannot take it. This gathers the selected cells' K, V and mask with `get_rows`
+and feeds flash attention one query per stream slot. The indexer scores and the
+top-k are chunked per query row (`LLAMA_QSA_CHUNK`, default 32), which removes
+the `[n_kv × n_ubatch]` intermediate: **compute buffer 3,773 → 1,063 MiB** at
+chunk 32. `LLAMA_QSA_GATHER=0` returns to the dense path.
+
+The gather writes F16 directly: with an F16 destination, CUDA's `get_rows` does
+q4_0 → float → half in one pass instead of an F32 write plus a CPY. The rounding
+is the same, so this part is **bit-identical**, and prefill gains 7% at 20k and
+3.4% at 40k. (Gathering the raw q4_0 bytes instead was tried and abandoned: the
+compute buffer grew with the chunk count, 17.8 GB at ubatch 4096, and the server
+would not start.)
+
+`LLAMA_QSA_PAD=1` pads the gathered K/V and mask to a multiple of
+`FATTN_KQ_STRIDE` so flash attention takes the vector kernel instead of the tile
+kernel: **prefill −7.8%** and **262k speculative decode −18%** at unchanged
+VRAM. Output changes, and it changes for the better: the vector kernel
+accumulates VKQ in float2 where the tile kernel uses half2 on NVIDIA, so
+relative RMS against a CPU F32 reference is *lower* than the unpadded path in
+every shape measured, and a paired per-chunk perplexity comparison gives
+t = −0.36.
+
+`LLAMA_QSA_TREE_CONCAT=1` builds the chunked output with a pairwise concat tree
+instead of a left-leaning chain.
+
+### 46 · `qwen4exp-moe-expert-cache` — `model`
+
+With 48 layers of 512 experts the routed weights do not fit on a 16 GiB card, so
+`--n-cpu-moe 48` computes them on the CPU. This keeps the recently used ones on
+the GPU instead: C slots per layer, filled from a flat count over a ring window
+of recent tokens and replanned every so often. The routing history is written
+out to a device tensor and collected at the next `set_input`. Experts that hit
+the cache are computed by a GPU `mul_mat_id`, the misses by the CPU one with −1
+in the id (patch 34), and the two are added. The cache refuses to start on a
+model whose experts need anything the cached path does not reproduce: fused
+gate/up tensors, a non-zero SwiGLU clamp, per-expert scale tensors, or experts
+that are not all host-side.
+
+`LLAMA_MOE_CACHE=<slots>` enables it (off when unset), with
+`LLAMA_MOE_CACHE_INTERVAL` (default 32) the replan period,
+`LLAMA_MOE_CACHE_WINDOW` (default 1024) the ring window,
+`LLAMA_MOE_CACHE_MAXTOK` (default 8) the ubatch width it stays active for — it
+is also capped at `GGML_OP_OFFLOAD_MIN_BATCH − 1`, since above that threshold
+the CPU experts are offloaded to the GPU anyway, and at `LLAMA_MMVQ_MMID_MAX`
+(patch 35), because the shared zero slot repeats ids within a token and only
+MMVQ tolerates that — and `LLAMA_MOE_WARM`
+(default 32) the number of tokens after a prefill during which the replan period
+is shortened to 8.
+
+Slot count, decode ms/token, interleaved two rounds:
+
+| slots | 40k | 210k |
+|---:|---:|---:|
+| 48 | 55.2 ms | 53.0 ms |
+| 54 | 51.9 | 53.1 |
+| 60 | **51.0** | **52.4** |
+
+A slot costs about 92.5 MiB across the 48 layers. A longer replan period is
+better than the default: 128 is −3.8% against 32 (44.3 → 42.6 ms at 40k) with
+the 26-question long-context bench answering identically.
+
+The cache is cold right after a fresh prompt, and prefill routing does not
+predict generation routing well enough to warm it (that was tried and dropped).
+Shortening the replan period for the first 32 generated tokens instead takes the
+first window's hit rate from 7.2% to **46.6%**: 94.2 → **83.7 ms/token** for a
+32-token generation (−11%) and 75.8 → **70.0** for 64 tokens (−8%), with the
+steady state unchanged. Each of those points needs its own server: measuring
+several generation lengths against one server lets the earlier generation warm
+the cache and reverses the result.
+
+Two graph-order changes ride along, both bit-identical: the shared expert and
+the hyper-connection inject matmul are expanded *before* the CPU split rather
+than after it, so they run under patch 32's overlap (−0.5% at 40k, −1.0% at
+210k; `LLAMA_INJECT_LATE` restores the old order for the inject).
+
+The cache also lends its buffer to patch 33 as a staging area during prefill,
+and repairs the slots it loses: on an epoch change it invalidates the layers
+inside the clobbered extent, re-zeroes the shared zero slot, re-sends the maps
+and refills on the next decode.
+
+The clamp against the MMVQ ceiling uses `LLAMA_MMVQ_MMID_MAX`, which is the
+override patch 35 applies to every type. The built-in ceiling is per type and
+per architecture, and outside sm_60 it is below 8 for several types (Turing and
+later: 5 for Q3_K, 6 for IQ3_S, 7 for Q2_K, IQ2_S, IQ3_XXS and MXFP4; the AMD
+tables are lower still). The host side cannot read that table, so on any
+architecture other than the one this was measured on **set
+`LLAMA_MMVQ_MMID_MAX` to a width the device takes before enabling this cache**:
+without it a wide enough ubatch sends the GPU expert matmul to MMQ, which writes
+out of bounds on the repeated ids the shared zero slot produces.
+
+Accuracy over the whole configuration is 62/78 on the 26-question × 3-depth
+long-context benchmark, against 59/78 for the same model without any of this;
+every McNemar comparison against the other arms gives p ≥ 0.5.
