@@ -19,6 +19,7 @@ their measurements live on this page rather than in the source.
 |---|---|
 | `sm_60` | Gated to Pascal GP100 (no DP4A, full-rate HFMA2). Do not apply elsewhere without measuring. |
 | `pre-Volta` | Gated to NVIDIA before Volta, i.e. Pascal and older. |
+| `no DP4A` | Reached only by NVIDIA GPUs without DP4A — GP100 and Maxwell/Kepler — which take their own MMQ tile table. A build compiled only for such an arch also routes newer cards here. |
 | `pre-Turing` | Gated to NVIDIA before Turing. **This includes Volta, which does have tensor cores and was not measured.** |
 | `all archs` | Not architecture-gated at all: every GPU gets the change. Measured only on sm_60. |
 | `CUDA` | Architecture-independent CUDA improvement. |
@@ -207,17 +208,20 @@ layout-dependent fusion decision described in benchmarking.md, not the kernel.
 
 ---
 
-### 40 · `mmq-iq4-nl-threads` — `pre-Volta`
+### 40 · `mmq-iq4-nl-threads` — `no DP4A`
 
-The MMQ tile table for Pascal and older is uniform at 256 threads per block
-across quantization types, and that uniformity was never measured without
-DP4A. IQ4_NL at 128 threads is **3–4% faster for an MoE down projection
-([640, 2560], IQ4_NL) at every token count measured**, and the kernel's error
-against a CPU F32 reference is bit-identical to the 256-thread build — the tile
-shape and the accumulation order do not change, only how many threads carry it.
+`ggml_cuda_mmq_get_config_pascal_older` — the table for GPUs with no DP4A — is
+uniform at 256 threads per block across quantization types, and that uniformity
+was never measured on a device that has to emulate the int8 dot product. IQ4_NL
+at 128 threads is **3–4% faster for an MoE down projection ([640, 2560], IQ4_NL)
+at every token count measured**, and the kernel's error against a CPU F32
+reference came out **bit-identical** to the 256-thread build in every shape
+measured (measured, not argued from the tile geometry).
 
-IQ3_XXS was swept the same way and keeps 256. Other architectures have their
-own tables and are untouched.
+IQ3_XXS was swept the same way and keeps 256. The other tables (DP4A Pascal,
+Ampere, Blackwell, CDNA, RDNA) are untouched; note that
+`ggml_cuda_highest_compiled_arch` decides which table a card takes, so a build
+compiled only for a no-DP4A arch sends every card here.
 
 ## Architecture-independent CUDA
 
@@ -613,8 +617,10 @@ correctness bound. MMQ also cannot take a repeated id in one token
 (`mm_ids_helper` writes out of bounds), which the expert cache in patch 46 does
 deliberately, so that path must stay on MMVQ.
 
-`LLAMA_MMVQ_MMID_MAX=<n>` raises the cap to at most 32 (unset keeps upstream
-behaviour). `__launch_bounds__` is compile time, so a wider batch needs its own
+`LLAMA_MMVQ_MMID_MAX=<n>` raises the cap to at most 32, and never past
+`1024/warp_size` since one block is `warp_size × ncols_dst` threads (unset keeps
+upstream behaviour, including the per-type tables this override otherwise
+bypasses on every architecture). `__launch_bounds__` is compile time, so a wider batch needs its own
 template instantiation; the default one is left alone to keep its register
 budget.
 
@@ -659,8 +665,9 @@ those must keep falling through to cuBLAS.
 | before | 1,228 MiB | 1,212.5 MiB | 38.5 ms/token |
 | after | **62 MiB** | **0** | **37.3 ms/token** |
 
-The freed VRAM bought 12 more resident expert slots, worth a further −4.7%
-decode at 40k in the same tree.
+In the production tree, this change plus the 12 extra resident expert slots the
+freed VRAM buys took decode at 40k from 47.30 to 45.07 ms (−4.7%, three
+interleaved rounds); the two were not separated.
 
 Output changes: the verify logits now go down the same MMVQ path as
 non-speculative decode instead of cuBLAS F16, so speculative and plain decode
@@ -755,7 +762,13 @@ forbid FMA contraction, so output is **bit-identical** (64/64 decode tokens,
 16/16 prefill, max |dlogprob| = 0).
 
 `GGML_CUDA_DISABLE_FUSE_HC` is a bitmask kill switch: 1 disables the stream
-reduction, 2 the repeat-anchored combine, 4 the sigmoid-anchored one.
+reduction, 2 the repeat-anchored combine, 4 the sigmoid-anchored one; 7 disables
+all three.
+
+One interaction to know about: the existing `{UNARY, MUL}` fusion now stands
+down when the MUL it would take is the head of a stream reduction, so that the
+larger fusion can have it. The probe is the same matcher, so on a graph without
+hyper-connections it never fires and the decision is unchanged.
 
 Two hazards this had to handle, both found by wrong output rather than by
 reasoning: a fused kernel's input can die *after* the fusion's anchor node (the
@@ -1066,11 +1079,27 @@ with the experts in host memory. Unlike the rest of the set they change what the
 graph computes, not only how a kernel runs, so each one names what it does to
 the output.
 
+The tree these numbers were taken on also carried one change that is **not** in
+this set: `VDR_Q6_K_Q8_1_MMVQ` raised from 1 to 2, which changes Q6_K matvec
+numerics and was never measured on its own, so it was left out. It is not free of
+consequence for the figures — this model keeps 94 tensors in Q6_K — so it was
+measured afterwards, against the published set, in the production configuration:
+a fresh 40k prefill 238.0 vs 240.2 t/s, decode at 40k (best of five, two rounds)
+49.6 vs 51.2 ms/token, one 31-token ubatch 24.1 vs 24.7 ms/token. No difference
+beyond this protocol's run-to-run spread, and what difference there is favours
+the published set. Model output does change: with that one line restored, this
+set reproduces the measured tree **bit for bit** (16/16 positions, max
+|dlogprob| 0), which is also how the fixes made during review were shown not to
+alter output.
+
 Together with the host-side and CUDA patches above, they took decode from
 96 ms/token to 67 at 40k and from 201 to 68 at 210k, and a fresh 210k prefill
 from 52.5 to 27.8 minutes, against the same model on the published set alone.
-Long-context accuracy went 59/78 → 62/78 over the same span (26 questions at
-three depths, McNemar p = 1.000 on every comparison).
+That comparison is **not patches alone**: the arms also differ in the server
+options these patches make usable (one more offloaded expert layer, a wider
+ubatch, the cache slots), which is the point of them — none of it is reachable
+without the code. Long-context accuracy went 59/78 → 62/78 over the same span
+(26 questions at three depths, McNemar p = 1.000 on every comparison).
 
 ### 42 · `qwen4exp-hc-exact` — `model`
 
@@ -1119,7 +1148,8 @@ the setter writes to scratch instead.
 ### 45 · `qwen4exp-qsa-sparse-gather` — `model`
 
 Upstream ships this architecture with sparse attention stubbed out — `TODO:
-enable sparse attention`, the graph is dense flash attention with a top-k mask —
+enable sparse attention when we are ready`, the graph is dense flash attention
+with a top-k mask —
 and the upstream sparse path needs Turing mma, so Pascal with a q4_0 KV cache
 cannot take it. This gathers the selected cells' K, V and mask with `get_rows`
 and feeds flash attention one query per stream slot. The indexer scores and the

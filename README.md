@@ -31,7 +31,8 @@ Every row in the table below carries a scope tag, and
 
 Every patch has a measurement behind it, and the measurements — including the
 alternatives that were tried and rejected — are in the comments the patches add
-to the source.
+to the source, except for 32–46, whose measurements are in
+[docs/patches.md](docs/patches.md) instead.
 
 ## What the set is worth
 
@@ -66,6 +67,19 @@ above nor the `v0.2.0` non-regression check has been re-taken against the tree
 this rebase ships, so both numbers are now one more unmeasured rebase removed
 from what actually runs.
 
+**The table also predates patches 32–46**, and those were developed on a third
+model, not on either of these two. Nine of the fifteen are off by default. Of the
+six that are not, four fire only on one model architecture, one changes an MMQ
+tile for IQ4_NL on no-DP4A cards, and one adds CUDA fusions whose matchers need a
+hyper-connection graph — so on these two models the set should behave as it did
+before. That was measured rather than assumed, on the third model the card still
+has locally (27B dense, IQ3_XXS/IQ4_XS, all layers on the GPU, `llama-bench -fa 1
+-ctk q4_0 -ctv q4_0`, six rounds with the arm order rotated): against the
+published 31-patch set, pp512 138.23 → 138.47 t/s and tg64 22.84 → 22.84 t/s
+(dropping each arm's first round, where a cold start costs both arms ~1%), and a
+third arm with the new fusions disabled lands in the same place. No change at
+this resolution.
+
 This is the whole set against no patches. It is **not** the sum of the per-patch
 numbers below, which were each measured against the stack as it stood at the
 time and do not compose.
@@ -85,13 +99,21 @@ time and do not compose.
   keep using upstream's own fallback (its radix top-k above `ncols = 1024`, a
   full sort at or under it) untouched (see [docs/patches.md](docs/patches.md)).
   Nothing but time has kept any of them out.
-- `test-backend-ops` passed on a P100 with the full set applied: 13,352 tests on
-  `v0.2.0`, matching the unpatched `v0.2.0` build on the same machine, and
-  14,744 on `v0.4.0`. No failures on either. The `v0.4.0` run has not been
-  compared against an unpatched build of that tag, and both runs predate
-  patches 32–46 — those were verified against the model they were written for
-  (bit-identity checks, perplexity and a long-context benchmark, per patch),
-  not with `test-backend-ops`.
+- `test-backend-ops` on a P100 with the full set applied: **14,744 tests, and
+  three full runs went 14,744/14,744 twice with one failing case once** — the
+  same score as the 31-patch set on the same machine (also two clean runs of
+  three), and an earlier 13,352-test run on `v0.2.0` matched its unpatched build.
+  Read those counts as *no reproducible failures* rather than *never a red line*:
+  the suite draws fresh random inputs every run, and
+  `ADD(type=f16,ne=[10,5,4,3],nr=[2,1,1,1],nf=2)` fails intermittently on the
+  **unpatched `v0.4.0` build as well** — 5 of 15 runs of the ADD subset there,
+  2 of 15 with 31 patches, 1 of 15 with all 44 — so the single red line is a
+  tolerance-borderline case, not something the patches introduce.
+  `TOPK_MOE(ne=[288,22,1,1],n_expert_used=8,with_norm=0)` behaves the same way at
+  a lower rate. Patches 32–46 additionally have per-patch evidence against the
+  model they were written for (bit-identity checks, perplexity, a long-context
+  benchmark), and a non-regression A/B on a third model, in
+  [docs/patches.md](docs/patches.md).
 - Unless a patch says otherwise, its output is **bit-identical** to the
   unpatched build. A few do change output (09 where K needs three of the four
   warps, 12 at the widths it takes, 15 by design, 31 once the KV cache is
