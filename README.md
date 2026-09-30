@@ -25,7 +25,11 @@ delta-net models and five need a specific model architecture.
 Patches 32–46 come from one workload: a 48-layer sparse-attention MoE with its
 routed experts in host memory, at a 262,144-token context. Most of them are
 **off by default** behind an environment variable, because what they are worth
-depends on how much of the model is offloaded.
+depends on how much of the model is offloaded. On that model, and with both arms
+built from this repository, they are worth **−58.8% on a fresh 40k prefill**
+(431 → 177 s) and **−52% on decode at 40k** (about 101 → 49 ms/token) against the
+31-patch set — the arms differ in server options too, which is the point of them;
+see [docs/patches.md](docs/patches.md).
 Every row in the table below carries a scope tag, and
 [docs/patches.md](docs/patches.md) is grouped by it.
 
@@ -180,13 +184,13 @@ each was measured against the stack as it stood at the time.
 | 36 | `mmvq-chunk-large-batch` | CUDA | −1,166 MiB pool after a speculative batch, **off by default** (`GGML_CUDA_MMVQ_CHUNK_MIN_MIB=<MiB>`) |
 | 37 | `getrows-narrow-batched` | CUDA | −9.4% prefill, bit-identical, **off by default** (`GGML_CUDA_GETROWS_FLAT_MAX=<n>`) |
 | 38 | `getrows-q4-0-block` | CUDA | −10.1% prefill, bit-identical, **off by default** (`GGML_CUDA_GETROWS_Q4_0_BLK=1`) |
-| 39 | `gdn-lanes-per-column` | CUDA (delta-net) | −4.5% prefill, **off by default** (`GGML_GDN_LPC=16`) |
+| 39 | `gdn-lanes-per-column` | CUDA (delta-net) | −4.3% prefill, −3% decode, **off by default** (`GGML_GDN_LPC=16`) |
 | 40 | `mmq-iq4-nl-threads` | pre-Volta | +3–4% on an IQ4_NL MoE down projection, bit-identical |
 | 41 | `top-k-radix-select` | CUDA | 133 → 74.8 µs at k = 2,051, −2.3% decode, **off by default** (`GGML_CUDA_TOP_K_SELECT=1`) |
 | 42 | `qwen4exp-hc-exact` | model | −1% decode, bit-identical |
 | 43 | `fuse-hc-combine` | CUDA | two kernels for ~40 element-wise ops per layer, bit-identical |
 | 44 | `qwen4exp-qsa-block-key-cache` | model | removes decode's depth dependence (384 MiB at ctx 262,144) |
-| 45 | `qwen4exp-qsa-sparse-gather` | model | compute buffer 3,773 → 1,063 MiB; −7.8% prefill and −18% 262k decode with `LLAMA_QSA_PAD=1` |
+| 45 | `qwen4exp-qsa-sparse-gather` | model | compute buffer 3,773 → 1,063 MiB; −7.0% prefill and −3% decode with `LLAMA_QSA_PAD=1` |
 | 46 | `qwen4exp-moe-expert-cache` | model | decode 51.0 ms/token at 40k on 60 slots (55.2 on 48), **off by default** (`LLAMA_MOE_CACHE=<slots>`) |
 
 Patches 19 and 20 are off by default. Their per-patch figures above were

@@ -847,11 +847,15 @@ there are enough tokens to hide it. Gated on the token count:
 `GGML_GDN_LPC=8|16` selects the lane count (unset = a full warp as before) and
 `GGML_GDN_LPC_MIN_TOK` the threshold (default 32).
 
-**Prefill −4.5%.** Decode is unchanged once the arms are temperature-matched;
-the first sweep showed a decode regression that was the GPU heating up. Output
-is not bit-identical — the reduction order changes — and a paired per-chunk
-perplexity comparison against the unchanged build gives t = +0.25, i.e. no
-detectable difference.
+Re-measured on the published build by flipping only this variable, two rounds
+with the order reversed and both arms cooled to ≤56 °C: a fresh 40k prefill
+**165.0 vs 172.5 s (−4.3%)** and decode at 40k **47.7 vs 49.2 ms/token**. During
+development prefill measured −4.5% and decode looked unchanged once the arms were
+temperature-matched — the first sweep there showed a decode regression that was
+the GPU heating up, and the small decode gain visible here was inside that noise.
+Output is not bit-identical — the reduction order changes — and a paired
+per-chunk perplexity comparison against the unchanged build gives t = +0.25, i.e.
+no detectable difference.
 
 ## Host side
 
@@ -1092,14 +1096,24 @@ set reproduces the measured tree **bit for bit** (16/16 positions, max
 |dlogprob| 0), which is also how the fixes made during review were shown not to
 alter output.
 
-Together with the host-side and CUDA patches above, they took decode from
-96 ms/token to 67 at 40k and from 201 to 68 at 210k, and a fresh 210k prefill
-from 52.5 to 27.8 minutes, against the same model on the published set alone.
-That comparison is **not patches alone**: the arms also differ in the server
-options these patches make usable (one more offloaded expert layer, a wider
-ubatch, the cache slots), which is the point of them — none of it is reachable
-without the code. Long-context accuracy went 59/78 → 62/78 over the same span
-(26 questions at three depths, McNemar p = 1.000 on every comparison).
+**What the fifteen are worth on this model**, both arms built from this
+repository and measured after the split, two rounds with the arm order reversed:
+
+| | 01–31, `--n-cpu-moe 44`, ubatch 1024 | 01–46, `--n-cpu-moe 48`, ubatch 6144, the variables below |
+|---|---:|---:|
+| fresh 40k prefill | 431 s (93.5 t/s) | **177 s (227.4 t/s)**, −58.8% |
+| decode at 40k, best of five | 99.9 / 102.8 ms/token | **48.4 / 49.3 ms/token**, −52% |
+| VRAM peak while doing it | 14,635 MiB | 15,429 MiB |
+
+The arms differ in server options as well as in patches, deliberately: one more
+offloaded expert layer, a six-times wider ubatch and 60 resident expert slots are
+what the code makes reachable, and the left column is the configuration the
+published set can actually run. The extra 794 MiB is the cache; it stays under
+the 15,697 MiB peak this context length was already validated at.
+
+Long-context accuracy over the same span went 59/78 → 62/78 (26 questions at
+three depths, McNemar p = 1.000 on every comparison), measured during
+development rather than on this build.
 
 ### 42 · `qwen4exp-hc-exact` — `model`
 
@@ -1166,8 +1180,10 @@ would not start.)
 
 `LLAMA_QSA_PAD=1` pads the gathered K/V and mask to a multiple of
 `FATTN_KQ_STRIDE` so flash attention takes the vector kernel instead of the tile
-kernel: **prefill −7.8%** and **262k speculative decode −18%** at unchanged
-VRAM. Output changes, and it changes for the better: the vector kernel
+kernel. Re-measured on this build by flipping only that variable, two rounds with
+the order reversed: a fresh 40k prefill **165.5 vs 178.0 s (−7.0%)** and decode
+at 40k **47.4 vs 49.0 ms/token**, at unchanged VRAM. During development it
+measured −7.8% on prefill and −18% on 262k speculative decode. Output changes, and it changes for the better: the vector kernel
 accumulates VKQ in float2 where the tile kernel uses half2 on NVIDIA, so
 relative RMS against a CPU F32 reference is *lower* than the unpadded path in
 every shape measured, and a paired per-chunk perplexity comparison gives
@@ -1209,8 +1225,12 @@ Slot count, decode ms/token, interleaved two rounds:
 | 60 | **51.0** | **52.4** |
 
 A slot costs about 92.5 MiB across the 48 layers. A longer replan period is
-better than the default: 128 is −3.8% against 32 (44.3 → 42.6 ms at 40k) with
-the 26-question long-context bench answering identically.
+better than the default. Re-measured on this build with the slot restored so the
+arms see the same context, two rounds with the order reversed: 128 gives
+**47.45 vs 48.65 ms/token (−2.5%)** against 32, and one of the two rounds showed
+no difference (47.2 / 47.7 against 49.8 / 47.5). During development it measured
+−3.8% (44.3 → 42.6 ms at 40k) with the 26-question long-context bench answering
+identically.
 
 The cache is cold right after a fresh prompt, and prefill routing does not
 predict generation routing well enough to warm it (that was tried and dropped).

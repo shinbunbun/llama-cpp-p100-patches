@@ -24,7 +24,11 @@ gated delta-net を持つモデルでしか発火せず、5 本は特定のモ�
 
 パッチ 32〜46 は 1 つのワークロードから出ている。48 層の疎アテンション MoE を、ルー
 ティング重みをホストメモリに置いたまま 262,144 トークンの文脈で動かす構成である。
-効き方が offload の量に依存するため、**ほとんどが環境変数で既定オフ**にしてある。
+効き方が offload の量に依存するため、**ほとんどが環境変数で既定オフ**にしてある。その
+モデルでは、両アームをこのリポジトリからビルドして測ると、31 本に対して**新規 40k
+prefill が −58.8%** (431 → 177 秒)、**40k decode が −52%** (約 101 → 49 ms/token) である。
+両アームはサーバ設定も違うが、それがこのパッチ群の目的である。詳細は
+[docs/patches.ja.md](docs/patches.ja.md) を参照。
 下の表の各行に適用範囲のタグを付けてあり、[docs/patches.ja.md](docs/patches.ja.md) は
 その分類で章立てしてある。
 
@@ -163,13 +167,13 @@ MMQ タイルだけを変え、1 本の CUDA 融合はマッチャが hyper-conn
 | 36 | `mmvq-chunk-large-batch` | CUDA | 投機バッチ後のプール −1,166 MiB、**既定オフ** (`GGML_CUDA_MMVQ_CHUNK_MIN_MIB=<MiB>`) |
 | 37 | `getrows-narrow-batched` | CUDA | prefill −9.4%、出力ビット一致、**既定オフ** (`GGML_CUDA_GETROWS_FLAT_MAX=<n>`) |
 | 38 | `getrows-q4-0-block` | CUDA | prefill −10.1%、出力ビット一致、**既定オフ** (`GGML_CUDA_GETROWS_Q4_0_BLK=1`) |
-| 39 | `gdn-lanes-per-column` | CUDA (delta-net) | prefill −4.5%、**既定オフ** (`GGML_GDN_LPC=16`) |
+| 39 | `gdn-lanes-per-column` | CUDA (delta-net) | prefill −4.3%、decode −3%、**既定オフ** (`GGML_GDN_LPC=16`) |
 | 40 | `mmq-iq4-nl-threads` | no DP4A | IQ4_NL の MoE down 射影で +3〜4%、出力ビット一致 |
 | 41 | `top-k-radix-select` | CUDA | k = 2,051 で 133 → 74.8 µs、decode −2.3%、**既定オフ** (`GGML_CUDA_TOP_K_SELECT=1`) |
 | 42 | `qwen4exp-hc-exact` | model | decode −1%、出力ビット一致 |
 | 43 | `fuse-hc-combine` | CUDA | 層あたり約 40 回の要素演算を 2 本のカーネルへ、出力ビット一致 |
 | 44 | `qwen4exp-qsa-block-key-cache` | model | decode の深さ依存を除去 (ctx 262,144 で 384 MiB) |
-| 45 | `qwen4exp-qsa-sparse-gather` | model | 計算バッファ 3,773 → 1,063 MiB。`LLAMA_QSA_PAD=1` で prefill −7.8%・262k decode −18% |
+| 45 | `qwen4exp-qsa-sparse-gather` | model | 計算バッファ 3,773 → 1,063 MiB。`LLAMA_QSA_PAD=1` で prefill −7.0%・decode −3% |
 | 46 | `qwen4exp-moe-expert-cache` | model | 60 スロットで 40k decode 51.0 ms/token (48 スロットでは 55.2)、**既定オフ** (`LLAMA_MOE_CACHE=<スロット数>`) |
 
 19・20 は既定オフである。表中の数値はそれぞれ単独で dense モデルを対象に測ったもので、
