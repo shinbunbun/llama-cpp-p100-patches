@@ -40,7 +40,9 @@ to the source, except for 32–46, whose measurements are in
 
 ## What the set is worth
 
-Against stock `b10133` on the same card, same models, same server options:
+Against stock on the same card — rows 1 and 2 against `b10133` at the same
+server options as the patched arm, row 3 against `v0.4.0` (see below for why its
+options differ):
 
 | Model | Stock | Patched | |
 |---|---:|---:|---:|
@@ -62,7 +64,7 @@ the patched arm runs the ones the patches make reachable (`--n-cpu-moe 48`,
 ubatch 6144 and the environment variables in
 [docs/patches.md](docs/patches.md)) — on this model that *is* the win, since the
 configuration is what the code buys. Prefill moves with it: a fresh 40k prompt
-takes 418 s stock against **177 s** patched (96.4 → **227.4 t/s**, +136%). Of the
+takes 413 s stock against **177 s** patched (97.7 → **227.4 t/s**, +133%). Of the
 decode gain, patches 01–31 account for 8.63 → 9.87 t/s and 32–46 for the rest.
 Stock is three rounds there, the patched arm two; the stock prefill spread
 (423 / 413 / 403 s) is the host page cache warming to 41 GB of weights.
