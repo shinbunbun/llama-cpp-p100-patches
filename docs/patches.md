@@ -1099,11 +1099,18 @@ alter output.
 **What the fifteen are worth on this model**, both arms built from this
 repository and measured after the split, two rounds with the arm order reversed:
 
-| | 01–31, `--n-cpu-moe 44`, ubatch 1024 | 01–46, `--n-cpu-moe 48`, ubatch 6144, the variables below |
-|---|---:|---:|
-| fresh 40k prefill | 431 s (93.5 t/s) | **177 s (227.4 t/s)**, −58.8% |
-| decode at 40k, best of five | 99.9 / 102.8 ms/token | **48.4 / 49.3 ms/token**, −52% |
-| VRAM peak while doing it | 14,635 MiB | 15,429 MiB |
+| | stock `v0.4.0` | 01–31, `--n-cpu-moe 44`, ubatch 1024 | 01–46, `--n-cpu-moe 48`, ubatch 6144, the variables below |
+|---|---:|---:|---:|
+| fresh 40k prefill | 413 s (97.7 t/s) | 431 s (93.5 t/s) | **177 s (227.4 t/s)** |
+| decode at 40k, best of five | 115.9 ms/token | 101.4 ms/token | **48.9 ms/token** |
+| VRAM peak while doing it | 14,559 MiB | 14,635 MiB | 15,429 MiB |
+
+Against stock that is **+137% on decode and +133% on prefill**; against the
+published 31-patch set, −58.8% on prefill and −52% on decode. Stock does start at
+this context length on this card, at the same options the 31-patch set runs.
+Stock is three rounds, the other two columns two rounds each; the stock prefill
+figure is the mean of 423, 413 and 403 s, a spread that is the host page cache
+warming to the 41 GB of weights rather than anything in the build.
 
 The arms differ in server options as well as in patches, deliberately: one more
 offloaded expert layer, a six-times wider ubatch and 60 resident expert slots are

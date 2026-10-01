@@ -46,12 +46,26 @@ Against stock `b10133` on the same card, same models, same server options:
 |---|---:|---:|---:|
 | Qwen3.5 9B dense (Q4_1, MTP head Q4_1) | 76.99 t/s | **136.11 t/s** | **+76.8%** |
 | Qwen3.6 35B-A3B MoE (Q2_K_XL, dense layers Q5_1) | 67.01 t/s | **120.57 t/s** | **+79.9%** |
+| Qwen3.8-Flash-Next MoE (UD-IQ3_XXS, q4_0 KV, ctx 262,144, 40k deep) | 8.63 t/s | **20.47 t/s** | **+137%** |
 
 End-to-end decode throughput from `llama-server`, geometric mean over three
 prompts, MTP speculative decoding (n-max 4, p-min 0.75) and a realistic sampler
 (temperature 0.7, top-p 0.8, top-k 20). Arms interleaved, order reversed for the
 second half, GPU cooled to ≤58 °C before each arm: six rounds for the dense model
 (SD 0.19% stock / 0.08% patched), four for the MoE (0.16% / 0.12%).
+
+The third row is measured differently and is the newest: that model has no MTP
+head, so it is plain greedy decode with no speculation, 64 tokens at a 40k-token
+depth, best of five reps, two rounds. Both arms run at ctx 262,144 with a q4_0 KV
+cache; stock runs the options stock can run (`--n-cpu-moe 44`, ubatch 1024) and
+the patched arm runs the ones the patches make reachable (`--n-cpu-moe 48`,
+ubatch 6144 and the environment variables in
+[docs/patches.md](docs/patches.md)) — on this model that *is* the win, since the
+configuration is what the code buys. Prefill moves with it: a fresh 40k prompt
+takes 418 s stock against **177 s** patched (96.4 → **227.4 t/s**, +136%). Of the
+decode gain, patches 01–31 account for 8.63 → 9.87 t/s and 32–46 for the rest.
+Stock is three rounds there, the patched arm two; the stock prefill spread
+(423 / 413 / 403 s) is the host page cache warming to 41 GB of weights.
 
 Both runs predate patches 29 and 30. The dense model is all Q4_1/Q5_1, so it is
 unaffected; the MoE model carries 31.7% of its bytes in IQ3_XXS and 47.9% in
