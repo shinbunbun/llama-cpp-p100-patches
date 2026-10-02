@@ -984,7 +984,10 @@ split even though part of the *preceding* GPU split produces nothing that split
 needs. This cuts the GPU split at the last node the next CPU split consumes,
 queues that head, starts the async copies of the CPU split's inputs, and queues
 the tail behind them, so the tail overlaps the CPU work. The copies are waited
-for with their own event, not by synchronizing the backend.
+for with their own event, not by synchronizing the backend. The backend now sees
+two graph submissions where it saw one, so a backend that caches a captured
+graph per context re-captures on every evaluation; the measurement below is net
+of that.
 
 Off by default (`LLAMA_SCHED_PREFETCH=1`). On a 48-layer MoE with 48 expert
 slots resident on the GPU and the remaining experts computed on the CPU:
@@ -1265,7 +1268,8 @@ that are not all host-side.
 is also capped at `GGML_OP_OFFLOAD_MIN_BATCH − 1`, since above that threshold
 the CPU experts are offloaded to the GPU anyway, and at `LLAMA_MMVQ_MMID_MAX`
 (patch 35), because the shared zero slot repeats ids within a token and only
-MMVQ tolerates that — and `LLAMA_MOE_WARM`
+MMVQ tolerates that (4 when that variable is unset, see below). The cache is
+disabled outright if the caps leave nothing. `LLAMA_MOE_WARM`
 (default 32) the number of tokens after a prefill during which the replan period
 is shortened to 8.
 
@@ -1308,13 +1312,15 @@ The clamp against the MMVQ ceiling uses `LLAMA_MMVQ_MMID_MAX`, which is the
 override patch 35 applies to every type. The built-in ceiling is per type and
 per architecture, and outside sm_60 it is below 8 for several types (Turing and
 later: 5 for Q3_K, 6 for IQ3_S, 7 for Q2_K, IQ2_S, IQ3_XXS and MXFP4; the AMD
-tables are lower still). The host side cannot read that table — it reads the variable, capped at 32, and
-cannot see the device's own `1024/warp_size` limit, which is 16 on a 64-lane
-device and is where the two limits diverge — so on any architecture other
-than the one this was measured on **set `LLAMA_MMVQ_MMID_MAX` to a width the
-device takes before enabling this cache**: without it a wide enough ubatch sends
-the GPU expert matmul to MMQ, which writes out of bounds on the repeated ids the
-shared zero slot produces.
+tables are lower still). The host side cannot read that table — it reads the
+variable, capped at 32, and cannot see the device's own `1024/warp_size` limit,
+which is 16 on a 64-lane device and is where the two limits diverge. Unset, the
+cache therefore assumes the smallest entry in any table (4). To get a wider
+batch on any architecture other than the one this was measured on, **set
+`LLAMA_MMVQ_MMID_MAX` to a width that device and those expert types take**: set
+too wide, a ubatch past the real ceiling sends the GPU expert matmul to MMQ,
+which folds together the repeated ids the shared zero slot produces and leaves
+the rows of the folded-away experts unwritten.
 
 Accuracy over the whole configuration is 62/78 on the 26-question × 3-depth
 long-context benchmark, against 59/78 for the same model without any of this. The

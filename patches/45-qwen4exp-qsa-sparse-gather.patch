@@ -22,7 +22,7 @@ index 58fef0896..651b60839 100644
          // so the layers sharing a ratio share one input set
          std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index fd6709295..419629936 100644
+index fd6709295..ec29009c9 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -545,6 +545,9 @@ public:
@@ -96,7 +96,7 @@ index fd6709295..419629936 100644
 +    // it views: the K/V cache has one, a graph input such as the mask does not.
 +    const ggml_tensor * owner = rows->view_src ? rows->view_src : rows;
 +    const char * buft = owner->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(owner->buffer)) : nullptr;
-+    if (!buft || strncmp(buft, "CUDA", 4) != 0) {
++    if (!buft || ggml_backend_buffer_is_host(owner->buffer) || strncmp(buft, "CUDA", 4) != 0) {
 +        return ggml_cast(ctx, t, GGML_TYPE_F16);
 +    }
 +    t->type  = GGML_TYPE_F16;

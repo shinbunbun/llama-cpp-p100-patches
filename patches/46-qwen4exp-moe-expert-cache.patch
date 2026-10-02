@@ -37,10 +37,10 @@ index 651b60839..6fbd3458d 100644
          ggml_tensor * build_norm_gated(
                      ggml_tensor * input,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 419629936..74ae42cab 100644
+index ec29009c9..7883b3826 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -398,11 +398,294 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -398,11 +398,297 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
      return cur;
  }
  
@@ -200,8 +200,11 @@ index 419629936..74ae42cab 100644
 +        const char * m = getenv("LLAMA_MMVQ_MMID_MAX");
 +        const int64_t x   = e ? atoll(e) : 8;
 +        const int64_t off = o ? atoll(o) : 32;
-+        const int64_t mmq = m ? std::min<int64_t>(atoll(m), 32) : 8;
-+        return std::max<int64_t>(1, std::min(std::min(x, mmq), off - 1));
++        // 4 is the smallest built-in ceiling in any of the per-type tables, and the host cannot
++        // read the one this device uses
++        const int64_t mmq = m ? std::min<int64_t>(atoll(m), 32) : 4;
++        const int64_t v   = std::min(std::min(x, mmq), off - 1);
++        return v > 0 ? v : 0;
 +    }();
 +    return v;
 +}
@@ -335,7 +338,7 @@ index 419629936..74ae42cab 100644
      GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
  
      int sections[4];
-@@ -414,6 +697,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -414,6 +700,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
  
      auto * inp = build_inp_mem_hybrid();
  
@@ -351,7 +354,7 @@ index 419629936..74ae42cab 100644
      // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
      // the indexer cache inside it is absent when the GGUF has no indexer tensors
      const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
-@@ -482,7 +774,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -482,7 +777,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                  model.layers[il].hc_ffn_inject,
                  &inject, il);
  
@@ -360,7 +363,7 @@ index 419629936..74ae42cab 100644
          cb(cur, "ffn_out", il);
  
          res_hc = build_hc_combine(res_hc, cur, inject, model.layers[il].hc_ffn_inject, il);
-@@ -1349,29 +1641,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -1349,29 +1644,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
      return cur;
  }
  
@@ -485,7 +488,7 @@ index 419629936..74ae42cab 100644
              build_ffn(cur,
                  model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                  model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-@@ -1389,7 +1756,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1389,7 +1759,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
  
          ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
          cb(ffn_shexp, "ffn_shexp_gated", il);

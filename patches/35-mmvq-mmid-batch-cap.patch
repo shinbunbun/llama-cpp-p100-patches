@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7498398a0..607b84e67 100644
+index 7498398a0..bf7b1a29d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1883,7 +1883,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
@@ -20,6 +20,15 @@ index 7498398a0..607b84e67 100644
              if (ggml_is_quantized(src0->type)) {
                  const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                  if (ne2 <= mmvq_mmid_max) {
+@@ -1927,7 +1927,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+                     return;
+                 }
+             } else {
+-                if (GGML_CUDA_CC_IS_AMD(cc)) {
++                if (GGML_CUDA_CC_IS_AMD(cc) && ne2 <= MMVF_MAX_BATCH_SIZE) {
+                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                     return;
+                 }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
 index cbac2fe2f..cd1aee531 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
