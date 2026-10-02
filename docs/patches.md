@@ -1173,7 +1173,11 @@ larger than it is; per-op host synchronization inflates small kernels.
 
 This is the one patch in 32–46 that is on by default, changes the graph and has no
 kill switch; its bit-identity rests on the whole-set comparison at the top of this
-section rather than on a check of its own.
+section rather than on a check of its own. Folding also moves the scale to the
+wrong side of a LoRA: `build_lora_mm` adds the adapter's contribution after the
+base matmul, so an adapter on one of the folded `hc_*` tensors is no longer
+divided by `hc` and lands four times too strong. Nothing here was run with an
+adapter.
 
 ### 44 · `qwen4exp-qsa-block-key-cache` — `model`
 
@@ -1268,8 +1272,9 @@ that are not all host-side.
 is also capped at `GGML_OP_OFFLOAD_MIN_BATCH − 1`, since above that threshold
 the CPU experts are offloaded to the GPU anyway, and at `LLAMA_MMVQ_MMID_MAX`
 (patch 35), because the shared zero slot repeats ids within a token and only
-MMVQ tolerates that (4 when that variable is unset, see below). The cache is
-disabled outright if the caps leave nothing. `LLAMA_MOE_WARM`
+MMVQ tolerates that (4 when that variable is unset, see below). The cache is not
+built at all if the caps leave nothing, or if the model routes experts in groups,
+which `build_moe_cached` does not reproduce. `LLAMA_MOE_WARM`
 (default 32) the number of tokens after a prefill during which the replan period
 is shortened to 8.
 

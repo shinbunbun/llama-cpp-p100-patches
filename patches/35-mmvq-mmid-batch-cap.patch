@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7498398a0..bf7b1a29d 100644
+index 7498398a0..c2da5e301 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1883,7 +1883,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -1883,12 +1883,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
          return true;
      }
  
@@ -11,6 +11,12 @@ index 7498398a0..bf7b1a29d 100644
          if (ggml_is_quantized(src0->type)) {
              if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                  return false;
+             }
+-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
++        } else if (GGML_CUDA_CC_IS_AMD(cc) && dst->ne[2] <= MMVF_MAX_BATCH_SIZE) {
+             return false;
+         }
+     }
 @@ -1919,7 +1919,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
      if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {

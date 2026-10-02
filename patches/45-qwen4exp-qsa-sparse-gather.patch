@@ -22,7 +22,7 @@ index 58fef0896..651b60839 100644
          // so the layers sharing a ratio share one input set
          std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index fd6709295..ec29009c9 100644
+index fd6709295..9cecfd274 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -545,6 +545,9 @@ public:
@@ -310,7 +310,7 @@ index fd6709295..ec29009c9 100644
 +        ggml_build_forward_expand(gf, k_sel);
 +        ggml_build_forward_expand(gf, v_sel);
 +
-+        ggml_tensor * m_rows = ggml_view_3d(ctx0, kq_mask, 1, n_kv, c, m_el, n_kv*m_el, i0*n_kv*m_el);
++        ggml_tensor * m_rows = ggml_view_3d(ctx0, kq_mask, 1, n_kv, c, m_el, kq_mask->nb[1], i0*kq_mask->nb[1]);
 +        ggml_tensor * m_sel;
 +        if (kq_mask->type == GGML_TYPE_F16) {
 +            m_sel = ggml_reshape_4d(ctx0, qwen4exp_get_rows_f16(ctx0, m_rows, idx), width, 1, 1, c);
