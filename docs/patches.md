@@ -23,7 +23,7 @@ their measurements live on this page rather than in the source.
 | `pre-Turing` | Gated to NVIDIA before Turing. **This includes Volta, which does have tensor cores and was not measured.** |
 | `all archs` | Not architecture-gated at all: every GPU gets the change. Measured only on sm_60. |
 | `CUDA` | Architecture-independent CUDA improvement. |
-| `CUDA (delta-net)` | Architecture-independent, but only fires for models with a gated delta-net block. |
+| `CUDA (delta-net)` | Architecture-independent, but only fires for models with a gated delta-net block (Qwen3-Next, Qwen3.5, Qwen3.8-Flash-Next and the other architectures in the same filter). |
 | `host` | CPU-side; the faster the GPU, the larger the share. |
 | `model` | Depends on a model architecture, not on hardware. |
 
@@ -636,7 +636,8 @@ state):
 | 17 | 844.8 | **814.4** | 1120.8 | **1013.0** |
 | 32 | 1187.8 | **1106.7** | 1425.2 | **1371.3** |
 
-**4–11% at every point measured**, VRAM identical. Greedy decode at matched
+**−3.6 to −9.6% across the three widths shown**, and −3.6 to −11.2% across the
+full eight-width sweep those three are taken from. VRAM identical. Greedy decode at matched
 acceptance (1.000) went 44.98 / 45.69 → 43.28 / 43.88 ms/token. A 26-question ×
 3-depth long-context benchmark scored the same as the capped build (61/78,
 McNemar p = 1.000 on every comparison).
@@ -656,9 +657,11 @@ dst into 8-column views and looping MMVQ needs no copy at all.
 
 `GGML_CUDA_MMVQ_CHUNK_MIN_MIB=<MiB>` is the minimum F16 expansion that makes
 the split worthwhile; unset keeps the cuBLAS path. At 256 it takes the LM head
-and nothing else. The path is also gated on `ggml_cuda_should_use_mmvq`, since
-`supports_op` accepts quantization types the MMVQ switch has no kernel for and
-those must keep falling through to cuBLAS.
+and nothing else. The path is also gated on `ggml_cuda_should_use_mmvq`. That is belt-and-braces
+rather than a type whitelist: it keeps the chunking off where upstream's own
+heuristic would not have used MMVQ at this width, and on the architecture measured
+here it is always true. A quantized type with no MMVQ instantiation would still
+reach the switch's `GGML_ABORT`; none is reachable today.
 
 | | pool peak | LM head request | 262k speculative decode |
 |---|---:|---:|---:|
@@ -701,8 +704,9 @@ what the card does in practice.
 Adds a q4_0 → F16 kernel with one thread per q4_0 block: 32 elements
 dequantized and written as four 16-byte stores of 64 contiguous bytes, so a
 warp's writes coalesce completely. The dequantization is `dequantize_q4_0`'s own
-expression, so output is **bit-identical**; unaligned destinations fall back.
-`GGML_CUDA_GETROWS_Q4_0_BLK=1`.
+expression, so output is **bit-identical**; unaligned destinations fall back, and
+the kernel exists only for an F16 destination, which is what patch 45's gather
+asks for. `GGML_CUDA_GETROWS_Q4_0_BLK=1`.
 
 Fresh 40k prefill, on top of patch 37: 208.3 → **187.3 s (−10.1%)**, three
 interleaved rounds, distributions separated. Decode unchanged (it gathers the
@@ -720,7 +724,9 @@ k = 2,051 of 40,544 scores, so it sorted all 40,544 to keep the first 2,051:
 **133 µs to read 162 KB** (161 µs at 210k depth, 65.6 ms for a 4,096-row prefill
 chunk).
 
-Adds a radix select for large k (`GGML_CUDA_TOP_K_SELECT=1`):
+Adds a radix select for large k (`GGML_CUDA_TOP_K_SELECT=1`), in the same block
+patch 28 guards off for HIP and for builds whose CUB provides `DeviceTopK`, and
+only for rows of at least `CUDA_TOP_K_MIN_NCOLS` = 4,096 columns:
 
 - the comparison key is a 64-bit packed `(ordered_key << 32) | ~idx`, so
   unsigned descending order *is* "key descending, index ascending" and matches
@@ -748,7 +754,7 @@ Kernel 133 → **74.8 µs** at the decode shape, 65.6 → **28.6 ms** at 4,096 r
 End to end: decode 40k 48.6 → **47.5 ms (−2.3%)**, prefill of 2,050 tokens
 126.8 → **131.1 t/s (+3.4%)**, decode at 210k unchanged.
 
-### 43 · `fuse-hc-combine` — `CUDA`
+### 43 · `fuse-hc-combine` — `CUDA` (hyper-connection graphs only)
 
 Hyper-connections surround every block with element-wise glue — around 40 small
 ops per layer. Two kernels take the two chains:
@@ -777,8 +783,10 @@ reads), which is why the combine reads the materialized `REPEAT` output; and a
 fusion must not run when its output overlaps a source by bytes — only an
 in-place source at the same pointer and stride is allowed.
 
-Not isolated end to end: it was measured together with a slot-count increase
-and the reorder in patch 46 (decode 40k 55.2 → 49.2 ms for the three changes).
+Not isolated end to end: it was measured together with a slot-count increase and
+the reorder in patch 46, whose own before/after at 40k is 58.4 → 49.2 ms for the
+three changes (55.2 ms is the 48-slot step inside that span, which is why the
+slot table under patch 46 starts there).
 
 ## Delta-net / gated-delta-net (Qwen3-Next, Qwen3.5)
 
@@ -845,14 +853,20 @@ parameter and using 16 lanes halves the reductions per token and raises the
 FMA-to-shuffle ratio — but it also halves the parallelism, which only pays once
 there are enough tokens to hide it. Gated on the token count:
 `GGML_GDN_LPC=8|16` selects the lane count (unset = a full warp as before) and
-`GGML_GDN_LPC_MIN_TOK` the threshold (default 32).
+`GGML_GDN_LPC_MIN_TOK` the threshold (default 32). Only `S_v == 128` has the
+narrow instantiations, so on any other head size the variable is ignored.
 
 Re-measured on the published build by flipping only this variable, two rounds
 with the order reversed and both arms cooled to ≤56 °C: a fresh 40k prefill
-**165.0 vs 172.5 s (−4.3%)** and decode at 40k **47.7 vs 49.2 ms/token**. During
-development prefill measured −4.5% and decode looked unchanged once the arms were
-temperature-matched — the first sweep there showed a decode regression that was
-the GPU heating up, and the small decode gain visible here was inside that noise.
+**165.0 vs 172.5 s (−4.3%)**. During development it measured −4.9% (161 / 167 →
+154 / 158 s).
+
+Decode is untouched by construction: the override needs `n_tokens >= 32`, and a
+decode step without speculation is one token. The same two rounds did show decode
+at 40k moving 49.2 → 47.7 ms/token, which is therefore this protocol's
+server-to-server spread and not the flag — worth knowing when reading the decode
+figures of the other two variables re-measured the same way (45 and 46), where the
+flag *can* act but the spread is the same size.
 Output is not bit-identical — the reduction order changes — and a paired
 per-chunk perplexity comparison against the unchanged build gives t = +0.25, i.e.
 no detectable difference.
@@ -977,8 +991,8 @@ slots resident on the GPU and the remaining experts computed on the CPU:
 
 | | off | on |
 |---|---:|---:|
-| decode at 40k | 66.4 ms | **59.4 ms (−10%)** |
-| decode at 210k | 62.0 ms | **56.1 ms (−9%)** |
+| decode at 40k | 66.4 ms | **59.4 ms (−10.5%)** |
+| decode at 210k | 62.0 ms | **56.1 ms (−9.5%)** |
 
 What is overlapped is the tail of the GPU split — the cached experts' matmuls.
 An earlier revision measured **no effect at all** with 34 resident slots,
@@ -1002,7 +1016,9 @@ clobbered and repair them. The uploads run on their own backend, which no
 graph-level synchronize covers, so the owner waits for them with
 `ggml_backend_sched_staging_synchronize()` before it repairs anything, and drops
 the registration with `ggml_backend_sched_clear_staging_area()` before the buffer
-goes away. Staging is confined to the device that owns the buffer: a split on
+goes away. The producer table holds 16 backends; a scheduler that does not fit
+leaves weight prefetch off rather than borrow memory nothing would wait for.
+Staging is confined to the device that owns the buffer: a split on
 another device would have to take the weight through a host copy, which does not
 honour the upload event. In the measured configuration the ~1 GB comes from an
 expert cache that prefill does not use.
@@ -1012,7 +1028,7 @@ Appending to a 40k context, and a fresh 20k prompt:
 
 | | off | on |
 |---|---:|---:|
-| 1,025 tokens | 11.9 s | 11.8–12.0 (±0) |
+| 1,025 tokens | 11.9 s | 11.8–12.0 (±0, the refill cancels the gain) |
 | 2,049 tokens | 17.4 s | **16.6 s (−4.6%)** |
 | 4,097 tokens | 29.0 s | **27.1 s (−6.6%)** |
 | fresh 20k | 123.4 s | **115.7 s (−6.2%)** |
@@ -1087,11 +1103,12 @@ The tree these numbers were taken on also carried one change that is **not** in
 this set: `VDR_Q6_K_Q8_1_MMVQ` raised from 1 to 2, which changes Q6_K matvec
 numerics and was never measured on its own, so it was left out. It is not free of
 consequence for the figures — this model keeps 94 tensors in Q6_K — so it was
-measured afterwards, against the published set, in the production configuration:
-a fresh 40k prefill 238.0 vs 240.2 t/s, decode at 40k (best of five, two rounds)
-49.6 vs 51.2 ms/token, one 31-token ubatch 24.1 vs 24.7 ms/token. No difference
-beyond this protocol's run-to-run spread, and what difference there is favours
-the published set. Model output does change: with that one line restored, this
+measured afterwards, against the published set, in the production configuration,
+two rounds each: a fresh 40k prefill 238.0 vs 240.2 t/s (the dropped line ahead by
+0.9%, on a spread of 1.6% against 6.7% within the arms), decode at 40k best of
+five 49.6 vs 51.2 ms/token and one 31-token ubatch 24.1 vs 24.7 ms/token (the
+published set ahead on both). Nothing separates them beyond this protocol's
+spread, and the metrics disagree about the sign. Model output does change: with that one line restored, this
 set reproduces the measured tree **bit for bit** (16/16 positions, max
 |dlogprob| 0), which is also how the fixes made during review were shown not to
 alter output.
@@ -1101,16 +1118,26 @@ repository and measured after the split, two rounds with the arm order reversed:
 
 | | stock `v0.4.0` | 01–31, `--n-cpu-moe 44`, ubatch 1024 | 01–46, `--n-cpu-moe 48`, ubatch 6144, the variables below |
 |---|---:|---:|---:|
-| fresh 40k prefill | 413 s (97.7 t/s) | 431 s (93.5 t/s) | **177 s (227.4 t/s)** |
+| fresh 40k prefill | 413 s (97.6 t/s) | 431 s (93.5 t/s) | **177 s (227.4 t/s)** |
 | decode at 40k, best of five | 115.9 ms/token | 101.4 ms/token | **48.9 ms/token** |
 | VRAM peak while doing it | 14,559 MiB | 14,635 MiB | 15,429 MiB |
 
 Against stock that is **+137% on decode and +133% on prefill**; against the
 published 31-patch set, −58.8% on prefill and −52% on decode. Stock does start at
 this context length on this card, at the same options the 31-patch set runs.
-Stock is three rounds, the other two columns two rounds each; the stock prefill
-figure is the mean of 423, 413 and 403 s, a spread that is the host page cache
-warming to the 41 GB of weights rather than anything in the build.
+
+The VRAM row is the peak sampled every two seconds through that 40k run, which is
+not the worst case. The worst case for the right-hand configuration is a 262k
+context restored and then decoded speculatively; that was measured during
+development at **15,393 MiB with no failed allocation**, and it is the number to
+budget against.
+
+Protocol: the two patched columns are two rounds with the arm order reversed. The
+stock column is three consecutive runs rather than interleaved with them (prefill
+423 / 413 / 403 s, a spread that is the host page cache warming to the 41 GB of
+weights), its first two rounds are best of five decode reps and the third is best
+of three, and its VRAM figure comes from that third run, the only stock round
+that sampled memory.
 
 The arms differ in server options as well as in patches, deliberately: one more
 offloaded expert layer, a six-times wider ubatch and 60 resident expert slots are
@@ -1129,9 +1156,10 @@ matmuls per layer plus the element-wise glue. Three changes, all
 **bit-identical**:
 
 - fold the `1/hc = 0.25` SCALE into the weights at load time — the Q8_0 `down`
-  block scales and the F32 `inject` values. A tensor is only folded if every
-  scale survives the division exactly (129 of 193 qualified); the rest keep the
-  original path
+  block scales and the F32 `inject` values. A tensor is folded only if it is on a
+  device and every scale survives the division exactly; host-resident weights are
+  skipped whatever their scales, so the 129 of 193 that qualified is not a count
+  of rounding failures. The rest keep the original path, per tensor
 - drop the `CONT` before the stream average: ADD reads a non-contiguous view
   directly
 - expand the gamma reshape before the RMS norm, so RMS_NORM and MUL end up
@@ -1139,6 +1167,10 @@ matmuls per layer plus the element-wise glue. Three changes, all
 
 Worth about **−1% decode** (0.5 ms). Event-level profiles had made the glue look
 larger than it is; per-op host synchronization inflates small kernels.
+
+This is the one patch in 32–46 that is on by default, changes the graph and has no
+kill switch; its bit-identity rests on the whole-set comparison at the top of this
+section rather than on a check of its own.
 
 ### 44 · `qwen4exp-qsa-block-key-cache` — `model`
 
@@ -1176,12 +1208,22 @@ cannot take it. This gathers the selected cells' K, V and mask with `get_rows`
 and feeds flash attention one query per stream slot. The indexer scores and the
 top-k are chunked per query row (`LLAMA_QSA_CHUNK`, default 32), which removes
 the `[n_kv × n_ubatch]` intermediate: **compute buffer 3,773 → 1,063 MiB** at
-chunk 32. `LLAMA_QSA_GATHER=0` returns to the dense path.
+chunk 32. `LLAMA_QSA_GATHER=0` returns to the dense path; so does a build or context
+without flash attention, more than one stream, a 4-D mask, or a KV cache shorter
+than `2*(top_k + ratio - 1)`, all of which the sparse path requires.
+
+This patch is **on by default and changes output**: gathering the selected cells
+and running attention over them accumulates in top-k order, where the dense path
+accumulated over the whole KV behind an additive mask. The selection is the same —
+patch 41's entry depends on that order being deterministic — but the sums are not
+bit-identical to upstream.
 
 The gather writes F16 directly: with an F16 destination, CUDA's `get_rows` does
 q4_0 → float → half in one pass instead of an F32 write plus a CPY. The rounding
 is the same, so this part is **bit-identical**, and prefill gains 7% at 20k and
-3.4% at 40k. (Gathering the raw q4_0 bytes instead was tried and abandoned: the
+3.4% at 40k while decode loses about 1%. Only the K/V gathers take it: the mask
+gather has no buffer to inspect when the graph is built, so it keeps the F32 write
+and an explicit cast, which is also what any CPU placement needs. (Gathering the raw q4_0 bytes instead was tried and abandoned: the
 compute buffer grew with the chunk count, 17.8 GB at ubatch 4096, and the server
 would not start.)
 
@@ -1189,8 +1231,12 @@ would not start.)
 `FATTN_KQ_STRIDE` so flash attention takes the vector kernel instead of the tile
 kernel. Re-measured on this build by flipping only that variable, two rounds with
 the order reversed: a fresh 40k prefill **165.5 vs 178.0 s (−7.0%)** and decode
-at 40k **47.4 vs 49.0 ms/token**, at unchanged VRAM. During development it
-measured −7.8% on prefill and −18% on 262k speculative decode. Output changes, and it changes for the better: the vector kernel
+at 40k **47.4 vs 49.0 ms/token**, During development it measured −7.8% on prefill and −18% on 262k
+speculative decode, at a VRAM peak that did not move; the re-measurement did not
+sample VRAM. Its two rounds were also not temperature-matched (the padded arm
+started a round at 48 °C against 56 °C for the unpadded one), and the decode
+figure is the same size as the spread discussed under patch 39, so read the
+prefill number and treat the decode one as noise. Output changes, and it changes for the better: the vector kernel
 accumulates VKQ in float2 where the tile kernel uses half2 on NVIDIA, so
 relative RMS against a CPU F32 reference is *lower* than the unpadded path in
 every shape measured, and a paired per-chunk perplexity comparison gives
@@ -1262,12 +1308,17 @@ The clamp against the MMVQ ceiling uses `LLAMA_MMVQ_MMID_MAX`, which is the
 override patch 35 applies to every type. The built-in ceiling is per type and
 per architecture, and outside sm_60 it is below 8 for several types (Turing and
 later: 5 for Q3_K, 6 for IQ3_S, 7 for Q2_K, IQ2_S, IQ3_XXS and MXFP4; the AMD
-tables are lower still). The host side cannot read that table, so on any
-architecture other than the one this was measured on **set
-`LLAMA_MMVQ_MMID_MAX` to a width the device takes before enabling this cache**:
-without it a wide enough ubatch sends the GPU expert matmul to MMQ, which writes
-out of bounds on the repeated ids the shared zero slot produces.
+tables are lower still). The host side cannot read that table — it reads the variable, capped at 32, and
+cannot see the device's own `1024/warp_size` limit, which is 16 on a 64-lane
+device and is where the two limits diverge — so on any architecture other
+than the one this was measured on **set `LLAMA_MMVQ_MMID_MAX` to a width the
+device takes before enabling this cache**: without it a wide enough ubatch sends
+the GPU expert matmul to MMQ, which writes out of bounds on the repeated ids the
+shared zero slot produces.
 
 Accuracy over the whole configuration is 62/78 on the 26-question × 3-depth
-long-context benchmark, against 59/78 for the same model without any of this;
-every McNemar comparison against the other arms gives p ≥ 0.5.
+long-context benchmark, against 59/78 for the same model without any of this. The
+two ends are not one experiment: 59/78 is the pre-patch production build, 62/78
+was taken during development on a 56-slot configuration, and the p ≥ 0.5 figure
+comes from the 59/78-against-61/78 comparison in between. Nothing here was
+re-scored on the published build.

@@ -21,7 +21,7 @@ index 7498398a0..607b84e67 100644
                  const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                  if (ne2 <= mmvq_mmid_max) {
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index cbac2fe2f..a26ea1dcf 100644
+index cbac2fe2f..cd1aee531 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -274,8 +274,24 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
@@ -64,18 +64,28 @@ index cbac2fe2f..a26ea1dcf 100644
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
      if (!ggml_is_quantized(type)) {
          return false;
-@@ -864,8 +887,8 @@ static __global__ void mul_mat_vec_q(
+@@ -863,9 +886,18 @@ static __global__ void mul_mat_vec_q(
+ // Dedicated MoE multi-token kernel.
  // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
  // Block: (warp_size, ncols_dst) - each warp handles one token independently.
++// one block is warp_size x ncols_dst threads, which has to stay inside the device's block limit:
++// a 64-lane device cannot take the widest instantiation at its nominal width
++template <ggml_type type, int c_max_ncols_dst>
++static constexpr __device__ int mmvq_moe_block_threads() {
++    return (c_max_ncols_dst ? c_max_ncols_dst : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size() > 1024
++        ? 1024
++        : (c_max_ncols_dst ? c_max_ncols_dst : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size();
++}
++
  // No shared memory reduction needed since each warp works alone.
 -template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
 -__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 +template <ggml_type type, int c_rows_per_block, bool has_fusion = false, int c_max_ncols_dst = 0>
-+__launch_bounds__((c_max_ncols_dst ? c_max_ncols_dst : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
++__launch_bounds__(mmvq_moe_block_threads<type, c_max_ncols_dst>(), 1)
  static __global__ void mul_mat_vec_q_moe(
          const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
          float * dst_ptr,
-@@ -1096,18 +1119,39 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1096,18 +1128,39 @@ static void mul_mat_vec_q_moe_launch(
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                              fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
  
@@ -125,7 +135,7 @@ index cbac2fe2f..a26ea1dcf 100644
      }
  }
  
-@@ -1122,7 +1166,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1122,7 +1175,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
@@ -134,7 +144,7 @@ index cbac2fe2f..a26ea1dcf 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-@@ -1506,7 +1550,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1506,7 +1559,7 @@ void ggml_cuda_mul_mat_vec_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  

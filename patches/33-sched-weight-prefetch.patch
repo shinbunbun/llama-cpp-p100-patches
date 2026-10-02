@@ -19,7 +19,7 @@ index cc3f8cd36..f1c3569f6 100644
      // Meta backend
      //
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 2b0c869a3..e8fb076d8 100644
+index 2b0c869a3..725f807b0 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,7 @@
@@ -30,7 +30,7 @@ index 2b0c869a3..e8fb076d8 100644
  #include <unordered_map>
  #include <vector>
  
-@@ -833,6 +834,19 @@ struct ggml_backend_sched {
+@@ -833,6 +834,20 @@ struct ggml_backend_sched {
  
      int debug;
  
@@ -46,11 +46,12 @@ index 2b0c869a3..e8fb076d8 100644
 +    int                   wpf_n;
 +    bool                  wpf_tried;
 +    bool                  wpf_off_graph;
++    bool                  wpf_borrowed;
 +
      // run the GPU work that the next CPU split does not need while the CPU computes [LLAMA_SCHED_PREFETCH]
      int prefetch;
      ggml_backend_event_t prefetch_event[GGML_SCHED_MAX_BACKENDS];
-@@ -1661,6 +1675,158 @@ static bool sched_backend_is_cpu(ggml_backend_t backend) {
+@@ -1661,6 +1676,189 @@ static bool sched_backend_is_cpu(ggml_backend_t backend) {
      return ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
  }
  
@@ -58,7 +59,33 @@ index 2b0c869a3..e8fb076d8 100644
 +static size_t                g_stage_size   = 0;
 +static std::atomic<uint64_t> g_stage_epoch  { 0 };
 +static std::atomic<size_t>   g_stage_extent { 0 };
-+static ggml_backend_t        g_stage_producer = NULL;
++#define GGML_SCHED_MAX_STAGE_PRODUCERS 16
++static ggml_backend_t        g_stage_producers[GGML_SCHED_MAX_STAGE_PRODUCERS] = { NULL };
++static int                   g_stage_n_producers = 0;
++
++// a producer that does not fit cannot be synchronized, so it does not get to borrow either
++static bool stage_producer_add(ggml_backend_t backend) {
++    for (int i = 0; i < g_stage_n_producers; i++) {
++        if (g_stage_producers[i] == backend) {
++            return true;
++        }
++    }
++    if (g_stage_n_producers == GGML_SCHED_MAX_STAGE_PRODUCERS) {
++        return false;
++    }
++    g_stage_producers[g_stage_n_producers++] = backend;
++    return true;
++}
++
++static void stage_producer_del(ggml_backend_t backend) {
++    for (int i = 0; i < g_stage_n_producers; i++) {
++        if (g_stage_producers[i] == backend) {
++            g_stage_producers[i] = g_stage_producers[--g_stage_n_producers];
++            g_stage_producers[g_stage_n_producers] = NULL;
++            return;
++        }
++    }
++}
 +
 +void ggml_backend_sched_set_staging_area(ggml_backend_buffer_t buffer, size_t size) {
 +    g_stage_buf  = buffer;
@@ -67,8 +94,8 @@ index 2b0c869a3..e8fb076d8 100644
 +
 +// the staging uploads run on their own backend, which no graph-level synchronize covers
 +void ggml_backend_sched_staging_synchronize(void) {
-+    if (g_stage_producer) {
-+        ggml_backend_synchronize(g_stage_producer);
++    for (int i = 0; i < g_stage_n_producers; i++) {
++        ggml_backend_synchronize(g_stage_producers[i]);
 +    }
 +}
 +
@@ -128,7 +155,12 @@ index 2b0c869a3..e8fb076d8 100644
 +                GGML_LOG_WARN("%s: weight prefetch disabled\n", __func__);
 +                sched->wpf_size = 0;
 +            } else if (sched->wpf_buf == g_stage_buf) {
-+                g_stage_producer = sched->wpf_backend;
++                if (stage_producer_add(sched->wpf_backend)) {
++                    sched->wpf_borrowed = true;
++                } else {
++                    GGML_LOG_WARN("%s: weight prefetch disabled: no staging producer slot\n", __func__);
++                    sched->wpf_size = 0;
++                }
 +            }
 +        }
 +    }
@@ -191,7 +223,7 @@ index 2b0c869a3..e8fb076d8 100644
 +    if (sched->wpf_n == 0) {
 +        return;
 +    }
-+    if (sched->wpf_buf == g_stage_buf) {
++    if (sched->wpf_borrowed) {
 +        size_t ext = g_stage_extent.load();
 +        while (ext < off && !g_stage_extent.compare_exchange_weak(ext, off)) {
 +        }
@@ -209,7 +241,7 @@ index 2b0c869a3..e8fb076d8 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1670,6 +1836,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1670,6 +1868,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<ggml_bitset_t> used_ids;
  
      int prev_backend_id = -1;
@@ -221,7 +253,13 @@ index 2b0c869a3..e8fb076d8 100644
 +            wpf = sched_wpf_ready(sched, sched->backends[b]);
 +        }
 +    }
-+    if (wpf && sched->wpf_buf == g_stage_buf) {
++    // the owner may have taken the area back since it was borrowed, which also retires the guards below
++    if (wpf && sched->wpf_borrowed && (sched->wpf_buf != g_stage_buf || g_stage_size < sched->wpf_size)) {
++        sched->wpf_size = 0;
++        stage_producer_del(sched->wpf_backend);
++        wpf = false;
++    }
++    if (wpf && sched->wpf_borrowed) {
 +        bool offload = false;
 +        for (int i = 0; i < sched->n_splits && !offload; i++) {
 +            for (int k = 0; k < splits[i].n_inputs && !offload; k++) {
@@ -245,7 +283,7 @@ index 2b0c869a3..e8fb076d8 100644
      sched->n_prefetched = 0;
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
-@@ -1725,6 +1920,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1725,6 +1958,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      ggml_backend_synchronize(split_backend);
                  }
  
@@ -256,7 +294,7 @@ index 2b0c869a3..e8fb076d8 100644
                  // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                  ggml_tensor * node = split->graph.nodes[0];
                  if (split->graph.n_nodes > 0 &&
-@@ -1877,6 +2076,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1877,6 +2114,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                  if (ec != GGML_STATUS_SUCCESS) {
                      return ec;
                  }
@@ -266,19 +304,17 @@ index 2b0c869a3..e8fb076d8 100644
              }
          } else {
              // similar to ggml_backend_compare_graph_backend
-@@ -2019,6 +2221,17 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2019,6 +2259,15 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          }
          ggml_backend_event_free(sched->prefetch_event[b]);
      }
 +    ggml_backend_event_free(sched->wpf_ev_up);
 +    ggml_backend_event_free(sched->wpf_ev_free);
-+    if (sched->wpf_buf && sched->wpf_buf != g_stage_buf) {
++    if (sched->wpf_buf && !sched->wpf_borrowed) {
 +        ggml_backend_buffer_free(sched->wpf_buf);
 +    }
 +    if (sched->wpf_backend) {
-+        if (g_stage_producer == sched->wpf_backend) {
-+            g_stage_producer = NULL;
-+        }
++        stage_producer_del(sched->wpf_backend);
 +        ggml_backend_free(sched->wpf_backend);
 +    }
      ggml_gallocr_free(sched->galloc);

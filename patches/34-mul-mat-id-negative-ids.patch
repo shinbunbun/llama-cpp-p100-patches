@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index e8fb076d8..151ea29dd 100644
+index 725f807b0..9962c36d2 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1963,7 +1963,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2001,7 +2001,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                              for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                  int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
@@ -14,7 +14,7 @@ index e8fb076d8..151ea29dd 100644
                                  ggml_bitset_set(used_ids.data(), id);
                              }
                          }
-@@ -1987,9 +1990,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2025,9 +2028,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      };
  
                      int id = 0;

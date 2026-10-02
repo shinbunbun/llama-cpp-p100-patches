@@ -22,7 +22,7 @@ index 58fef0896..651b60839 100644
          // so the layers sharing a ratio share one input set
          std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index fd6709295..8d64b417c 100644
+index fd6709295..419629936 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -545,6 +545,9 @@ public:
@@ -64,7 +64,7 @@ index fd6709295..8d64b417c 100644
  };
  
  ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-@@ -824,6 +842,289 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -824,6 +842,294 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      return cur;
  }
  
@@ -91,7 +91,12 @@ index fd6709295..8d64b417c 100644
 +// what get_rows to F32 followed by a cast would do, without the F32 round trip through memory.
 +static ggml_tensor * qwen4exp_get_rows_f16(ggml_context * ctx, ggml_tensor * rows, ggml_tensor * idx) {
 +    ggml_tensor * t = ggml_get_rows(ctx, rows, idx);
-+    if (rows->buffer && ggml_backend_buffer_is_host(rows->buffer)) {
++    // The F16 destination is a CUDA extension of get_rows, so it is only safe for a source that
++    // is already on a device. A view carries no buffer until the allocator runs, so ask the tensor
++    // it views: the K/V cache has one, a graph input such as the mask does not.
++    const ggml_tensor * owner = rows->view_src ? rows->view_src : rows;
++    const char * buft = owner->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(owner->buffer)) : nullptr;
++    if (!buft || strncmp(buft, "CUDA", 4) != 0) {
 +        return ggml_cast(ctx, t, GGML_TYPE_F16);
 +    }
 +    t->type  = GGML_TYPE_F16;
@@ -354,7 +359,7 @@ index fd6709295..8d64b417c 100644
  ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          llm_graph_input_attn_kv * inp,
          const llama_memory_hybrid_idx_context * mctx_hyb,
-@@ -837,7 +1138,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -837,7 +1143,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      // indexer reads the same block input as q/k/v; no cache or no ratio means dense
      const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
  
@@ -368,7 +373,7 @@ index fd6709295..8d64b417c 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -889,7 +1195,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -889,7 +1200,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
  
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
  

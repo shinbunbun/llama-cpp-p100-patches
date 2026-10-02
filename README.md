@@ -64,7 +64,7 @@ the patched arm runs the ones the patches make reachable (`--n-cpu-moe 48`,
 ubatch 6144 and the environment variables in
 [docs/patches.md](docs/patches.md)) — on this model that *is* the win, since the
 configuration is what the code buys. Prefill moves with it: a fresh 40k prompt
-takes 413 s stock against **177 s** patched (97.7 → **227.4 t/s**, +133%). Of the
+takes 413 s stock against **177.5 s** patched (97.6 → **227.4 t/s**, +133%). Of the
 decode gain, patches 01–31 account for 8.63 → 9.87 t/s and 32–46 for the rest.
 Stock is three rounds there, the patched arm two; the stock prefill spread
 (423 / 413 / 403 s) is the host page cache warming to 41 GB of weights.
@@ -87,18 +87,24 @@ above nor the `v0.2.0` non-regression check has been re-taken against the tree
 this rebase ships, so both numbers are now one more unmeasured rebase removed
 from what actually runs.
 
-**The table also predates patches 32–46**, and those were developed on a third
-model, not on either of these two. Nine of the fifteen are off by default. Of the
-six that are not, four fire only on one model architecture, one changes an MMQ
-tile for IQ4_NL on no-DP4A cards, and one adds CUDA fusions whose matchers need a
-hyper-connection graph — so on these two models the set should behave as it did
-before. That was measured rather than assumed, on the third model the card still
-has locally (27B dense, IQ3_XXS/IQ4_XS, all layers on the GPU, `llama-bench -fa 1
--ctk q4_0 -ctv q4_0`, six rounds with the arm order rotated): against the
-published 31-patch set, pp512 138.23 → 138.47 t/s and tg64 22.84 → 22.84 t/s
-(dropping each arm's first round, where a cold start costs both arms ~1%), and a
-third arm with the new fusions disabled lands in the same place. No change at
-this resolution.
+**Rows 1 and 2 also predate patches 32–46**, which were developed on the model in
+row 3. Nine of the fifteen are off by default. Of the six that are not, three fire
+only on that one model architecture (42, 44, 45), one changes an MMQ tile for
+IQ4_NL on no-DP4A cards (40), one adds CUDA fusions whose matchers need a
+hyper-connection graph (43), and one is a host-side change that does nothing
+until the expert cache uses it (34) — so on the models in rows 1 and 2 the set
+should behave as it did before.
+
+That was measured rather than assumed, on a dense 27B model this card still has
+locally (IQ3_XXS/IQ4_XS, all layers on the GPU, `llama-bench -fa 1 -ctk q4_0
+-ctv q4_0`, six rounds with the arm order rotated): against the published
+31-patch set, pp512 138.23 → 138.48 t/s and tg64 22.84 → 22.84 t/s, dropping each
+arm's first round, where a cold start costs 0.4–2.0% depending on the arm. A third
+arm with the new fusions disabled lands in the same place — that arm bounds the
+matcher's overhead, not the fusions themselves, since a model without
+hyper-connections never matches them. An earlier four-round run that always
+measured the arms in the same order had put the patched arm 0.4% behind on tg64;
+rotating the order removed it, which is why the rotation is in the protocol.
 
 This is the whole set against no patches. It is **not** the sum of the per-patch
 numbers below, which were each measured against the stack as it stood at the
@@ -130,10 +136,11 @@ time and do not compose.
   2 of 15 with 31 patches, 1 of 15 with all 44 — so the single red line is a
   tolerance-borderline case, not something the patches introduce.
   `TOPK_MOE(ne=[288,22,1,1],n_expert_used=8,with_norm=0)` behaves the same way at
-  a lower rate. Patches 32–46 additionally have per-patch evidence against the
+  a lower rate. Most of 32–46 additionally have per-patch evidence against the
   model they were written for (bit-identity checks, perplexity, a long-context
-  benchmark), and a non-regression A/B on a third model, in
-  [docs/patches.md](docs/patches.md).
+  benchmark), and the set as a whole has a non-regression A/B on a dense 27B
+  model, in [docs/patches.md](docs/patches.md). Two do not: 34 has no effect on
+  its own, and 44 carries no timing of its own — both say so in their entries.
 - Unless a patch says otherwise, its output is **bit-identical** to the
   unpatched build. A few do change output (09 where K needs three of the four
   warps, 12 at the widths it takes, 15 by design, 31 once the KV cache is
@@ -143,13 +150,13 @@ time and do not compose.
   it replaces was value-descending, 44 while the newest positions form a partial
   block, 45 when the padded flash-attention kernel is taken, 46 because an
   expert moves between the CPU and the GPU) and say so with the evidence. Of
-  those, 44 and 45 are the two that are **on by default**. 22 is the one
-  whose bit-identity is **measured rather than argued**: its `n_tokens <= 4`
-  default comes from a dense and an MoE model staying identical there, not
-  from a proof that a different compute-buffer layout cannot change a fusion
-  decision. 19 and 20 are **off by default** and excluded from that default
-  build: enabled, they are bit-identical on a dense model but produce
-  non-deterministic MoE decode output (see docs/patches.md).
+  those, 09, 12, 31, 44 and 45 are **on by default**, and 15, 35, 36, 39, 41 and
+  46 are not. 22 is the one whose bit-identity is **measured rather than
+  argued**: its `n_tokens <= 4` default comes from a dense and an MoE model
+  staying identical there, not from a proof that a different compute-buffer
+  layout cannot change a fusion decision. 19 and 20 are **off by default** and
+  excluded from that default build: enabled, they are bit-identical on a dense
+  model but produce non-deterministic MoE decode output (see docs/patches.md).
 - **This repository is expected to shrink.** Anything upstream fixes should be
   deleted here rather than carried forward; the value is in the measurements as
   much as in the code.
@@ -193,20 +200,20 @@ each was measured against the stack as it stood at the time.
 | 29 | `mmvq-iq3xxs-grid-smem` | CUDA | +3.1–7.6% decode (dense), bit-identical |
 | 30 | `mmvq-ksigns-smem` | CUDA | +0.2–1.8% decode, −9.3% IQ3_XXS kernel, bit-identical |
 | 31 | `fattn-f16-kv-chunk` | pre-Turing | −960 MiB compute buffer at ctx 262,144 (1,152 → 192), decode unchanged |
-| 32 | `sched-split-prefetch` | host | −9–10% decode with offloaded MoE experts, **off by default** (`LLAMA_SCHED_PREFETCH=1`) |
+| 32 | `sched-split-prefetch` | host | −9.5–10.5% decode with offloaded MoE experts, **off by default** (`LLAMA_SCHED_PREFETCH=1`) |
 | 33 | `sched-weight-prefetch` | host | −4.6–6.6% prefill, −1,222 MiB peak at ctx 262,144, **off by default** (`LLAMA_SCHED_WPF=<MiB>`) |
 | 34 | `mul-mat-id-negative-ids` | host | enables 46; no effect on its own |
 | 35 | `mmvq-mmid-batch-cap` | CUDA | −4–11% per ubatch with a resident expert cache, **off by default** (`LLAMA_MMVQ_MMID_MAX=<n>`) |
 | 36 | `mmvq-chunk-large-batch` | CUDA | −1,166 MiB pool after a speculative batch, **off by default** (`GGML_CUDA_MMVQ_CHUNK_MIN_MIB=<MiB>`) |
 | 37 | `getrows-narrow-batched` | CUDA | −9.4% prefill, bit-identical, **off by default** (`GGML_CUDA_GETROWS_FLAT_MAX=<n>`) |
 | 38 | `getrows-q4-0-block` | CUDA | −10.1% prefill, bit-identical, **off by default** (`GGML_CUDA_GETROWS_Q4_0_BLK=1`) |
-| 39 | `gdn-lanes-per-column` | CUDA (delta-net) | −4.3% prefill, −3% decode, **off by default** (`GGML_GDN_LPC=16`) |
-| 40 | `mmq-iq4-nl-threads` | pre-Volta | +3–4% on an IQ4_NL MoE down projection, bit-identical |
+| 39 | `gdn-lanes-per-column` | CUDA (delta-net) | −4.3% prefill, decode untouched (needs ≥32 tokens), **off by default** (`GGML_GDN_LPC=16`) |
+| 40 | `mmq-iq4-nl-threads` | no DP4A | +3–4% on an IQ4_NL MoE down projection, bit-identical |
 | 41 | `top-k-radix-select` | CUDA | 133 → 74.8 µs at k = 2,051, −2.3% decode, **off by default** (`GGML_CUDA_TOP_K_SELECT=1`) |
 | 42 | `qwen4exp-hc-exact` | model | −1% decode, bit-identical |
 | 43 | `fuse-hc-combine` | CUDA | two kernels for ~40 element-wise ops per layer, bit-identical |
-| 44 | `qwen4exp-qsa-block-key-cache` | model | removes decode's depth dependence (384 MiB at ctx 262,144) |
-| 45 | `qwen4exp-qsa-sparse-gather` | model | compute buffer 3,773 → 1,063 MiB; −7.0% prefill and −3% decode with `LLAMA_QSA_PAD=1` |
+| 44 | `qwen4exp-qsa-block-key-cache` | model | removes almost all of decode's depth dependence (384 MiB at ctx 262,144); no per-patch timing |
+| 45 | `qwen4exp-qsa-sparse-gather` | model | compute buffer 3,773 → 1,063 MiB; −7.0% prefill with `LLAMA_QSA_PAD=1`; output changes |
 | 46 | `qwen4exp-moe-expert-cache` | model | decode 51.0 ms/token at 40k on 60 slots (55.2 on 48), **off by default** (`LLAMA_MOE_CACHE=<slots>`) |
 
 Patches 19 and 20 are off by default. Their per-patch figures above were

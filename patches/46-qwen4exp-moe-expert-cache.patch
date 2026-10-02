@@ -37,7 +37,7 @@ index 651b60839..6fbd3458d 100644
          ggml_tensor * build_norm_gated(
                      ggml_tensor * input,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8d64b417c..3a4c85ab8 100644
+index 419629936..74ae42cab 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -398,11 +398,294 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
@@ -200,7 +200,7 @@ index 8d64b417c..3a4c85ab8 100644
 +        const char * m = getenv("LLAMA_MMVQ_MMID_MAX");
 +        const int64_t x   = e ? atoll(e) : 8;
 +        const int64_t off = o ? atoll(o) : 32;
-+        const int64_t mmq = m ? atoll(m) : 8;
++        const int64_t mmq = m ? std::min<int64_t>(atoll(m), 32) : 8;
 +        return std::max<int64_t>(1, std::min(std::min(x, mmq), off - 1));
 +    }();
 +    return v;
@@ -360,7 +360,7 @@ index 8d64b417c..3a4c85ab8 100644
          cb(cur, "ffn_out", il);
  
          res_hc = build_hc_combine(res_hc, cur, inject, model.layers[il].hc_ffn_inject, il);
-@@ -1344,29 +1636,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -1349,29 +1641,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
      return cur;
  }
  
@@ -485,7 +485,7 @@ index 8d64b417c..3a4c85ab8 100644
              build_ffn(cur,
                  model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                  model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-@@ -1384,7 +1751,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1389,7 +1756,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
  
          ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
          cb(ffn_shexp, "ffn_shexp_gated", il);
