@@ -1,0 +1,518 @@
+diff --git a/src/models/models.h b/src/models/models.h
+index 651b60839..6fbd3458d 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2281,6 +2281,15 @@ struct llama_model_qwen4exp : public llama_model_base {
+     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+ 
+     class llm_graph_input_qsa;
++    class llm_graph_input_moe_cache;
++
++    // routed experts recently used on the CPU, copied into device slots; null when disabled
++    struct moe_cache;
++    mutable std::shared_ptr<moe_cache> mcache;
++    mutable bool mcache_tried = false;
++
++    moe_cache * moe_cache_get() const;
++
+     // hc weights with the 1/hc factor folded in; exact, since hc is a power of two
+     mutable std::unordered_set<const ggml_tensor *> hc_prescaled;
+     mutable bool hc_fold_tried = false;
+@@ -2364,7 +2373,16 @@ struct llama_model_qwen4exp : public llama_model_base {
+ 
+         ggml_tensor * build_layer_ffn(
+                     ggml_tensor * cur,
+-                            int   il);
++                            int   il,
++                    ggml_tensor * independent = nullptr);
++
++        ggml_tensor * build_moe_cached(
++                    ggml_tensor * cur,
++                            int   il,
++                    ggml_tensor * independent,
++                    ggml_tensor * independent2);
++
++        llm_graph_input_moe_cache * moe_inp = nullptr;
+ 
+         ggml_tensor * build_norm_gated(
+                     ggml_tensor * input,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 9cecfd274..69e17f656 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -398,11 +398,298 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     return cur;
+ }
+ 
++struct llama_model_qwen4exp::moe_cache {
++    ~moe_cache() { ggml_backend_sched_clear_staging_area(buf.get()); }
++
++    int64_t n_slot   = 0;
++    int64_t n_used   = 0;
++    int64_t n_layer  = 0;
++    int64_t n_expert = 0;
++    int64_t interval = 32;
++    int64_t window   = 1024;
++
++    ggml_context_ptr        ctx;
++    ggml_backend_buffer_ptr buf;
++
++    std::vector<ggml_tensor *> up, gate, down, map_gpu, map_cpu;
++    ggml_tensor * hist = nullptr;
++
++    std::vector<std::vector<int32_t>> slot_of; // [n_layer][n_expert] -> slot or -1
++    std::vector<std::vector<int32_t>> in_slot; // [n_layer][n_slot]   -> expert or -1
++    std::vector<std::vector<int32_t>> counts;  // [n_layer][n_expert] over the window
++    std::vector<int32_t> ring;                 // [window][n_layer][n_used]
++    std::vector<int32_t> hist_host;
++
++    int64_t n_rec = 0;
++    int64_t since = 0;
++    bool    hist_pending = false;
++    int64_t warm      = 0;
++    int64_t warm_left = 0;
++
++    // the buffer doubles as the scheduler's staging area while no graph uses the cache
++    uint64_t stage_epoch = 0;
++
++    void reclaim(size_t extent) {
++        const char * base = (const char *) ggml_backend_buffer_get_base(buf.get());
++        auto clobbered = [&](const ggml_tensor * t) { return (size_t) ((const char *) t->data - base) < extent; };
++        for (int64_t il = 0; il < n_layer; ++il) {
++            if (clobbered(up[il]) || clobbered(gate[il]) || clobbered(down[il])) {
++                std::fill(slot_of[il].begin(), slot_of[il].end(), -1);
++                std::fill(in_slot[il].begin(), in_slot[il].end(), -1);
++                for (ggml_tensor * t : { up[il], gate[il], down[il] }) {
++                    ggml_backend_tensor_memset(t, 0, n_slot*t->nb[2], t->nb[2]);
++                }
++                upload_maps(il);
++            } else if (clobbered(map_gpu[il]) || clobbered(map_cpu[il])) {
++                upload_maps(il);
++            }
++        }
++        since = interval;
++    }
++
++    void upload_maps(int64_t il) {
++        std::vector<int32_t> g(n_expert), c(n_expert);
++        for (int64_t e = 0; e < n_expert; ++e) {
++            const int32_t s = slot_of[il][e];
++            g[e] = s >= 0 ? s : (int32_t) n_slot;
++            c[e] = s >= 0 ? -1 : (int32_t) e;
++        }
++        ggml_backend_tensor_set(map_gpu[il], g.data(), 0, ggml_nbytes(map_gpu[il]));
++        ggml_backend_tensor_set(map_cpu[il], c.data(), 0, ggml_nbytes(map_cpu[il]));
++    }
++};
++
++// A miss maps to the shared zero slot, so ids repeat within a token, and the CPU branch carries -1.
++// Only MMVQ tolerates the former and nothing on the device the latter, so stay below both the MMVQ
++// ceiling (LLAMA_MMVQ_MMID_MAX) and the size at which CPU weights get offloaded.
++static int64_t moe_cache_max_tok() {
++    static const int64_t v = [] {
++        const char * e = getenv("LLAMA_MOE_CACHE_MAXTOK");
++        const char * o = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
++        const char * m = getenv("LLAMA_MMVQ_MMID_MAX");
++        const int64_t x   = e ? atoll(e) : 8;
++        const int64_t off = o ? atoll(o) : 32;
++        // 4 is the smallest built-in ceiling in any of the per-type tables, and the host cannot
++        // read the one this device uses
++        const int64_t mmq = m ? std::min<int64_t>(atoll(m), 32) : 4;
++        const int64_t v   = std::min(std::min(x, mmq), off - 1);
++        return v > 0 ? v : 0;
++    }();
++    return v;
++}
++
++llama_model_qwen4exp::moe_cache * llama_model_qwen4exp::moe_cache_get() const {
++    if (mcache_tried) {
++        return mcache.get();
++    }
++    mcache_tried = true;
++
++    const char * e = getenv("LLAMA_MOE_CACHE");
++    const int64_t n_slot = e ? atoll(e) : 0;
++    if (n_slot < hparams.n_expert_used(0) || hparams.no_alloc || moe_cache_max_tok() <= 0 ||
++            hparams.n_expert_groups > 1) {
++        return nullptr;
++    }
++
++    const int64_t n_layer = hparams.n_layer();
++    for (int64_t il = 0; il < n_layer; ++il) {
++        const auto & l = layers[il];
++        if (!l.ffn_up_exps || !l.ffn_gate_exps || !l.ffn_down_exps || l.ffn_gate_up_exps ||
++                l.ffn_up_exps_s || l.ffn_gate_exps_s || l.ffn_down_exps_s ||
++                !l.ffn_up_exps->buffer || !ggml_backend_buffer_is_host(l.ffn_up_exps->buffer) ||
++                !ggml_backend_buffer_is_host(l.ffn_gate_exps->buffer) || !ggml_backend_buffer_is_host(l.ffn_down_exps->buffer) ||
++                hparams.swiglu_clamp_exp[il] > 1e-6f) {
++            LLAMA_LOG_WARN("%s: expert cache disabled: layer %lld experts are not all host-side\n", __func__, (long long) il);
++            return nullptr;
++        }
++    }
++
++    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++    if (!dev) {
++        return nullptr;
++    }
++
++    auto mc = std::make_shared<moe_cache>();
++    mc->n_slot   = n_slot;
++    mc->n_used   = hparams.n_expert_used(0);
++    mc->n_layer  = n_layer;
++    mc->n_expert = hparams.n_expert;
++    if (const char * v = getenv("LLAMA_MOE_CACHE_INTERVAL")) { mc->interval = std::max<int64_t>(1, atoll(v)); }
++    if (const char * v = getenv("LLAMA_MOE_CACHE_WINDOW"))   { mc->window   = std::max<int64_t>(1, atoll(v)); }
++
++    ggml_init_params params = {
++        /*.mem_size   =*/ size_t((8*n_layer + 4)*ggml_tensor_overhead()),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    mc->ctx.reset(ggml_init(params));
++
++    auto slots_like = [&](const ggml_tensor * w) {
++        return ggml_new_tensor_3d(mc->ctx.get(), w->type, w->ne[0], w->ne[1], n_slot + 1);
++    };
++    for (int64_t il = 0; il < n_layer; ++il) {
++        mc->up     .push_back(slots_like(layers[il].ffn_up_exps));
++        mc->gate   .push_back(slots_like(layers[il].ffn_gate_exps));
++        mc->down   .push_back(slots_like(layers[il].ffn_down_exps));
++        mc->map_gpu.push_back(ggml_new_tensor_2d(mc->ctx.get(), GGML_TYPE_I32, 1, mc->n_expert));
++        mc->map_cpu.push_back(ggml_new_tensor_2d(mc->ctx.get(), GGML_TYPE_I32, 1, mc->n_expert));
++    }
++    mc->hist = ggml_new_tensor_2d(mc->ctx.get(), GGML_TYPE_I32, mc->n_used, n_layer);
++    {
++        const char * e = getenv("LLAMA_MOE_WARM");
++        mc->warm = e ? std::max<int64_t>(0, atoll(e)) : 32;
++    }
++
++    mc->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mc->ctx.get(), ggml_backend_dev_buffer_type(dev)));
++    if (!mc->buf) {
++        LLAMA_LOG_WARN("%s: expert cache disabled: allocation failed\n", __func__);
++        return nullptr;
++    }
++    ggml_backend_buffer_clear(mc->buf.get(), 0);
++    ggml_backend_sched_set_staging_area(mc->buf.get(), ggml_backend_buffer_get_size(mc->buf.get()));
++    mc->stage_epoch = ggml_backend_sched_staging_epoch(nullptr);
++    LLAMA_LOG_INFO("%s: expert cache: %lld slots per layer, %.2f MiB\n", __func__, (long long) n_slot,
++            ggml_backend_buffer_get_size(mc->buf.get())/1024.0/1024.0);
++
++    mc->slot_of.assign(n_layer, std::vector<int32_t>(mc->n_expert, -1));
++    mc->in_slot.assign(n_layer, std::vector<int32_t>(n_slot, -1));
++    mc->counts .assign(n_layer, std::vector<int32_t>(mc->n_expert, 0));
++    mc->ring   .assign(mc->window*n_layer*mc->n_used, -1);
++    mc->hist_host.assign(mc->n_used*n_layer, 0);
++    for (int64_t il = 0; il < n_layer; ++il) {
++        mc->upload_maps(il);
++    }
++
++    mcache = mc;
++    return mcache.get();
++}
++
++class llama_model_qwen4exp::llm_graph_input_moe_cache : public llm_graph_input_i {
++public:
++    llm_graph_input_moe_cache(const llama_model_qwen4exp & model, bool active) : model(model), active(active) {}
++    virtual ~llm_graph_input_moe_cache() = default;
++
++    void set_input(const llama_ubatch * ubatch) override {
++        moe_cache * mc = model.mcache.get();
++        if (!mc) {
++            return;
++        }
++        const int64_t L = mc->n_layer, k = mc->n_used;
++
++        size_t extent = 0;
++        const uint64_t epoch = ggml_backend_sched_staging_epoch(&extent);
++        if (epoch != mc->stage_epoch) {
++            ggml_backend_sched_staging_synchronize();
++            mc->stage_epoch = epoch;
++            mc->reclaim(extent);
++        }
++
++        if (mc->hist_pending) {
++            ggml_backend_tensor_get(mc->hist, mc->hist_host.data(), 0, ggml_nbytes(mc->hist));
++            const int64_t slot = mc->n_rec % mc->window;
++            for (int64_t il = 0; il < L; ++il) {
++                int32_t * r = &mc->ring[(slot*L + il)*k];
++                for (int64_t j = 0; j < k; ++j) {
++                    if (r[j] >= 0) {
++                        mc->counts[il][r[j]]--;
++                    }
++                    const int32_t e = mc->hist_host[il*k + j];
++                    r[j] = (e >= 0 && e < mc->n_expert) ? e : -1;
++                    if (r[j] >= 0) {
++                        mc->counts[il][r[j]]++;
++                    }
++                }
++            }
++            mc->n_rec++;
++            mc->since++;
++            mc->hist_pending = false;
++        }
++
++        const int64_t interval = mc->warm_left > 0 ? std::min<int64_t>(8, mc->interval) : mc->interval;
++        if (mc->warm_left > 0) {
++            mc->warm_left--;
++        }
++        if (active && mc->since >= interval) {
++            refresh(*mc);
++        }
++
++        mc->hist_pending = active;
++        // a prefill replaces the context, so let the window re-form quickly afterwards
++        if (!active && ubatch != nullptr && ubatch->n_tokens > moe_cache_max_tok()) {
++            mc->warm_left = mc->warm;
++        }
++    }
++
++    bool can_reuse(const llm_graph_params & params) override {
++        return (params.ubatch.n_tokens <= moe_cache_max_tok()) == active;
++    }
++
++    const llama_model_qwen4exp & model;
++    const bool active;
++
++private:
++    void refresh(moe_cache & mc) {
++        std::vector<int32_t> order(mc.n_expert);
++        for (int64_t il = 0; il < mc.n_layer; ++il) {
++            const auto & cnt = mc.counts[il];
++            for (int64_t e = 0; e < mc.n_expert; ++e) {
++                order[e] = (int32_t) e;
++            }
++            const int64_t n_top = std::min(mc.n_slot, mc.n_expert);
++            std::partial_sort(order.begin(), order.begin() + n_top, order.end(),
++                    [&](int32_t a, int32_t b) { return cnt[a] != cnt[b] ? cnt[a] > cnt[b] : a < b; });
++
++            std::vector<char> want(mc.n_expert, 0);
++            for (int64_t i = 0; i < n_top; ++i) {
++                if (cnt[order[i]] > 0) {
++                    want[order[i]] = 1;
++                }
++            }
++
++            std::vector<int32_t> free_slots;
++            for (int64_t s = 0; s < mc.n_slot; ++s) {
++                const int32_t e = mc.in_slot[il][s];
++                if (e < 0 || !want[e]) {
++                    if (e >= 0) {
++                        mc.slot_of[il][e] = -1;
++                    }
++                    mc.in_slot[il][s] = -1;
++                    free_slots.push_back((int32_t) s);
++                }
++            }
++
++            bool changed = false;
++            for (int64_t i = 0; i < n_top && !free_slots.empty(); ++i) {
++                const int32_t e = order[i];
++                if (!want[e] || mc.slot_of[il][e] >= 0) {
++                    continue;
++                }
++                const int32_t s = free_slots.back();
++                free_slots.pop_back();
++                const auto & l = model.layers[il];
++                for (auto [dst, src] : { std::make_pair(mc.up[il], l.ffn_up_exps), std::make_pair(mc.gate[il], l.ffn_gate_exps),
++                                         std::make_pair(mc.down[il], l.ffn_down_exps) }) {
++                    ggml_backend_tensor_set(dst, (const char *) src->data + e*src->nb[2], s*dst->nb[2], src->nb[2]);
++                }
++                mc.slot_of[il][e] = s;
++                mc.in_slot[il][s] = e;
++                changed = true;
++            }
++            if (changed || !free_slots.empty()) {
++                mc.upload_maps(il);
++            }
++        }
++        mc.since = 0;
++    }
++};
++
++
+ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
+     llm_build_delta_net_base(params), model(model) {
+     const int64_t hc = hparams.dsv4_hc_mult;
+ 
+     static_cast<const llama_model_qwen4exp &>(model).hc_fold();
++
+     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
+ 
+     int sections[4];
+@@ -414,6 +701,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+ 
+     auto * inp = build_inp_mem_hybrid();
+ 
++    {
++        const auto & m = static_cast<const llama_model_qwen4exp &>(model);
++        if (m.moe_cache_get() != nullptr) {
++            auto mi = std::make_unique<llm_graph_input_moe_cache>(m, n_tokens <= moe_cache_max_tok());
++            moe_inp = mi.get();
++            res->add_input(std::move(mi));
++        }
++    }
++
+     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
+     // the indexer cache inside it is absent when the GGUF has no indexer tensors
+     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
+@@ -482,7 +778,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+                 model.layers[il].hc_ffn_inject,
+                 &inject, il);
+ 
+-        cur = build_layer_ffn(cur, il);
++        cur = build_layer_ffn(cur, il, inject);
+         cb(cur, "ffn_out", il);
+ 
+         res_hc = build_hc_combine(res_hc, cur, inject, model.layers[il].hc_ffn_inject, il);
+@@ -1349,29 +1645,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+     return cur;
+ }
+ 
+-ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+-    GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
++ggml_tensor * llama_model_qwen4exp::graph::build_moe_cached(ggml_tensor * cur, const int il, ggml_tensor * independent, ggml_tensor * independent2) {
++    const auto & m  = static_cast<const llama_model_qwen4exp &>(model);
++    const auto * mc = m.mcache.get();
++    const auto & layer = model.layers[il];
++
++    const int64_t n_embd_ = cur->ne[0];
++    const int64_t n_tok   = cur->ne[1];
++    const int64_t k       = n_expert_used;
++
++    ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);
++    cb(logits, "ffn_moe_logits", il);
++    ggml_tensor * probs = ggml_soft_max(ctx0, logits);
++    cb(probs, "ffn_moe_probs", il);
++
++    ggml_tensor * selected = ggml_argsort_top_k(ctx0, probs, k);
++    cb(selected->src[0], "ffn_moe_argsort", il);
++    cb(selected, "ffn_moe_topk", il);
++
++    ggml_tensor * weights = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tok), selected);
++    cb(weights, "ffn_moe_weights", il);
++    weights = ggml_reshape_2d(ctx0, weights, k, n_tok);
++    ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
++    cb(weights_sum, "ffn_moe_weights_sum", il);
++    weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
++    cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
++    weights = ggml_div(ctx0, weights, weights_sum);
++    cb(weights, "ffn_moe_weights_norm", il);
++    weights = ggml_reshape_3d(ctx0, weights, 1, k, n_tok);
++    if (hparams.expert_weights_scale != 0.0f && hparams.expert_weights_scale != 1.0f) {
++        weights = ggml_scale(ctx0, weights, hparams.expert_weights_scale);
++        cb(weights, "ffn_moe_weights_scaled", il);
++    }
++    ggml_build_forward_expand(gf, weights);
+ 
+-    ggml_tensor * moe_out =
+-        build_moe_ffn(cur,
+-            model.layers[il].ffn_gate_inp,
+-            model.layers[il].ffn_up_exps,
+-            model.layers[il].ffn_gate_exps,
+-            model.layers[il].ffn_down_exps,
+-            nullptr,
+-            n_expert, n_expert_used,
+-            LLM_FFN_SILU, true,
+-            hparams.expert_weights_scale,
+-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, model.layers[il].ffn_gate_up_exps,
+-            model.layers[il].ffn_up_exps_s,
+-            model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
+-    cb(moe_out, "ffn_moe_out", il);
++    if (n_tok > 0) {
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, selected, k, 1, selected->nb[1], 0)),
++                ggml_view_2d(ctx0, mc->hist, k, 1, mc->hist->nb[1], il*mc->hist->nb[1])));
++    }
++
++    ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected), k*n_tok);
++    ggml_tensor * ids_gpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mc->map_gpu[il], sel_flat), k, n_tok);
++    ggml_tensor * ids_cpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mc->map_cpu[il], sel_flat), k, n_tok);
++    ggml_build_forward_expand(gf, ids_cpu);
++
++    ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd_, 1, n_tok);
++
++    auto branch = [&](ggml_tensor * w_up, ggml_tensor * w_gate, ggml_tensor * w_down, ggml_tensor * ids) {
++        ggml_tensor * up = build_lora_mm_id(w_up, x, ids);
++        cb(up, "ffn_moe_up", il);
++        ggml_tensor * g = build_lora_mm_id(w_gate, x, ids);
++        cb(g, "ffn_moe_gate", il);
++        ggml_tensor * act = ggml_swiglu_split(ctx0, g, up);
++        cb(act, "ffn_moe_swiglu", il);
++        ggml_tensor * out = build_lora_mm_id(w_down, act, ids);
++        cb(out, "ffn_moe_down", il);
++        return out;
++    };
+ 
+-    // shared experts, as in the Qwen3Next reference
++    // device work queued between the CPU branch inputs and the CPU branch runs while the CPU computes
++    ggml_tensor * on_gpu = branch(mc->up[il], mc->gate[il], mc->down[il], ids_gpu);
++    ggml_build_forward_expand(gf, on_gpu);
++    if (independent) {
++        ggml_build_forward_expand(gf, independent);
++    }
++    if (independent2) {
++        ggml_build_forward_expand(gf, independent2);
++    }
++    ggml_tensor * experts = ggml_add(ctx0, on_gpu,
++            branch(layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, ids_cpu));
++    experts = ggml_mul(ctx0, experts, weights);
++    cb(experts, "ffn_moe_weighted", il);
++    ggml_build_forward_expand(gf, experts);
++
++    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
++    for (int64_t i = 0; i < k; ++i) {
++        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd_, n_tok, experts->nb[2], i*experts->nb[1]);
++        ggml_build_forward_expand(gf, cur_experts[i]);
++    }
++    ggml_tensor * moe_out = cur_experts[0];
++    for (int64_t i = 1; i < k; ++i) {
++        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
++        ggml_build_forward_expand(gf, moe_out);
++    }
++    return moe_out;
++}
++
++static bool inject_late() {
++    static const bool v = getenv("LLAMA_INJECT_LATE") && atoi(getenv("LLAMA_INJECT_LATE"));
++    return v;
++}
++
++ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * independent) {
++    GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
++
++    ggml_tensor * ffn_shexp = nullptr;
+     if (model.layers[il].ffn_up_shexp != nullptr) {
+-        ggml_tensor * ffn_shexp =
++        // shared experts, as in the Qwen3Next reference
++        ffn_shexp =
+             build_ffn(cur,
+                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                 model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+@@ -1389,7 +1760,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+ 
+         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+         cb(ffn_shexp, "ffn_shexp_gated", il);
++    }
++
++    ggml_tensor * moe_out = moe_inp && moe_inp->active && cur->ne[1] > 0 ? build_moe_cached(cur, il, ffn_shexp, inject_late() ? nullptr : independent) :
++        build_moe_ffn(cur,
++            model.layers[il].ffn_gate_inp,
++            model.layers[il].ffn_up_exps,
++            model.layers[il].ffn_gate_exps,
++            model.layers[il].ffn_down_exps,
++            nullptr,
++            n_expert, n_expert_used,
++            LLM_FFN_SILU, true,
++            hparams.expert_weights_scale,
++            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
++            nullptr, model.layers[il].ffn_gate_up_exps,
++            model.layers[il].ffn_up_exps_s,
++            model.layers[il].ffn_gate_exps_s,
++            model.layers[il].ffn_down_exps_s);
++    cb(moe_out, "ffn_moe_out", il);
+ 
++    if (ffn_shexp) {
+         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+         cb(cur, "ffn_out", il);
+     } else {

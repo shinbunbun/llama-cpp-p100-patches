@@ -41,5 +41,20 @@
     ../patches/29-mmvq-iq3xxs-grid-smem.patch
     ../patches/30-mmvq-ksigns-smem.patch
     ../patches/31-fattn-f16-kv-chunk.patch
+    ../patches/32-sched-split-prefetch.patch
+    ../patches/33-sched-weight-prefetch.patch
+    ../patches/34-mul-mat-id-negative-ids.patch
+    ../patches/35-mmvq-mmid-batch-cap.patch
+    ../patches/36-mmvq-chunk-large-batch.patch
+    ../patches/37-getrows-narrow-batched.patch
+    ../patches/38-getrows-q4-0-block.patch
+    ../patches/39-gdn-lanes-per-column.patch
+    ../patches/40-mmq-iq4-nl-threads.patch
+    ../patches/41-top-k-radix-select.patch
+    ../patches/42-qwen4exp-hc-exact.patch
+    ../patches/43-fuse-hc-combine.patch
+    ../patches/44-qwen4exp-qsa-block-key-cache.patch
+    ../patches/45-qwen4exp-qsa-sparse-gather.patch
+    ../patches/46-qwen4exp-moe-expert-cache.patch
   ];
 }

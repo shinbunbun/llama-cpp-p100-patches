@@ -1,0 +1,438 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c3fe3a050..5d325bc1e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -27,6 +27,7 @@
+ #include "ggml-cuda/fattn.cuh"
+ #include "ggml-cuda/fwht.cuh"
+ #include "ggml-cuda/getrows.cuh"
++#include "ggml-cuda/hc-fuse.cuh"
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
+ #include "ggml-cuda/mmq.cuh"
+@@ -3725,6 +3726,279 @@ static bool ggml_cuda_take_deferred_gather(ggml_backend_cuda_context * cuda_ctx,
+     return out.base != nullptr && out.rows != nullptr && out.gather_dst != nullptr && out.row_stride > 0;
+ }
+ 
++// The fused kernels read their sources while writing the output, so a source the allocator has
++// recycled into the output's buffer would be clobbered. Element-wise aliasing at the same index
++// (the in-place ADD the allocator likes to make) stays safe and is allowed separately.
++static bool ggml_cuda_hc_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a || !b || !a->data || !b->data || !a->buffer || !b->buffer) {
++        return true;
++    }
++    const char * as = (const char *) a->data;
++    const char * ae = as + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++    const char * bs = (const char *) b->data;
++    const char * be = bs + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++    return as < be && bs < ae;
++}
++
++// Every node the two hyper-connection fusions elide must be consumed only inside the matched
++// range, otherwise skipping its write would change what a later node reads.
++static bool ggml_cuda_hc_range_self_contained(const ggml_cgraph * cgraph, int first, int last) {
++    for (int j = first; j <= last; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (!ggml_cuda_is_view_or_noop(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            return false;
++        }
++        if (j == last) {
++            break;
++        }
++        if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            return false;
++        }
++        int32_t uses = 0;
++        for (int k = first; k <= last; ++k) {
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                uses += cgraph->nodes[k]->src[s] == n;
++            }
++        }
++        if (uses != ggml_node_get_use_count(cgraph, j)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// MUL(xn, gate) -> ADD chain over the hc stream views -> SCALE(1/hc)
++static int ggml_cuda_try_hc_mix_fusion(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool dry) {
++    const ggml_tensor * mul = cgraph->nodes[i];
++    if (mul->op != GGML_OP_MUL || mul->src[0] == nullptr || mul->src[1] == nullptr) {
++        return 0;
++    }
++    const ggml_tensor * xn   = mul->src[0];
++    const ggml_tensor * gate = mul->src[1];
++    if (mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
++        !ggml_are_same_shape(mul, xn) || !ggml_are_same_shape(mul, gate) ||
++        xn->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(xn) || !ggml_is_contiguous(gate) || mul->ne[2] != 1 || mul->ne[3] != 1) {
++        return 0;
++    }
++
++    const int64_t hc_dim = mul->ne[0];
++    const int64_t nt     = mul->ne[1];
++
++    std::vector<const ggml_tensor *> adds;
++    const ggml_tensor * scale = nullptr;
++    int last = i;
++    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(n)) {
++            continue;
++        }
++        if (n->op == GGML_OP_ADD) {
++            adds.push_back(n);
++            last = j;
++            continue;
++        }
++        if (n->op == GGML_OP_SCALE && !adds.empty()) {
++            scale = n;
++            last  = j;
++        }
++        break;
++    }
++    if (scale == nullptr || adds.empty() || scale->src[0] != adds.back()) {
++        return 0;
++    }
++
++    const int64_t hc     = (int64_t) adds.size() + 1;
++    const int64_t n_embd = hc_dim / hc;
++    if (n_embd * hc != hc_dim || scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) ||
++        scale->ne[0] != n_embd || scale->ne[1] != nt || scale->ne[2] != 1 || scale->ne[3] != 1) {
++        return 0;
++    }
++
++    float sp[2] = { 0.0f, 0.0f };
++    memcpy(sp, scale->op_params, sizeof(sp));
++    if (sp[1] != 0.0f || sp[0] != 1.0f / (float) hc) {
++        return 0;
++    }
++
++    // each ADD folds in stream c as a [n_embd, nt] view of the MUL result at offset c
++    const size_t row = ggml_row_size(GGML_TYPE_F32, n_embd);
++    for (int64_t c = 1; c < hc; ++c) {
++        const ggml_tensor * a  = adds[c - 1];
++        const ggml_tensor * s0 = a->src[0];
++        const ggml_tensor * s1 = a->src[1];
++        if (a->type != GGML_TYPE_F32 || a->ne[0] != n_embd || a->ne[1] != nt ||
++            s1->type != GGML_TYPE_F32 || s1->ne[0] != n_embd || s1->ne[1] != nt ||
++            s1->nb[1] != row * hc || (const char *) s1->data != (const char *) mul->data + row * c) {
++            return 0;
++        }
++        const bool s0_ok = c == 1
++            ? (s0->ne[0] == n_embd && s0->ne[1] == nt && s0->nb[1] == row * hc && s0->data == mul->data)
++            : (s0 == adds[c - 2]);
++        if (!s0_ok) {
++            return 0;
++        }
++    }
++
++    if (!ggml_cuda_hc_range_self_contained(cgraph, i, last)) {
++        return 0;
++    }
++    if (ggml_cuda_hc_overlaps(scale, xn) || ggml_cuda_hc_overlaps(scale, gate)) {
++        return 0;
++    }
++
++    if (!dry) {
++        ggml_cuda_op_hc_mix_reduce(*cuda_ctx, xn, gate, cgraph->nodes[last], (int) hc, sp[0]);
++    }
++    return last - i;
++}
++
++// REPEAT(block_out) -> SIGMOID(inject) -> SCALE(2) -> MUL -> ADD(residual, .)
++static int ggml_cuda_try_hc_combine_fusion(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * rep = cgraph->nodes[i];
++    const ggml_tensor * bo  = rep->src[0];
++    if (rep->type != GGML_TYPE_F32 || bo->type != GGML_TYPE_F32 || !ggml_is_contiguous(bo) ||
++        rep->ne[3] != 1 || bo->ne[0] != rep->ne[0] || ggml_nelements(bo) != rep->ne[0]*rep->ne[2]) {
++        return 0;
++    }
++
++    const ggml_tensor * chain[4] = { nullptr, nullptr, nullptr, nullptr };
++    int last = i;
++    int got  = 0;
++    for (int j = i + 1; j < cgraph->n_nodes && got < 4; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(n)) {
++            continue;
++        }
++        static const ggml_op want[4] = { GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_ADD };
++        if (n->op != want[got] || (got == 0 && ggml_get_unary_op(n) != GGML_UNARY_OP_SIGMOID)) {
++            return 0;
++        }
++        chain[got++] = n;
++        last = j;
++    }
++    if (got != 4) {
++        return 0;
++    }
++
++    const ggml_tensor * sig = chain[0];
++    const ggml_tensor * sc  = chain[1];
++    const ggml_tensor * mul = chain[2];
++    const ggml_tensor * add = chain[3];
++    const ggml_tensor * inj = sig->src[0];
++    const ggml_tensor * res = add->src[0];
++
++    float sp[2] = { 0.0f, 0.0f };
++    memcpy(sp, sc->op_params, sizeof(sp));
++    if (sc->src[0] != sig || sp[1] != 0.0f || sig->type != GGML_TYPE_F32 ||
++        inj->type != GGML_TYPE_F32 || !ggml_is_contiguous(inj) || !ggml_is_contiguous(sig)) {
++        return 0;
++    }
++    if (mul->src[0] != rep || mul->src[1]->data != sc->data || add->src[1] != mul ||
++        add->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 ||
++        !ggml_are_same_shape(add, res) || !ggml_are_same_shape(add, rep) || add->ne[3] != 1) {
++        return 0;
++    }
++
++    const int64_t hc = add->ne[1];
++    const int64_t nt = add->ne[2];
++    // hc_combine_f32 indexes the weight as [1, hc, nt]; ggml_mul would also admit [hc, 1, nt]
++    if (mul->src[1]->ne[0] != 1 || mul->src[1]->ne[1] != hc || mul->src[1]->ne[2] != nt) {
++        return 0;
++    }
++    if (inj->ne[0] != hc || ggml_nelements(inj) != hc*nt) {
++        return 0;
++    }
++
++    if (!ggml_cuda_hc_range_self_contained(cgraph, i, last)) {
++        return 0;
++    }
++
++    if (ggml_cuda_hc_overlaps(add, bo) || ggml_cuda_hc_overlaps(add, inj) ||
++        (ggml_cuda_hc_overlaps(add, res) && !(res->data == add->data && ggml_are_same_stride(res, add)))) {
++        return 0;
++    }
++
++    ggml_cuda_op_hc_combine(*cuda_ctx, res, bo, inj, cgraph->nodes[last], sp[0], false);
++    return last - i;
++}
++
++// SIGMOID(inject) -> SCALE(2) -> MUL(repeat(block_out), .) -> ADD(residual, .)
++// The REPEAT is left in place: graph order puts the inject matmul between it and the SIGMOID,
++// so it is already executed by the time this fires.
++static int ggml_cuda_try_hc_combine_from_sigmoid(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * sig = cgraph->nodes[i];
++    const ggml_tensor * inj = sig->src[0];
++    if (sig->type != GGML_TYPE_F32 || inj == nullptr || inj->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(sig) || !ggml_is_contiguous(inj)) {
++        return 0;
++    }
++
++    const ggml_tensor * chain[3] = { nullptr, nullptr, nullptr };
++    int last = i;
++    int got  = 0;
++    for (int j = i + 1; j < cgraph->n_nodes && got < 3; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(n)) {
++            continue;
++        }
++        static const ggml_op want[3] = { GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_ADD };
++        if (n->op != want[got]) {
++            return 0;
++        }
++        chain[got++] = n;
++        last = j;
++    }
++    if (got != 3) {
++        return 0;
++    }
++
++    const ggml_tensor * sc  = chain[0];
++    const ggml_tensor * mul = chain[1];
++    const ggml_tensor * add = chain[2];
++    const ggml_tensor * rep = mul->src[0];
++    const ggml_tensor * res = add->src[0];
++
++    float sp[2] = { 0.0f, 0.0f };
++    memcpy(sp, sc->op_params, sizeof(sp));
++    if (sc->src[0] != sig || sp[1] != 0.0f || mul->src[1]->data != sc->data || add->src[1] != mul ||
++        rep == nullptr || rep->op != GGML_OP_REPEAT || rep->type != GGML_TYPE_F32) {
++        return 0;
++    }
++
++    // the pre-repeat tensor dies at the REPEAT, so by now its buffer may hold something else
++    const ggml_tensor * bo = rep;
++    if (add->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 ||
++        !ggml_are_same_shape(add, res) || !ggml_are_same_shape(add, rep) || add->ne[3] != 1) {
++        return 0;
++    }
++
++    const int64_t hc = add->ne[1];
++    const int64_t nt = add->ne[2];
++    // hc_combine_f32 indexes the weight as [1, hc, nt]; ggml_mul would also admit [hc, 1, nt]
++    if (mul->src[1]->ne[0] != 1 || mul->src[1]->ne[1] != hc || mul->src[1]->ne[2] != nt) {
++        return 0;
++    }
++    if (inj->ne[0] != hc || ggml_nelements(inj) != hc*nt) {
++        return 0;
++    }
++
++    if (!ggml_cuda_hc_range_self_contained(cgraph, i, last)) {
++        return 0;
++    }
++
++    const auto inplace_ok = [&](const ggml_tensor * src) {
++        return !ggml_cuda_hc_overlaps(add, src) ||
++               (src->data == add->data && ggml_are_same_stride(src, add));
++    };
++    if (ggml_cuda_hc_overlaps(add, inj) || !inplace_ok(bo) || !inplace_ok(res)) {
++        return 0;
++    }
++
++    ggml_cuda_op_hc_combine(*cuda_ctx, res, bo, inj, cgraph->nodes[last], sp[0], true);
++    return last - i;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
+                               bool allow_defer) {
+@@ -3736,6 +4010,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // bitmask: 1 disables the stream reduction, 2 the repeat-anchored combine, 4 the sigmoid-anchored one
++    static const int hc_off = getenv("GGML_CUDA_DISABLE_FUSE_HC") ? std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_HC")) : 0;
++    if (hc_off != 7) {
++        if (!(hc_off & 1) && node->op == GGML_OP_MUL) {
++            const int skip = ggml_cuda_try_hc_mix_fusion(cuda_ctx, cgraph, i, false);
++            if (skip > 0) {
++                return skip;
++            }
++        }
++        if (!(hc_off & 2) && node->op == GGML_OP_REPEAT) {
++            const int skip = ggml_cuda_try_hc_combine_fusion(cuda_ctx, cgraph, i);
++            if (skip > 0) {
++                return skip;
++            }
++        }
++        if (!(hc_off & 4) && node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
++            const int skip = ggml_cuda_try_hc_combine_from_sigmoid(cuda_ctx, cgraph, i);
++            if (skip > 0) {
++                return skip;
++            }
++        }
++    }
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+@@ -4693,9 +4990,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
+-    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+-        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+-        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
++    // taking the MUL here would hide the head of the hyper-connection stream reduction
++    const bool hc_mix_head = !(hc_off & 1) && i + 1 < cgraph->n_nodes &&
++                             ggml_cuda_try_hc_mix_fusion(cuda_ctx, cgraph, i + 1, true) > 0;
++    if (!hc_mix_head &&
++        (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
++         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
++         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS }))) {
+         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+         return 1;
+     }
+diff --git a/ggml/src/ggml-cuda/hc-fuse.cu b/ggml/src/ggml-cuda/hc-fuse.cu
+new file mode 100644
+index 000000000..4eea71101
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-fuse.cu
+@@ -0,0 +1,75 @@
++#include "hc-fuse.cuh"
++
++#define HC_FUSE_BLOCK_SIZE 256
++
++// The element order of every operation below mirrors the unfused graph exactly, and every
++// arithmetic step uses an intrinsic so the compiler cannot contract a mul+add into an fma.
++
++static __global__ void hc_mix_reduce_f32(
++        const float * __restrict__ xn, const float * __restrict__ gate, float * __restrict__ dst,
++        const int n_embd, const int hc, const int64_t n_elem, const float scale) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_elem) {
++        return;
++    }
++    const int     e = i % n_embd;
++    const int64_t t = i / n_embd;
++
++    const float * x = xn   + t*n_embd*hc;
++    const float * g = gate + t*n_embd*hc;
++
++    float acc = __fmul_rn(x[e], g[e]);
++    for (int c = 1; c < hc; ++c) {
++        acc = __fadd_rn(acc, __fmul_rn(x[c*n_embd + e], g[c*n_embd + e]));
++    }
++    dst[i] = __fmul_rn(acc, scale);
++}
++
++static __global__ void hc_combine_f32(
++        const float * __restrict__ res, const float * __restrict__ bo,
++        const float * __restrict__ inj, float * __restrict__ dst,
++        const int n_embd, const int hc, const int64_t n_elem,
++        const int64_t res_s1, const int64_t res_s2, const int64_t bo_s1, const int64_t bo_s2,
++        const int64_t dst_s1, const int64_t dst_s2, const float wscale) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_elem) {
++        return;
++    }
++    const int     e = i % n_embd;
++    const int     c = (i / n_embd) % hc;
++    const int64_t t = i / ((int64_t) n_embd * hc);
++
++    const float w = __fmul_rn(1.0f / (1.0f + expf(-inj[t*hc + c])), wscale);
++    dst[t*dst_s2 + c*dst_s1 + e] = __fadd_rn(res[t*res_s2 + c*res_s1 + e], __fmul_rn(bo[t*bo_s2 + c*bo_s1 + e], w));
++}
++
++void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * xn, const ggml_tensor * gate, ggml_tensor * dst, int hc, float scale) {
++    const int     n_embd = dst->ne[0];
++    const int64_t n_elem = ggml_nelements(dst);
++    const int64_t nblk   = (n_elem + HC_FUSE_BLOCK_SIZE - 1) / HC_FUSE_BLOCK_SIZE;
++
++    const ggml_cuda_kernel_launch_params launch_params(dim3(nblk, 1, 1), dim3(HC_FUSE_BLOCK_SIZE, 1, 1), 0, ctx.stream());
++    ggml_cuda_kernel_launch(hc_mix_reduce_f32, launch_params,
++            (const float *) xn->data, (const float *) gate->data, (float *) dst->data,
++            n_embd, hc, n_elem, scale);
++}
++
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * residual, const ggml_tensor * block_out, const ggml_tensor * inject,
++        ggml_tensor * dst, float wscale, bool bo_has_hc) {
++    const int     n_embd = dst->ne[0];
++    const int     hc     = dst->ne[1];
++    const int64_t n_elem = ggml_nelements(dst);
++    const int64_t nblk   = (n_elem + HC_FUSE_BLOCK_SIZE - 1) / HC_FUSE_BLOCK_SIZE;
++
++    const ggml_cuda_kernel_launch_params launch_params(dim3(nblk, 1, 1), dim3(HC_FUSE_BLOCK_SIZE, 1, 1), 0, ctx.stream());
++    ggml_cuda_kernel_launch(hc_combine_f32, launch_params,
++            (const float *) residual->data, (const float *) block_out->data,
++            (const float *) inject->data, (float *) dst->data,
++            n_embd, hc, n_elem,
++            (int64_t) (residual->nb[1]/sizeof(float)), (int64_t) (residual->nb[2]/sizeof(float)),
++            bo_has_hc ? (int64_t) (block_out->nb[1]/sizeof(float)) : (int64_t) 0,
++            bo_has_hc ? (int64_t) (block_out->nb[2]/sizeof(float)) : (int64_t) n_embd,
++            (int64_t) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)), wscale);
++}
+diff --git a/ggml/src/ggml-cuda/hc-fuse.cuh b/ggml/src/ggml-cuda/hc-fuse.cuh
+new file mode 100644
+index 000000000..d2fd02f82
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-fuse.cuh
+@@ -0,0 +1,12 @@
++#pragma once
++
++#include "common.cuh"
++
++// xn/gate are [n_embd*hc, n_tokens]; dst is [n_embd, n_tokens]
++void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * xn, const ggml_tensor * gate, ggml_tensor * dst, int hc, float scale);
++
++// residual is [n_embd, hc, n_tokens], block_out [n_embd, n_tokens], inject [hc, n_tokens]
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * residual, const ggml_tensor * block_out, const ggml_tensor * inject,
++        ggml_tensor * dst, float wscale, bool bo_has_hc);
