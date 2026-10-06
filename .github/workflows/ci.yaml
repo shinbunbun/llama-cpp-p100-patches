@@ -28,7 +28,7 @@ jobs:
       - run: nix build .#checks.x86_64-linux.patches-apply .#checks.x86_64-linux.nixpkgs-llama-cpp-pin --no-link --print-build-logs
 
   # Slow gate: compiles the patched tree in the real derivation.  CPU-only, so it
-  # covers patch application, the nixpkgs recipe and the four host-side patches.
+  # covers patch application, the nixpkgs recipe and the host-side patches.
   # The CUDA sources are not built here and no runner can measure a P100 --
   # test-backend-ops and the throughput numbers stay manual, on the card.
   build:

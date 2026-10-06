@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index 771dd7494..7b62f19ec 100644
+index 9fca4f70b..58389340e 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
 @@ -78,6 +78,61 @@ static __global__ void cpy_scalar_fastdiv(const char * cx, char * cdst, const in
@@ -64,7 +64,7 @@ index 771dd7494..7b62f19ec 100644
  template <typename T>
  static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                 const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
-@@ -659,6 +714,88 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+@@ -667,6 +722,88 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
      }
  }
  
@@ -169,10 +169,10 @@ index a7a87d8fc..d7dcdce85 100644
 +
  void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8ee006756..b6b7237ed 100644
+index 8691c95dc..faa91e1f7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3425,6 +3425,126 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3430,6 +3430,126 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -299,7 +299,7 @@ index 8ee006756..b6b7237ed 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -3461,6 +3581,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3466,6 +3586,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  

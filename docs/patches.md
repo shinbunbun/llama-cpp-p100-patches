@@ -2,15 +2,21 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-44 patches, grouped by scope below; the application order is the file
+45 patches, grouped by scope below; the application order is the file
 numbering. Order matters: several touch the same files, and later ones build
-on earlier ones. All 44 are generated against llama.cpp `v0.4.0`, where they
+on earlier ones. All 45 are generated against llama.cpp `v0.5.0`, where they
 apply at zero fuzz and zero offset (see [patches.nix](../nix/patches.nix)
 and the top-level README for the current `llamaCppTag`).
 
+Patch 43 `fuse-hc-combine` was deleted at `v0.5.0`. Upstream added dedicated
+`GGML_OP_DSV4_HC_PRE` / `DSV4_HC_POST` ops for hyper-connections and enabled
+them by default in the qwen4exp graph (ggml-org/llama.cpp#28901). That removed the op sequence 43
+matched from every layer; only the final head mix (`il = -1`) still takes the
+unfused path, once per graph, which is not worth a kernel of its own. The numbering keeps the gap.
+
 Every patch carries its full reasoning — including the measurements that
 justify it and the alternatives that were tried and rejected — in the comments
-it adds to the source. This page is the index. Patches 32–46 are the exception:
+it adds to the source. This page is the index. Patches 32–48 are the exception:
 their measurements live on this page rather than in the source.
 
 **Scope** classifies who benefits:
@@ -301,6 +307,11 @@ The `rms_norm` side is gated at compile time on `block_size >= 1024`; `l2_norm`
 caches at every block size. A runtime gate loses: at a 1.9 µs launch floor the
 branch instructions themselves cost ~6% on the narrow norms.
 
+Since `v0.5.0` upstream normalizes the gated delta-net q/k with `rms_norm` +
+`scale` instead of `ggml_l2_norm` (ggml-org/llama.cpp#28068), so the `l2_norm` half no longer
+fires on qwen35, qwen35moe, qwen3next, qwen4exp and the like; only rwkv7 still
+uses `ggml_l2_norm`.
+
 ### 18 · `fuse-sibling-nodes` — `CUDA`
 
 Merges runs of identically shaped nodes into one launch. Unlike topk-moe or
@@ -313,6 +324,9 @@ Covers consecutive `CPY` (2.60 µs × 5 → 8.46 × 1) and `L2_NORM` (2.26 × 2 
 Kill switches: `GGML_CUDA_DISABLE_FUSE_CPY`, `GGML_CUDA_DISABLE_FUSE_L2_NORM`.
 `GGML_CUDA_FUSE_LOG=1` reports which rules fired; `=2` explains why they did
 not.
+
+Since `v0.5.0` the `L2_NORM` sibling fusion no longer fires on gated delta-net
+models, for the reason given under patch 17; the `CPY` one is unaffected.
 
 ### 19 · `fuse-pre-add-rms-norm` — `CUDA`
 
@@ -754,39 +768,22 @@ Kernel 133 → **74.8 µs** at the decode shape, 65.6 → **28.6 ms** at 4,096 r
 End to end: decode 40k 48.6 → **47.5 ms (−2.3%)**, prefill of 2,050 tokens
 126.8 → **131.1 t/s (+3.4%)**, decode at 210k unchanged.
 
-### 43 · `fuse-hc-combine` — `CUDA` (hyper-connection graphs only)
+### 48 · `fuse-rms-norm-scale` — `CUDA`
 
-Hyper-connections surround every block with element-wise glue — around 40 small
-ops per layer. Two kernels take the two chains:
+Since `v0.5.0` gated delta-net normalizes q and k as `scale(rms_norm(x, eps/n),
+1/sqrt(n))` instead of `l2_norm` (ggml-org/llama.cpp#28068), so 17's and 18's L2-norm halves stop
+firing on these models and each layer launches four small kernels. It matches any
+run of contiguous F32 RMS_NORM → SCALE pairs, not only those, and runs it as one
+launch of a kernel built from `rms_norm_f32<256>`'s implementation, with the
+scale applied in its epilogue the way `scale_f32` applies it, so the output is
+bit-identical (9B, 256 greedy tokens: same tokens and same top-5
+log-probabilities with and without it). It does not fuse when an output would
+alias any input, when the RMS_NORM result has another consumer, or for rows of
+1,024 or more, nor while the graph runs concurrent streams
+(`GGML_CUDA_GRAPH_OPT=1`). `GGML_CUDA_DISABLE_FUSE_RMS_SCALE=1` turns it off.
 
-- stream merge: `MUL(xn, gate)` → the four-stream `ADD` chain → `SCALE(1/hc)`
-- combine: `SIGMOID(inject)` → `SCALE(2)` → `MUL(repeat(block_out), ·)` →
-  `ADD(residual, ·)`
-
-Per-element operation order is the graph's own and `__fmul_rn` / `__fadd_rn`
-forbid FMA contraction, so output is **bit-identical** (64/64 decode tokens,
-16/16 prefill, max |dlogprob| = 0).
-
-`GGML_CUDA_DISABLE_FUSE_HC` is a bitmask kill switch: 1 disables the stream
-reduction, 2 the repeat-anchored combine, 4 the sigmoid-anchored one; 7 disables
-all three.
-
-One interaction to know about: the existing `{UNARY, MUL}` fusion now stands
-down when the MUL it would take is the head of a stream reduction, so that the
-larger fusion can have it. The probe is the same matcher, so on a graph without
-hyper-connections it never fires and the decision is unchanged.
-
-Two hazards this had to handle, both found by wrong output rather than by
-reasoning: a fused kernel's input can die *after* the fusion's anchor node (the
-inject matmul's output was reallocated into the attention output that `REPEAT`
-reads), which is why the combine reads the materialized `REPEAT` output; and a
-fusion must not run when its output overlaps a source by bytes — only an
-in-place source at the same pointer and stride is allowed.
-
-Not isolated end to end: it was measured together with a slot-count increase and
-the reorder in patch 46, whose own before/after at 40k is 58.4 → 49.2 ms for the
-three changes (55.2 ms is the 48-slot step inside that span, which is why the
-slot table under patch 46 starts there).
+`llama-bench` tg64, four rounds, order reversed every other round: 9B 72.93 →
+73.72 t/s (+1.1%), 35B-A3B 79.39 → 81.34 (+2.5%).
 
 ## Delta-net / gated-delta-net (Qwen3-Next, Qwen3.5)
 
@@ -937,6 +934,11 @@ to 88% still gained only +0.21%.
 Giving each slot its own scheduler restores the real thing: skip build, reset,
 split and alloc entirely.
 
+Merged with upstream's two-arena retention of the previous graph (`gf_res_prev`
+is now a `std::array`, and `gf_res_prev_active` marks the arena holding the main
+scheduler's current allocation). Decode through a slot does not rewrite
+`gf_res_prev_active`.
+
 | Slots | True reuse (hits / 1000 graphs) | Dense A/B | VRAM |
 |---:|---:|---|---:|
 | 0 (upstream) | 140 | — | baseline |
@@ -1051,6 +1053,22 @@ No effect on its own — it is what lets patch 46 route the experts it did not
 cache to the CPU by masking them out of the GPU call with −1, and what keeps a
 graph where every expert of a layer missed the cache from asserting.
 
+### 47 · `sched-split-inputs-cap` — `host`
+
+Caps the number of inputs a split takes, which upstream stopped doing in
+`v0.5.0` (ggml-org/llama.cpp#28387): a node whose new inputs would take the split past
+`GGML_SCHED_MAX_SPLIT_INPUTS` starts a new one. Without it a split takes
+any number of inputs, and on a graph whose GPU nodes read large host-side
+inputs (the KQ mask and the indexer scores of a sparse-attention model) the
+device copies of all of them stay live across one long split. On the
+offloaded sparse-attention MoE at ctx 262,144 / ubatch 6144 the CUDA0 compute
+buffer went from 2,596 MiB to 9,512 MiB and the context no longer fit on a
+16 GiB card; with this patch it is 2,600 MiB. The cap is fixed at
+`GGML_SCHED_MAX_SPLIT_INPUTS` and counts each distinct new input a node brings, so it
+does not drift with the input list's capacity. It is **off by default** and
+enabled with `GGML_SCHED_SPLIT_INPUTS_CAP=1`: it moves split boundaries on any
+graph that reaches the cap, and only this workload has been shown to need it.
+
 ## Model-specific
 
 ### 15 · `mtp-draft-vocab` — `model`
@@ -1116,8 +1134,10 @@ set reproduces the measured tree **bit for bit** (16/16 positions, max
 |dlogprob| 0), which is also how the fixes made during review were shown not to
 alter output.
 
-**What the fifteen are worth on this model**, both arms built from this
-repository and measured after the split, two rounds with the arm order reversed:
+**What 32–46 were worth on this model** (measured on `v0.4.0`, where they were
+fifteen patches including the since-deleted 43; on `v0.5.0` the same configuration also needs
+`LLAMA_QWEN4EXP_HC_FOLD=1` and `GGML_SCHED_SPLIT_INPUTS_CAP=1`), both arms built
+from this repository and measured after the split, two rounds with the arm order reversed:
 
 | | stock `v0.4.0` | 01–31, `--n-cpu-moe 44`, ubatch 1024 | 01–46, `--n-cpu-moe 48`, ubatch 6144, the variables below |
 |---|---:|---:|---:|
@@ -1155,29 +1175,39 @@ development rather than on this build.
 ### 42 · `qwen4exp-hc-exact` — `model`
 
 Hyper-connections are about 23% of decode GPU time on this model: four low-rank
-matmuls per layer plus the element-wise glue. Three changes, all
-**bit-identical**:
+matmuls per layer plus the element-wise glue. Two changes remain:
 
-- fold the `1/hc = 0.25` SCALE into the weights at load time — the Q8_0 `down`
+- fold the `1/hc = 0.25` SCALE into the weights on the first graph build — the Q8_0 `down`
   block scales and the F32 `inject` values. A tensor is folded only if it is on a
-  device and every scale survives the division exactly; host-resident weights are
-  skipped whatever their scales, so the 129 of 193 that qualified is not a count
+  device and every scale survives the division exactly and stays an F16 normal.
+  That makes the decode path (MMVQ, and F32 for `inject`) **bit-identical**; a
+  prefill matmul that runs in cuBLAS with F16 accumulation can still round its
+  partial sums differently at a quarter of the magnitude. Host-resident weights
+  are skipped whatever their scales, so the 122 of 193 that qualified is not a count
   of rounding failures. The rest keep the original path, per tensor
-- drop the `CONT` before the stream average: ADD reads a non-contiguous view
-  directly
-- expand the gamma reshape before the RMS norm, so RMS_NORM and MUL end up
-  adjacent and the existing fusion fires
+- drop the `CONT` before the stream average. Since `v0.5.0` only the final head
+  mix (`il = -1`) reaches that code: the layers take upstream's fused
+  hyper-connection op (ggml-org/llama.cpp#28901). **Bit-identical**
 
-Worth about **−1% decode** (0.5 ms). Event-level profiles had made the glue look
-larger than it is; per-op host synchronization inflates small kernels.
+The gamma reshape this patch used to make is upstream since `v0.5.0`, which reads
+gamma as `[n_embd, hc]` so RMS_NORM and MUL are adjacent (ggml-org/llama.cpp#28896).
 
-This is the one patch in 32–46 that is on by default, changes the graph and has no
-kill switch; its bit-identity rests on the whole-set comparison at the top of this
-section rather than on a check of its own. Folding also moves the scale to the
-wrong side of a LoRA: `build_lora_mm` adds the adapter's contribution after the
-base matmul, so an adapter on one of the folded `hc_*` tensors is no longer
-divided by `hc` and lands four times too strong. Nothing here was run with an
-adapter.
+The original three-change patch was worth about **−1% decode** (0.5 ms); what
+remains has not been re-measured on its own. Event-level profiles had made
+the glue look larger than it is; per-op host synchronization inflates small
+kernels.
+
+The fold is **off by default** and enabled with `LLAMA_QWEN4EXP_HC_FOLD=1`,
+because it rewrites the weights in place. `build_lora_mm` adds an adapter's
+contribution after the base matmul, so an adapter on a folded `hc_*` tensor would
+no longer be divided by `hc` and land four times too strong: building a graph
+with such an adapter at a non-zero scale aborts. Saving the model after the fold
+is refused (logged, nothing written) rather than write the divided weights.
+Fine-tuning through `llama_opt` builds graphs too, so with the fold on the
+`hc_*` weights would be optimized at a quarter of their scale; leave it off
+for training. The `CONT` removal
+is on with no kill switch; its bit-identity rests on the whole-set comparison at
+the top of this section rather than on a check of its own.
 
 ### 44 · `qwen4exp-qsa-block-key-cache` — `model`
 

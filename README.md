@@ -1,6 +1,6 @@
 # llama-cpp-p100-patches
 
-44 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
+45 performance patches for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 developed and measured on a **Tesla P100 (GP100, sm_60)**.
 
 日本語版: [README.ja.md](README.ja.md)
@@ -14,19 +14,20 @@ has full-rate HFMA2 — so llama.cpp's quantized matmul paths fall back to
 emulation and cuBLAS, while the one instruction the card is genuinely good at
 goes unused. The patches named `sm60` exploit that asymmetry.
 
-**But only 8 of the 44 are gated to Pascal-era hardware.** One more changes an
-unconditional constant that every GPU sees. The remaining 35 are not
+**But only 8 of the 45 are gated to Pascal-era hardware.** One more changes an
+unconditional constant that every GPU sees. The remaining 36 are not
 hardware-scoped at all — kernel fusions, index-arithmetic fixes, two host-side
-sampler paths, four scheduler patches, two `top_k` paths that avoid sorting a
+sampler paths, five scheduler patches, two `top_k` paths that avoid sorting a
 whole row, gather kernels whose launch geometry matches the work, and two lookup
 tables staged in shared memory — though six of those only fire on gated
 delta-net models and five need a specific model architecture.
 
-Patches 32–46 come from one workload: a 48-layer sparse-attention MoE with its
+Patches 32–47 come from one workload: a 48-layer sparse-attention MoE with its
 routed experts in host memory, at a 262,144-token context. Most of them are
 **off by default** behind an environment variable, because what they are worth
-depends on how much of the model is offloaded. On that model, and with both arms
-built from this repository, they are worth **−58.8% on a fresh 40k prefill**
+depends on how much of the model is offloaded. On that model, measured on
+`v0.4.0` for 32–46 (47 came later), and with both arms built from this
+repository, they are worth **−58.8% on a fresh 40k prefill**
 (431 → 177 s) and **−52% on decode at 40k** (about 101 → 49 ms/token) against the
 31-patch set — the arms differ in server options too, which is the point of them;
 see [docs/patches.md](docs/patches.md).
@@ -35,7 +36,7 @@ Every row in the table below carries a scope tag, and
 
 Every patch has a measurement behind it, and the measurements — including the
 alternatives that were tried and rejected — are in the comments the patches add
-to the source, except for 32–46, whose measurements are in
+to the source, except for 32–48, whose measurements are in
 [docs/patches.md](docs/patches.md) instead.
 
 ## What the set is worth
@@ -62,7 +63,8 @@ depth, best of five reps, two rounds. Both arms run at ctx 262,144 with a q4_0 K
 cache; stock runs the options stock can run (`--n-cpu-moe 44`, ubatch 1024) and
 the patched arm runs the ones the patches make reachable (`--n-cpu-moe 48`,
 ubatch 6144 and the environment variables in
-[docs/patches.md](docs/patches.md)) — on this model that *is* the win, since the
+[docs/patches.md](docs/patches.md), which on `v0.5.0` must include
+`LLAMA_QWEN4EXP_HC_FOLD=1` and `GGML_SCHED_SPLIT_INPUTS_CAP=1`) — on this model that *is* the win, since the
 configuration is what the code buys. Prefill moves with it: a fresh 40k prompt
 takes 413 s stock against **177.5 s** patched (97.6 → **227.4 t/s**, +133%). Of the
 decode gain, patches 01–31 account for 8.63 → 9.87 t/s and 32–46 for the rest.
@@ -82,27 +84,42 @@ three rounds each): 9B dense pp512 +1.15% / tg64 +0.15%, MoE pp512 −0.03% /
 tg64 +0.47%. That bounds the rebase as a non-regression; it does not restate what
 the set is worth against stock `v0.2.0`.
 
-**The `v0.4.0` rebase adds a further gap**: neither the stock-vs-patched table
-above nor the `v0.2.0` non-regression check has been re-taken against the tree
-this rebase ships, so both numbers are now one more unmeasured rebase removed
-from what actually runs.
+**The `v0.4.0` and `v0.5.0` rebases add a further gap**: neither the
+stock-vs-patched table above nor the `v0.2.0` non-regression check has been
+re-taken against the tree that now ships, so both numbers are two unmeasured
+rebases removed from what actually runs. The `v0.5.0` rebase was measured
+against the `v0.4.0` set instead, below.
+
+**The `v0.5.0` rebase was measured against the `v0.4.0` set** on the rows 1 and 2
+models (`llama-bench -ngl 99 -fa 1 -p 512 -n 64 -r 3`, four rounds, order
+reversed every other round, ≤56 °C): 9B pp512 607.4 → 628.1 t/s (+3.4%) and
+tg64 73.70 → 73.72 (±0.0%); 35B-A3B pp512 467.8 → 475.0 (+1.5%) and tg64
+80.56 → 81.34 (+1.0%). The prompt-processing gain is upstream's (stock `v0.4.0`
+→ `v0.5.0` moved it by the same amount). Decode would have lost 1.0% and 1.5%:
+upstream stopped using `l2_norm` on gated delta-net models, so 18's L2-norm
+fusion no longer fires, and 48 takes its place (with 48 off, tg64 is 72.93 and
+79.39). With MTP (n-max 4, p-min 0.75) the 35B-A3B costs 23.86 → 23.80 ms per
+draft-verify step. Perplexity on a fixed 80-chunk text is unchanged by the set
+on both tags (9B 4.3850 / 4.3850 on `v0.4.0`, 4.3847 / 4.3851 on `v0.5.0`;
+35B-A3B 4.0819 / 4.0818 and 4.0808 / 4.0809).
 
 **Rows 1 and 2 also predate patches 32–46**, which were developed on the model in
-row 3. Nine of the fifteen are off by default. Of the six that are not, three fire
+row 3. Nine of the fourteen are off by default. Of the five that are not, three fire
 only on that one model architecture (42, 44, 45), one changes an MMQ tile for
-IQ4_NL on no-DP4A cards (40), one adds CUDA fusions whose matchers need a
-hyper-connection graph (43), and one is a host-side change that does nothing
+IQ4_NL on no-DP4A cards (40), and one is a host-side change that does nothing
 until the expert cache uses it (34) — so on the models in rows 1 and 2 the set
-should behave as it did before.
+should behave as it did before. Of the two added at `v0.5.0`, 48 is on by default
+and fires on those models' gated delta-net layers (it is in the `v0.5.0`
+measurement above); 47 is off by default.
 
 That was measured rather than assumed, on a dense 27B model this card still has
 locally (IQ3_XXS/IQ4_XS, all layers on the GPU, `llama-bench -fa 1 -ctk q4_0
 -ctv q4_0`, six rounds with the arm order rotated): against the published
 31-patch set, pp512 138.23 → 138.48 t/s and tg64 22.84 → 22.84 t/s, dropping each
 arm's first round, where a cold start costs 0.4–2.0% depending on the arm. A third
-arm with the new fusions disabled lands in the same place — that arm bounds the
-matcher's overhead, not the fusions themselves, since a model without
-hyper-connections never matches them. An earlier four-round run that always
+arm with 43's fusions disabled (on `v0.4.0`, before 43 was deleted) landed in the
+same place — that arm bounds the matcher's overhead, not the fusions themselves,
+since a model without hyper-connections never matches them. An earlier four-round run that always
 measured the arms in the same order had put the patched arm 0.4% behind on tg64;
 rotating the order removed it, which is why the rotation is in the protocol.
 
@@ -112,9 +129,15 @@ time and do not compose.
 
 ## Status
 
-- All 44 patches are generated against llama.cpp **`v0.4.0`**, where they
+- All 45 patches are generated against llama.cpp **`v0.5.0`**, where they
   apply at **zero fuzz and zero offset** (`nix flake check` verifies both, and
-  that the file list matches the ordered list in `nix/patches.nix`).
+  that the file list matches the ordered list in `nix/patches.nix`). The
+  `v0.5.0` rebase deleted 43 `fuse-hc-combine`, which upstream's own
+  hyper-connection ops made redundant (see [docs/patches.md](docs/patches.md)).
+  Coming from the `v0.4.0` set, two defaults changed: 42's weight fold now needs
+  `LLAMA_QWEN4EXP_HC_FOLD=1`, and the offloaded sparse-attention MoE at ctx
+  262,144 / ubatch 6144 needs `GGML_SCHED_SPLIT_INPUTS_CAP=1` (47) to fit on a
+  16 GiB card.
 - Not submitted upstream. Two are straightforward candidates — 11
   `penalties-direct` and 21 `sched-reset-lazy` are architecture-independent,
   bit-identical, and fall back to the original path on any input they do not
@@ -125,10 +148,15 @@ time and do not compose.
   keep using upstream's own fallback (its radix top-k above `ncols = 1024`, a
   full sort at or under it) untouched (see [docs/patches.md](docs/patches.md)).
   Nothing but time has kept any of them out.
-- `test-backend-ops` on a P100 with the full set applied: **14,744 tests, and
-  three full runs went 14,744/14,744 twice with one failing case once** — the
-  same score as the 31-patch set on the same machine (also two clean runs of
-  three), and an earlier 13,352-test run on `v0.2.0` matched its unpatched build.
+- `test-backend-ops` on a P100 with the full set applied on `v0.5.0`:
+  **16,204/16,204** — 36 of them added by 48 — and the unpatched `v0.5.0` build
+  passes all of its 16,168. With the
+  environment variables the sparse-attention MoE runs with, and separately with
+  19/20 opted in, one case failed per full run — an n=1 `MUL_MAT` (`q5_1`,
+  `q4_1`) that the unpatched build also fails intermittently (2 of 140 isolated
+  runs, against 0 of 140 patched). On `v0.4.0` the set scored 14,744 tests with
+  two clean runs of three, and an earlier 13,352-test run on `v0.2.0` matched
+  its unpatched build.
   Read those counts as *no reproducible failures* rather than *never a red line*:
   the suite draws fresh random inputs every run, and
   `ADD(type=f16,ne=[10,5,4,3],nr=[2,1,1,1],nf=2)` fails intermittently on the
@@ -154,7 +182,9 @@ time and do not compose.
   46 are not. 22 is the one whose bit-identity is **measured rather than
   argued**: its `n_tokens <= 4` default comes from a dense and an MoE model
   staying identical there, not from a proof that a different compute-buffer
-  layout cannot change a fusion decision. 19 and 20 are **off by default** and
+  layout cannot change a fusion decision. 47, off by default, caps the inputs
+  of a split when enabled, which moves split boundaries and can move that
+  layout too, so it makes no bit-identity claim. 19 and 20 are **off by default** and
   excluded from that default build: enabled, they are bit-identical on a dense
   model but produce non-deterministic MoE decode output (see docs/patches.md).
 - **This repository is expected to shrink.** Anything upstream fixes should be
@@ -210,11 +240,12 @@ each was measured against the stack as it stood at the time.
 | 39 | `gdn-lanes-per-column` | CUDA (delta-net) | −4.3% prefill, decode untouched (needs ≥32 tokens), **off by default** (`GGML_GDN_LPC=16`) |
 | 40 | `mmq-iq4-nl-threads` | no DP4A | +3–4% on an IQ4_NL MoE down projection, bit-identical |
 | 41 | `top-k-radix-select` | CUDA | 133 → 74.8 µs at k = 2,051, −2.3% decode, **off by default** (`GGML_CUDA_TOP_K_SELECT=1`) |
-| 42 | `qwen4exp-hc-exact` | model | −1% decode, bit-identical |
-| 43 | `fuse-hc-combine` | CUDA | two kernels for ~40 element-wise ops per layer, bit-identical |
+| 42 | `qwen4exp-hc-exact` | model | bit-identical by default; the original three-change patch was worth −1% decode, not re-measured since; the weight fold is **off by default** (`LLAMA_QWEN4EXP_HC_FOLD=1`) and bit-identical on the decode path |
 | 44 | `qwen4exp-qsa-block-key-cache` | model | removes almost all of decode's depth dependence (384 MiB at ctx 262,144); no per-patch timing |
 | 45 | `qwen4exp-qsa-sparse-gather` | model | compute buffer 3,773 → 1,063 MiB; −7.0% prefill with `LLAMA_QSA_PAD=1`; output changes |
 | 46 | `qwen4exp-moe-expert-cache` | model | decode 51.0 ms/token at 40k on 60 slots (55.2 on 48), **off by default** (`LLAMA_MOE_CACHE=<slots>`) |
+| 47 | `sched-split-inputs-cap` | host | keeps the compute buffer at ctx 262,144 / ubatch 6144 at 2,600 MiB (9,512 MiB without it), **off by default** (`GGML_SCHED_SPLIT_INPUTS_CAP=1`) |
+| 48 | `fuse-rms-norm-scale` | CUDA | +1.1% / +2.5% decode (9B / 35B-A3B), bit-identical, off with `GGML_CUDA_DISABLE_FUSE_RMS_SCALE=1` |
 
 Patches 19 and 20 are off by default. Their per-patch figures above were
 measured individually on a dense model; enabling both together is worth
@@ -246,7 +277,7 @@ llama-cpp-patched = pkgs.llama-cpp.overrideAttrs (old: {
 });
 ```
 
-or use the overlay — apply it **last**, and assume it needs a pristine `v0.4.0`
+or use the overlay — apply it **last**, and assume it needs a pristine `v0.5.0`
 tree, because zero-fuzz patches reject against anything that has already
 rewritten the same lines:
 
@@ -265,7 +296,7 @@ code generation, so the flake pins `cudaPackages_12`.
 ### Without Nix
 
 ```console
-$ git clone --branch v0.4.0 https://github.com/ggml-org/llama.cpp
+$ git clone --branch v0.5.0 https://github.com/ggml-org/llama.cpp
 $ cd llama.cpp
 $ for p in ../llama-cpp-p100-patches/patches/*.patch; do
     patch -p1 -F0 < "$p" || { echo "FAILED: $p"; break; }

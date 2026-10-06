@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7498398a0..c2da5e301 100644
+index fc550478e..e2c2523c2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1883,12 +1883,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -1888,12 +1888,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
          return true;
      }
  
@@ -17,7 +17,7 @@ index 7498398a0..c2da5e301 100644
              return false;
          }
      }
-@@ -1919,7 +1919,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1924,7 +1924,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
      if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
          static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -26,7 +26,7 @@ index 7498398a0..c2da5e301 100644
              if (ggml_is_quantized(src0->type)) {
                  const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                  if (ne2 <= mmvq_mmid_max) {
-@@ -1927,7 +1927,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1932,7 +1932,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
                      return;
                  }
              } else {
@@ -36,10 +36,10 @@ index 7498398a0..c2da5e301 100644
                      return;
                  }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index cbac2fe2f..cd1aee531 100644
+index eb973fae0..b56ebf163 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -274,8 +274,24 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -303,8 +303,24 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
      }
  }
  
@@ -65,7 +65,7 @@ index cbac2fe2f..cd1aee531 100644
      // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
      if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
          if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-@@ -308,6 +324,13 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+@@ -337,6 +353,13 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
      return MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -79,7 +79,7 @@ index cbac2fe2f..cd1aee531 100644
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
      if (!ggml_is_quantized(type)) {
          return false;
-@@ -863,9 +886,18 @@ static __global__ void mul_mat_vec_q(
+@@ -926,9 +949,18 @@ static __global__ void mul_mat_vec_q(
  // Dedicated MoE multi-token kernel.
  // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
  // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -100,7 +100,7 @@ index cbac2fe2f..cd1aee531 100644
  static __global__ void mul_mat_vec_q_moe(
          const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
          float * dst_ptr,
-@@ -1096,18 +1128,39 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1159,18 +1191,39 @@ static void mul_mat_vec_q_moe_launch(
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                              fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
  
@@ -150,7 +150,7 @@ index cbac2fe2f..cd1aee531 100644
      }
  }
  
-@@ -1122,7 +1175,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1185,7 +1238,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
@@ -159,7 +159,7 @@ index cbac2fe2f..cd1aee531 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-@@ -1506,7 +1559,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1569,7 +1622,7 @@ void ggml_cuda_mul_mat_vec_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  

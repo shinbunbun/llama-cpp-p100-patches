@@ -1,21 +1,22 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 300447b71..05c39a69c 100644
+index 8e619b4f4..158e3a294 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -833,6 +833,12 @@ struct ggml_backend_sched {
+@@ -833,6 +833,13 @@ struct ggml_backend_sched {
  
      int debug;
  
 +    // run the GPU work that the next CPU split does not need while the CPU computes [LLAMA_SCHED_PREFETCH]
 +    int prefetch;
 +    ggml_backend_event_t prefetch_event[GGML_SCHED_MAX_BACKENDS];
-+    struct ggml_tensor * prefetched[GGML_SCHED_MAX_SPLIT_INPUTS];
++    struct ggml_tensor ** prefetched;
 +    int n_prefetched;
++    int prefetched_capacity;
 +    int prefetch_backend_id;
      // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
      // ref: https://github.com/ggml-org/llama.cpp/pull/17617
      int debug_realloc;
-@@ -1651,6 +1657,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1643,6 +1650,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -26,7 +27,7 @@ index 300447b71..05c39a69c 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1660,6 +1670,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1652,6 +1663,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<ggml_bitset_t> used_ids;
  
      int prev_backend_id = -1;
@@ -34,7 +35,7 @@ index 300447b71..05c39a69c 100644
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
-@@ -1676,12 +1687,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1668,12 +1680,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -63,7 +64,7 @@ index 300447b71..05c39a69c 100644
              if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-@@ -1799,10 +1826,57 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1795,10 +1823,64 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -86,7 +87,14 @@ index 300447b71..05c39a69c 100644
 +                    if (ec != GGML_STATUS_SUCCESS) {
 +                        return ec;
 +                    }
-+                    for (int i = 0; i < next->n_inputs && sched->n_prefetched < GGML_SCHED_MAX_SPLIT_INPUTS; i++) {
++                    if (sched->prefetched_capacity < next->n_inputs) {
++                        auto * grown = (struct ggml_tensor **) realloc((void *) sched->prefetched, next->n_inputs * sizeof(struct ggml_tensor *));
++                        if (grown) {
++                            sched->prefetched          = grown;
++                            sched->prefetched_capacity = next->n_inputs;
++                        }
++                    }
++                    for (int i = 0; i < next->n_inputs && sched->n_prefetched < sched->prefetched_capacity; i++) {
 +                        struct ggml_tensor * in = next->inputs[i];
 +                        struct ggml_tensor * in_cpy = tensor_copy(in, next->backend_id, sched->cur_copy);
 +                        if ((in->flags & GGML_TENSOR_FLAG_INPUT) || !ggml_is_contiguous(in) || !in_cpy || !in_cpy->data || !in->data ||
@@ -124,7 +132,7 @@ index 300447b71..05c39a69c 100644
              }
          } else {
              // similar to ggml_backend_compare_graph_backend
-@@ -1919,6 +1993,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1915,6 +1997,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          }
      }
  
@@ -139,7 +147,7 @@ index 300447b71..05c39a69c 100644
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
  
-@@ -1935,6 +2017,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -1931,10 +2021,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }
@@ -147,3 +155,8 @@ index 300447b71..05c39a69c 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
+     ggml_hash_set_free(&sched->hash_set);
++    free(sched->prefetched);
+     for (int i = 0; i < sched->splits_capacity; i++) {
+         free(sched->splits[i].inputs);
+     }

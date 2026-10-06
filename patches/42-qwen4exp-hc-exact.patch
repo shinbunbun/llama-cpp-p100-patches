@@ -1,5 +1,28 @@
+diff --git a/src/llama.cpp b/src/llama.cpp
+index ad8e44388..d2de3d6d8 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -10,6 +10,7 @@
+ #include "llama-model-loader.h"
+ #include "llama-model-saver.h"
+ #include "llama-model.h"
++#include "models/models.h"
+ 
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+@@ -496,6 +497,10 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
+ }
+ 
+ void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
++    if (model->arch == LLM_ARCH_QWEN4EXP && !static_cast<const llama_model_qwen4exp *>(model)->hc_prescaled_set.empty()) {
++        LLAMA_LOG_ERROR("%s: the hc weights were folded in place (LLAMA_QWEN4EXP_HC_FOLD=1), not saving\n", __func__);
++        return;
++    }
+     llama_model_saver ms(model);
+     ms.add_kv_from_model();
+     ms.add_tensors_from_model();
 diff --git a/src/models/models.h b/src/models/models.h
-index 9b87a40d5..58fef0896 100644
+index 3f9c67c63..23655922b 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -7,6 +7,8 @@
@@ -11,13 +34,12 @@ index 9b87a40d5..58fef0896 100644
  
  class llama_memory_hybrid_idx_context;
  
-@@ -2279,6 +2281,13 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2383,6 +2385,12 @@ struct llama_model_qwen4exp : public llama_model_base {
      llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
  
      class llm_graph_input_qsa;
-+    // hc weights with the 1/hc factor folded in; exact, since hc is a power of two
-+    mutable std::unordered_set<const ggml_tensor *> hc_prescaled;
-+    mutable bool hc_fold_tried = false;
++    // hc weights with the 1/hc factor folded in, where that is exact
++    mutable std::unordered_set<const ggml_tensor *> hc_prescaled_set;
 +    mutable std::once_flag hc_fold_once;
 +
 +    void hc_fold_impl() const;
@@ -25,7 +47,7 @@ index 9b87a40d5..58fef0896 100644
  
      void load_arch_hparams(llama_model_loader & ml) override;
      void load_arch_tensors(llama_model_loader & ml) override;
-@@ -2300,8 +2309,11 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2404,8 +2412,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                      ggml_tensor * residual,
                      ggml_tensor * block_out,
                      ggml_tensor * inject,
@@ -38,21 +60,33 @@ index 9b87a40d5..58fef0896 100644
                llm_graph_input_attn_kv * inp_attn,
    const llama_memory_hybrid_idx_context * mctx_hyb,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 1484c9b07..fd6709295 100644
+index f33989de0..ee5038e46 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -263,6 +263,67 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const
+@@ -262,6 +262,77 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const
+     return std::make_unique<graph>(*this, params);
+ }
  
- // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
- // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 +bool llama_model_qwen4exp::graph::hc_prescaled(const ggml_tensor * w) const {
-+    return static_cast<const llama_model_qwen4exp &>(model).hc_prescaled.count(w) > 0;
++    const bool folded = static_cast<const llama_model_qwen4exp &>(model).hc_prescaled_set.count(w) > 0;
++    if (folded && loras) {
++        for (const auto & [adapter, scale] : *loras) {
++            if (scale != 0.0f && adapter->get_weight(const_cast<ggml_tensor *>(w))) {
++                GGML_ABORT("LLAMA_QWEN4EXP_HC_FOLD=1 cannot be combined with a LoRA adapter on the hc weights");
++            }
++        }
++    }
++    return folded;
 +}
 +
 +// Divides every scale of the tensor by 4 in place. Returns false, leaving the tensor untouched,
 +// if any scale would round, which can only happen when it lands in the subnormal range.
 +static bool qwen4exp_div4_exact(ggml_tensor * t) {
 +    if (!t || !t->data || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
++        return false;
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
++    if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
 +        return false;
 +    }
 +    std::vector<uint8_t> buf(ggml_nbytes(t));
@@ -64,7 +98,8 @@ index 1484c9b07..fd6709295 100644
 +            memcpy(&h, &buf[o], sizeof(h));
 +            const float q = ggml_fp16_to_fp32(h) * 0.25f;
 +            const ggml_fp16_t hq = ggml_fp32_to_fp16(q);
-+            if (ggml_fp16_to_fp32(hq) != q) {
++            // a matmul that dequantizes to F16 must not see the products leave the normal range
++            if (ggml_fp16_to_fp32(hq) != q || (q != 0.0f && fabsf(q) < 6.103515625e-05f)) {
 +                return false;
 +            }
 +            memcpy(&buf[o], &hq, sizeof(hq));
@@ -87,11 +122,8 @@ index 1484c9b07..fd6709295 100644
 +}
 +
 +void llama_model_qwen4exp::hc_fold_impl() const {
-+    if (hc_fold_tried) {
-+        return;
-+    }
-+    hc_fold_tried = true;
-+    if (hparams.dsv4_hc_mult != 4) {
++    const char * e = getenv("LLAMA_QWEN4EXP_HC_FOLD");
++    if (!e || !atoi(e) || hparams.dsv4_hc_mult != 4) {
 +        return;
 +    }
 +    std::vector<ggml_tensor *> ws = { hc_head_down };
@@ -100,26 +132,16 @@ index 1484c9b07..fd6709295 100644
 +    }
 +    for (ggml_tensor * w : ws) {
 +        if (qwen4exp_div4_exact(w)) {
-+            hc_prescaled.insert(w);
++            hc_prescaled_set.insert(w);
 +        }
 +    }
-+    LLAMA_LOG_INFO("%s: folded 1/hc into %zu of %zu hc weights\n", __func__, hc_prescaled.size(), ws.size());
++    LLAMA_LOG_INFO("%s: folded 1/hc into %zu of %zu hc weights\n", __func__, hc_prescaled_set.size(), ws.size());
 +}
 +
+ // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
+ // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
  ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
-         ggml_tensor *  x,
-         ggml_tensor *  w_norm,
-@@ -277,13 +338,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
- 
-     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
-     // the converter folded each gamma to (1 + w)
--    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-+    // the gamma view is queued first so that RMS_NORM and MUL are adjacent and fuse
-+    ggml_tensor * gamma = ggml_reshape_2d(ctx0, w_norm, n_embd, hc);
-+    ggml_build_forward_expand(gf, gamma);
-+    ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), gamma);
-     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
--    xn = ggml_mul(ctx0, xn, w_norm);
+@@ -283,7 +354,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
      cb(xn, "hc_norm", il);
  
      ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -128,28 +150,30 @@ index 1484c9b07..fd6709295 100644
 +        lo = ggml_scale(ctx0, lo, 1.0f / (float) hc);
 +    }
 +    lo = ggml_silu(ctx0, lo);
-     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+     ggml_tensor * gate = build_lora_mm(w_up, lo);
      cb(gate, "hc_gate", il);
  
-@@ -291,14 +357,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
-     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+@@ -299,14 +373,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
  
-     // collapse the streams by their mean
--    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
--            ggml_row_size(gated->type, n_embd) * hc, 0);
--    mixed = ggml_cont(ctx0, mixed);
--    for (int64_t c = 1; c < hc; ++c) {
-+    ggml_tensor * mixed = nullptr;
-+    for (int64_t c = 0; c < hc; ++c) {
-         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
-                 ggml_row_size(gated->type, n_embd) * hc,
-                 ggml_row_size(gated->type, n_embd) * c);
--        mixed = ggml_add(ctx0, mixed, s);
-+        mixed = mixed ? ggml_add(ctx0, mixed, s) : s;
+         // collapse the streams by their mean
+-        mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+-                ggml_row_size(gated->type, n_embd) * hc, 0);
+-        mixed = ggml_cont(ctx0, mixed);
+-        for (int64_t c = 1; c < hc; ++c) {
++        for (int64_t c = 0; c < hc; ++c) {
+             ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                     ggml_row_size(gated->type, n_embd) * hc,
+                     ggml_row_size(gated->type, n_embd) * c);
+-            mixed = ggml_add(ctx0, mixed, s);
++            mixed = mixed ? ggml_add(ctx0, mixed, s) : s;
++        }
++        if (hc == 1) {
++            mixed = ggml_cont(ctx0, mixed);
+         }
+         mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
      }
-     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
-     cb(mixed, "hc_mixed", il);
-@@ -315,12 +379,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -324,12 +398,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
          ggml_tensor * residual,
          ggml_tensor * block_out,
          ggml_tensor * inject,
@@ -162,9 +186,9 @@ index 1484c9b07..fd6709295 100644
 -    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
 +    ggml_tensor * w = ggml_sigmoid(ctx0, hc_prescaled(w_inject) ? inject : ggml_scale(ctx0, inject, 1.0f / (float) hc));
      w = ggml_scale(ctx0, w, 2.0f);
-     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
  
-@@ -337,6 +402,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+     ggml_tensor * cur = nullptr;
+@@ -354,6 +429,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      llm_build_delta_net_base(params), model(model) {
      const int64_t hc = hparams.dsv4_hc_mult;
  
@@ -172,7 +196,7 @@ index 1484c9b07..fd6709295 100644
      GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
  
      int sections[4];
-@@ -407,7 +473,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -424,7 +500,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
          }
  
@@ -181,7 +205,7 @@ index 1484c9b07..fd6709295 100644
  
          cur = build_hc_mix(res_hc,
                  model.layers[il].hc_ffn_norm,
-@@ -419,7 +485,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -436,7 +512,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
          cur = build_layer_ffn(cur, il);
          cb(cur, "ffn_out", il);
  

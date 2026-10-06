@@ -9,7 +9,7 @@
 {
   # Keep in sync with inputs.llama-cpp-src.url in flake.nix -- flake inputs must
   # be literals, so the tag cannot be shared between the two.
-  llamaCppTag = "v0.4.0";
+  llamaCppTag = "v0.5.0";
 
   patches = [
     ../patches/01-vmad-dp4a-sm60.patch
@@ -52,9 +52,10 @@
     ../patches/40-mmq-iq4-nl-threads.patch
     ../patches/41-top-k-radix-select.patch
     ../patches/42-qwen4exp-hc-exact.patch
-    ../patches/43-fuse-hc-combine.patch
     ../patches/44-qwen4exp-qsa-block-key-cache.patch
     ../patches/45-qwen4exp-qsa-sparse-gather.patch
     ../patches/46-qwen4exp-moe-expert-cache.patch
+    ../patches/47-sched-split-inputs-cap.patch
+    ../patches/48-fuse-rms-norm-scale.patch
   ];
 }
