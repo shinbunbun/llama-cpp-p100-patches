@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index 7b62f19ec..babb8aa8e 100644
+index 58389340e..cfa32fdcc 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
 @@ -90,6 +90,44 @@ struct cpy_fused_ptrs {
@@ -47,7 +47,7 @@ index 7b62f19ec..babb8aa8e 100644
  template <cpy_kernel_t cpy_1>
  static __global__ void cpy_scalar_fastdiv_fused(const cpy_fused_ptrs p, const int ne,
                                    const uint3 fd_s0, const uint3 fd_s1, const uint3 fd_s2,
-@@ -781,6 +819,51 @@ bool ggml_cuda_cpy_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes,
+@@ -789,6 +827,51 @@ bool ggml_cuda_cpy_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes,
          p.cdst[k] = (char *)       nodes[k]->src[1]->data;
      }
  

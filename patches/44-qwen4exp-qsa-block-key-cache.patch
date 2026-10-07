@@ -1,8 +1,8 @@
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index 93b468784..3c18b0b70 100644
+index 3972ce9ce..a66364928 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
-@@ -61,7 +61,60 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+@@ -65,7 +65,60 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
              model, hparams_idx, type_k, type_v, v_trans, offload, unified,
              kv_size, n_seq_max, n_pad, n_swa, swa_type,
              nullptr, filter_idx, nullptr, nullptr, "idx_");
@@ -64,7 +64,7 @@ index 93b468784..3c18b0b70 100644
  
  llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
      // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
-@@ -139,6 +192,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
+@@ -143,6 +196,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
  void llama_memory_hybrid_idx::clear(bool data) {
      llama_memory_hybrid::clear(data);
  
@@ -73,7 +73,7 @@ index 93b468784..3c18b0b70 100644
      if (mem_idx) {
          mem_idx->clear(data);
      }
-@@ -154,12 +209,16 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
+@@ -158,12 +213,16 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
          mem_idx->seq_rm(seq_id, p0, p1);
      }
  
@@ -90,7 +90,7 @@ index 93b468784..3c18b0b70 100644
      if (mem_idx) {
          mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
      }
-@@ -168,6 +227,8 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
+@@ -172,6 +231,8 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
  void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
      llama_memory_hybrid::seq_keep(seq_id);
  
@@ -99,7 +99,7 @@ index 93b468784..3c18b0b70 100644
      if (mem_idx) {
          mem_idx->seq_keep(seq_id);
      }
-@@ -176,6 +237,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+@@ -180,6 +241,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
  void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
      llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
  
@@ -108,7 +108,7 @@ index 93b468784..3c18b0b70 100644
      if (mem_idx) {
          mem_idx->seq_add(seq_id, p0, p1, shift);
      }
-@@ -184,6 +247,8 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
+@@ -188,6 +251,8 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
  void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
      llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
  
@@ -117,7 +117,7 @@ index 93b468784..3c18b0b70 100644
      if (mem_idx) {
          mem_idx->seq_div(seq_id, p0, p1, d);
      }
-@@ -223,6 +288,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
+@@ -227,6 +292,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
      // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
      llama_kv_cache::slot_info_vec_t sinfos_attn;
  
@@ -126,7 +126,7 @@ index 93b468784..3c18b0b70 100644
      try {
          if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
              get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
-@@ -246,6 +313,111 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
+@@ -250,6 +317,111 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
      }
  }
  
@@ -238,7 +238,7 @@ index 93b468784..3c18b0b70 100644
  void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
      // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
      if (seq_id < 0) {
-@@ -289,8 +461,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -293,8 +465,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
      const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
  
      int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;

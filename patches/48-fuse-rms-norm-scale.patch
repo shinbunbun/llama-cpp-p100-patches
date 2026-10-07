@@ -1,0 +1,407 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9ae164379..be789eac5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3453,26 +3453,23 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     return false;
+ }
+ 
++static bool ggml_cuda_fuse_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a || !b || !a->data || !b->data || !a->buffer || !b->buffer) {
++        return true; // anything we cannot decide counts as overlapping, i.e. do not fuse
++    }
++    const char * as = (const char *) a->data;
++    const char * bs = (const char *) b->data;
++    const char * ae = as + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++    const char * be = bs + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++    return as < be && bs < ae;
++}
++
+ // Sibling fusion: merge a run of identically shaped nodes to cut the number of launches.
+ // Unlike topk-moe or rope+set_rows this removes no intermediate node -- every node is still
+ // computed -- so the only requirement is that reordering them cannot change the result: the
+ // destinations must not overlap each other, nor any other node's source.  That is checked here as
+ // byte ranges.
+ static bool ggml_cuda_fuse_nodes_disjoint(ggml_tensor ** nodes, int n, int dst_src_idx) {
+-    auto range_of = [](const ggml_tensor * t, const char *& beg, const char *& end) {
+-        beg = (const char *) t->data;
+-        end = beg + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
+-    };
+-    auto overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+-        if (!a || !b || !a->data || !b->data || !a->buffer || !b->buffer) {
+-            return true; // anything we cannot decide counts as overlapping, i.e. do not fuse
+-        }
+-        const char * as; const char * ae; const char * bs; const char * be;
+-        range_of(a, as, ae);
+-        range_of(b, bs, be);
+-        return as < be && bs < ae;
+-    };
+-
+     for (int a = 0; a < n; ++a) {
+         // dst_src_idx >= 0 means src[dst_src_idx] is the destination (CPY); otherwise the node
+         // itself is the destination (L2_NORM)
+@@ -3485,7 +3482,7 @@ static bool ggml_cuda_fuse_nodes_disjoint(ggml_tensor ** nodes, int n, int dst_s
+                 continue;
+             }
+             const ggml_tensor * dst_b = dst_src_idx >= 0 ? nodes[b]->src[dst_src_idx] : nodes[b];
+-            if (overlap(dst_a, dst_b)) {
++            if (ggml_cuda_fuse_overlap(dst_a, dst_b)) {
+                 return false;
+             }
+             for (int s = 0; s < GGML_MAX_SRC; ++s) {
+@@ -3496,7 +3493,7 @@ static bool ggml_cuda_fuse_nodes_disjoint(ggml_tensor ** nodes, int n, int dst_s
+                 if (dst_src_idx >= 0 && s == dst_src_idx) {
+                     continue; // destination-vs-destination was handled above
+                 }
+-                if (overlap(dst_a, src_b)) {
++                if (ggml_cuda_fuse_overlap(dst_a, src_b)) {
+                     return false;
+                 }
+             }
+@@ -4000,6 +3997,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    if (node->op == GGML_OP_RMS_NORM && allow_defer) {
++        static bool disable_rms_scale = getenv("GGML_CUDA_DISABLE_FUSE_RMS_SCALE") != nullptr &&
++                                        std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_RMS_SCALE"));
++        if (!disable_rms_scale) {
++            static const ggml_op pair_ops[2] = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
++            ggml_tensor * rms[CUDA_RMS_SCALE_FUSE_MAX];
++            ggml_tensor * scl[CUDA_RMS_SCALE_FUSE_MAX];
++            int           end[CUDA_RMS_SCALE_FUSE_MAX];
++            int n = 0;
++            for (int j = i; n < CUDA_RMS_SCALE_FUSE_MAX; j = end[n - 1] + 1) {
++                int idxs[2];
++                if (!ggml_cuda_collect_ops(cgraph, j, pair_ops, 2, idxs) || !ggml_can_fuse_ext(cgraph, idxs, pair_ops, 2)) {
++                    break;
++                }
++                const ggml_tensor * x = cgraph->nodes[idxs[0]]->src[0];
++                if (n > 0 && (!ggml_are_same_shape(x, rms[0]->src[0]) || !ggml_are_same_stride(x, rms[0]->src[0]) ||
++                              memcmp(cgraph->nodes[idxs[0]]->op_params, rms[0]->op_params, sizeof(float)) != 0)) {
++                    break;
++                }
++                rms[n] = cgraph->nodes[idxs[0]];
++                scl[n] = cgraph->nodes[idxs[1]];
++                end[n] = idxs[1];
++                n++;
++            }
++            if (n >= 1) {
++                // blocks of different pairs run concurrently, so no pair may write what any pair reads
++                auto disjoint = [&](int m) {
++                    for (int a = 0; a < m; ++a) {
++                        for (int b = 0; b < m; ++b) {
++                            if (ggml_cuda_fuse_overlap(scl[a], rms[b]->src[0]) || (a != b && ggml_cuda_fuse_overlap(scl[a], scl[b]))) {
++                                return false;
++                            }
++                        }
++                    }
++                    return true;
++                };
++                const int collected = n;
++                while (n >= 1 && !disjoint(n)) {
++                    --n;
++                }
++                const int launched = n >= 1 ? ggml_cuda_rms_norm_scale_fused(*cuda_ctx, rms, scl, n) : 0;
++                ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
++                if (launched > 0) {
++                    ggml_cuda_fuse_log("rms_norm_scale", launched);
++                    return end[launched - 1] - i;
++                }
++            }
++        }
++    }
++
+     //topk-moe
+     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 57ccdceb2..c7b566a40 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -73,8 +73,16 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
+     }
+ }
+ 
+-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_pre_add = false>
+-static __global__ void rms_norm_f32(const float * x,
++struct rms_norm_scale_fused_args {
++    const float * x    [CUDA_RMS_SCALE_FUSE_MAX];
++    float *       dst  [CUDA_RMS_SCALE_FUSE_MAX];
++    float         scale[CUDA_RMS_SCALE_FUSE_MAX];
++    float         bias [CUDA_RMS_SCALE_FUSE_MAX];
++    int           nrows;
++};
++
++template <int block_size, bool do_multiply, bool do_add, bool do_pre_add, bool do_scale_pairs>
++static __device__ __forceinline__ void rms_norm_f32_impl(const float * x,
+                                     float *       dst,
+                                     const int     ncols,
+                                     const int64_t stride_row,
+@@ -103,17 +111,32 @@ static __global__ void rms_norm_f32(const float * x,
+                                     // is contained in the block and no cross-block synchronization is needed.
+                                     const float * pre_a                = nullptr,
+                                     const float * pre_b                = nullptr,
+-                                    float *       pre_dst              = nullptr) {
++                                    float *       pre_dst              = nullptr,
++                                    // RMS_NORM -> SCALE pairs of identical shape, one per group of fused.nrows blocks
++                                    const rms_norm_scale_fused_args fused = {}) {
+     ggml_cuda_pdl_lc();
+-    const int nrows     = gridDim.x;
++    int       nrows     = gridDim.x;
+     const int nchannels = gridDim.y;
+ 
+-    const int row       = blockIdx.x;
++    int       row       = blockIdx.x;
+     const int channel   = blockIdx.y;
+     const int sample    = blockIdx.z;
+     const int tid       = threadIdx.x;
+ 
+     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
++    static_assert(!do_scale_pairs || (!do_multiply && !do_pre_add), "scale pairs are fused on their own");
++
++    float pair_scale = 0.0f;
++    float pair_bias  = 0.0f;
++    if constexpr (do_scale_pairs) {
++        nrows = fused.nrows;
++        const int k = blockIdx.x / nrows;
++        row = blockIdx.x - k*nrows;
++#pragma unroll
++        for (int j = 0; j < CUDA_RMS_SCALE_FUSE_MAX; ++j) {
++            if (k == j) { x = fused.x[j]; dst = fused.dst[j]; pair_scale = fused.scale[j]; pair_bias = fused.bias[j]; }
++        }
++    }
+ 
+     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+@@ -201,6 +224,9 @@ static __global__ void rms_norm_f32(const float * x,
+         } else if constexpr (do_multiply) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+             dst[col]          = scale * xi * mul[mul_col];
++        } else if constexpr (do_scale_pairs) {
++            const float t = scale * xi;
++            dst[col]      = pair_scale * t + pair_bias;
+         } else {
+             dst[col] = scale * xi;
+         }
+@@ -221,6 +247,49 @@ static __global__ void rms_norm_f32(const float * x,
+     }
+ }
+ 
++template <int block_size, bool do_multiply = false, bool do_add = false, bool do_pre_add = false>
++static __global__ void rms_norm_f32(const float * x,
++                                    float *       dst,
++                                    const int     ncols,
++                                    const int64_t stride_row,
++                                    const int64_t stride_channel,
++                                    const int64_t stride_sample,
++                                    const float   eps,
++                                    const float * mul                  = nullptr,
++                                    const int64_t mul_stride_row       = 0,
++                                    const int64_t mul_stride_channel   = 0,
++                                    const int64_t mul_stride_sample    = 0,
++                                    const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
++                                    const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
++                                    const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
++                                    const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
++                                    const float * add                  = nullptr,
++                                    const int64_t add_stride_row       = 0,
++                                    const int64_t add_stride_channel   = 0,
++                                    const int64_t add_stride_sample    = 0,
++                                    const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
++                                    const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
++                                    const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
++                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
++                                    // Fold the residual add into the prologue: compute x = pre_a + pre_b, store it to
++                                    // pre_dst (the ADD's destination, which is where rms_norm reads x from) and feed it
++                                    // straight into the sum of squares.  rms_norm maps one row to one block, so the row
++                                    // is contained in the block and no cross-block synchronization is needed.
++                                    const float * pre_a                = nullptr,
++                                    const float * pre_b                = nullptr,
++                                    float *       pre_dst              = nullptr) {
++    rms_norm_f32_impl<block_size, do_multiply, do_add, do_pre_add, false>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, pre_a, pre_b, pre_dst, rms_norm_scale_fused_args{});
++}
++
++template <int block_size>
++static __global__ void rms_norm_scale_pairs_f32(const rms_norm_scale_fused_args fused, const int ncols, const int64_t stride_row,
++        const int64_t stride_channel, const int64_t stride_sample, const float eps) {
++    rms_norm_f32_impl<block_size, false, false, false, true>(nullptr, nullptr, ncols, stride_row, stride_channel, stride_sample, eps,
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
++        nullptr, nullptr, nullptr, fused);
++}
++
+ template <int block_size>
+ static __global__ void rms_norm_back_f32(
+         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+@@ -511,6 +580,72 @@ bool ggml_cuda_l2_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nod
+     return true;
+ }
+ 
++int ggml_cuda_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** rms, ggml_tensor ** scl, int n) {
++    if (n < 1 || n > CUDA_RMS_SCALE_FUSE_MAX) {
++        return 0;
++    }
++
++    const ggml_tensor * src0 = rms[0]->src[0];
++    const size_t ts0 = sizeof(float);
++
++    auto matches = [&](int k) {
++        const ggml_tensor * s = rms[k]->src[0];
++        if (!s || s->type != GGML_TYPE_F32 || rms[k]->type != GGML_TYPE_F32 || scl[k]->type != GGML_TYPE_F32) {
++            return false;
++        }
++        if (scl[k]->src[0] != rms[k] || !ggml_is_contiguous(rms[k]) || !ggml_is_contiguous(scl[k]) || s->nb[0] != ts0) {
++            return false;
++        }
++        if (memcmp(rms[k]->op_params, rms[0]->op_params, sizeof(float)) != 0) {
++            return false;
++        }
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            if (s->ne[i] != src0->ne[i] || s->nb[i] != src0->nb[i] || scl[k]->ne[i] != src0->ne[i]) {
++                return false;
++            }
++        }
++        return true;
++    };
++    int m = 0;
++    while (m < n && matches(m)) {
++        ++m;
++    }
++    n = m;
++    if (n == 0) {
++        return 0;
++    }
++
++    const int64_t ncols     = src0->ne[0];
++    const int64_t nrows     = src0->ne[1];
++    const int64_t nchannels = src0->ne[2];
++    const int64_t nsamples  = src0->ne[3];
++
++    // the 1024-wide instantiation caches the row in registers; the unfused path would pick it here
++    if (ncols >= 1024 || nrows*n > INT_MAX) {
++        return 0;
++    }
++
++    rms_norm_scale_fused_args p = {};
++    for (int k = 0; k < n; ++k) {
++        p.x[k]   = (const float *) rms[k]->src[0]->data;
++        p.dst[k] = (float *)       scl[k]->data;
++        memcpy(&p.scale[k], (const float *) scl[k]->op_params + 0, sizeof(float));
++        memcpy(&p.bias[k],  (const float *) scl[k]->op_params + 1, sizeof(float));
++    }
++    p.nrows = (int) nrows;
++
++    float eps;
++    memcpy(&eps, rms[0]->op_params, sizeof(float));
++
++    const dim3 blocks_num((unsigned int) (nrows*n), (unsigned int) nchannels, (unsigned int) nsamples);
++    const dim3 block_dims(256, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), ctx.stream()};
++    ggml_cuda_kernel_launch(rms_norm_scale_pairs_f32<256>, launch_params,
++        p, (int) ncols, (int64_t) (src0->nb[1]/ts0), (int64_t) (src0->nb[2]/ts0), (int64_t) (src0->nb[3]/ts0), eps);
++
++    return n;
++}
++
+ static void norm_f32_cuda(
+         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index 83bae57ee..bf9e81a6c 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -27,4 +27,8 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
+ 
+ bool ggml_cuda_l2_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n);
+ 
++#define CUDA_RMS_SCALE_FUSE_MAX 4
++
++int ggml_cuda_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor ** rms, ggml_tensor ** scl, int n);
++
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8402fcfe0..b84b5fa73 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3760,6 +3760,62 @@ struct test_rms_norm_back : public test_case {
+     }
+ };
+ 
++struct test_rms_norm_scale_pairs : public test_case {
++    const int64_t head_dim;
++    const int64_t n_head;
++    const int64_t n_tokens;
++    const int     n_pairs;
++    const float   bias;
++    const bool    inplace;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "RMS_NORM_SCALE_PAIRS";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR6(head_dim, n_head, n_tokens, n_pairs, bias, inplace);
++    }
++
++    test_rms_norm_scale_pairs(int64_t head_dim = 128, int64_t n_head = 16, int64_t n_tokens = 1, int n_pairs = 2,
++            float bias = 0.0f, bool inplace = false)
++        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens), n_pairs(n_pairs), bias(bias), inplace(inplace) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t row = head_dim * n_head * (n_pairs + 1);
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, n_tokens);
++        ggml_set_param(x);
++        ggml_set_name(x, "x");
++        x = ggml_exp(ctx, x);
++
++        // the sum is nested to the right so that every pair is computed before any ADD
++        ggml_tensor * out = nullptr;
++        for (int k = 0; k < n_pairs; ++k) {
++            ggml_tensor * v = ggml_view_3d(ctx, x, head_dim, n_head, n_tokens,
++                    head_dim * sizeof(float), x->nb[1], k * head_dim * n_head * sizeof(float));
++            const float s = 1.0f / sqrtf((float) head_dim);
++            ggml_tensor * y;
++            if (inplace) {
++                v = ggml_cont(ctx, v);
++                y = ggml_scale_bias_inplace(ctx, ggml_rms_norm_inplace(ctx, v, 1e-6f / head_dim), s, bias);
++            } else {
++                y = ggml_scale_bias(ctx, ggml_rms_norm(ctx, v, 1e-6f / head_dim), s, bias);
++            }
++            out = out ? ggml_add(ctx, y, out) : y;
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t, -2.f, 2.f);
++        }
++    }
++};
++
+ // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+ struct test_rms_norm_mul_add : public test_case {
+     const ggml_type type;
+@@ -9784,6 +9840,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
+     }
+ 
++    for (int64_t head_dim : { 64, 128, 1024 }) {
++        for (int64_t n_tokens : { 1, 7 }) {
++            for (int n_pairs : { 1, 2, 3, 4, 5 }) {
++                test_cases.emplace_back(new test_rms_norm_scale_pairs(head_dim, 16, n_tokens, n_pairs));
++            }
++        }
++    }
++    for (int n_pairs : { 1, 2, 3 }) {
++        test_cases.emplace_back(new test_rms_norm_scale_pairs(128, 16, 7, n_pairs, 0.25f));
++        test_cases.emplace_back(new test_rms_norm_scale_pairs(128, 16, 7, n_pairs, 0.0f, true));
++    }
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true));

@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f1b87b9ce..8c44aecb3 100644
+index 8da3c1a96..4765ef220 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1998,7 +1998,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1995,7 +1995,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                              for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                  int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
@@ -14,7 +14,7 @@ index f1b87b9ce..8c44aecb3 100644
                                  ggml_bitset_set(used_ids.data(), id);
                              }
                          }
-@@ -2022,9 +2025,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2019,9 +2022,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      };
  
                      int id = 0;
@@ -29,10 +29,10 @@ index f1b87b9ce..8c44aecb3 100644
                      int32_t last_id = first_id;
  
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 87a329f26..9eb9fb7a5 100644
+index 8bb0ff7bc..53bf3e7fc 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -1646,7 +1646,12 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1654,7 +1654,12 @@ static void ggml_compute_forward_mul_mat_id(
              for (int id = 0; id < n_ids; ++id) {
                  const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
  

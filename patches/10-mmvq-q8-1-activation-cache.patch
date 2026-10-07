@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index b76fd04a9..753712d33 100644
+index 7713a1930..31293a1ce 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1430,6 +1430,41 @@ struct ggml_backend_cuda_context {
+@@ -1469,6 +1469,41 @@ struct ggml_backend_cuda_context {
      std::string name;
      cudaEvent_t copy_event = nullptr;
  
@@ -45,10 +45,10 @@ index b76fd04a9..753712d33 100644
      cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
      void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 45e9537f0..8ee006756 100644
+index 27b83503d..8691c95dc 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -705,6 +705,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -702,6 +702,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
      ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
  
@@ -57,7 +57,7 @@ index 45e9537f0..8ee006756 100644
      if (copy_event != nullptr) {
          CUDA_CHECK(cudaEventDestroy(copy_event));
      }
-@@ -4417,6 +4419,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4423,6 +4425,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -69,10 +69,10 @@ index 45e9537f0..8ee006756 100644
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 3b9579b5a..ea98de3a2 100644
+index 522c8eb4b..386c0933b 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1546,12 +1546,65 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1609,12 +1609,65 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -140,7 +140,7 @@ index 3b9579b5a..ea98de3a2 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1577,7 +1630,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1640,7 +1693,7 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(

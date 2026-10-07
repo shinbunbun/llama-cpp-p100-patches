@@ -1,8 +1,8 @@
 diff --git a/src/models/models.h b/src/models/models.h
-index 651b60839..6fbd3458d 100644
+index 9eea0ab59..5eda43094 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -2281,6 +2281,15 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2385,6 +2385,15 @@ struct llama_model_qwen4exp : public llama_model_base {
      llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
  
      class llm_graph_input_qsa;
@@ -15,10 +15,10 @@ index 651b60839..6fbd3458d 100644
 +
 +    moe_cache * moe_cache_get() const;
 +
-     // hc weights with the 1/hc factor folded in; exact, since hc is a power of two
-     mutable std::unordered_set<const ggml_tensor *> hc_prescaled;
-     mutable bool hc_fold_tried = false;
-@@ -2364,7 +2373,16 @@ struct llama_model_qwen4exp : public llama_model_base {
+     // hc weights with the 1/hc factor folded in, where that is exact
+     mutable std::unordered_set<const ggml_tensor *> hc_prescaled_set;
+     mutable std::once_flag hc_fold_once;
+@@ -2467,7 +2476,16 @@ struct llama_model_qwen4exp : public llama_model_base {
  
          ggml_tensor * build_layer_ffn(
                      ggml_tensor * cur,
@@ -37,10 +37,10 @@ index 651b60839..6fbd3458d 100644
          ggml_tensor * build_norm_gated(
                      ggml_tensor * input,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 9cecfd274..69e17f656 100644
+index 91c0b70ae..a02ff6d44 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -398,11 +398,298 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -425,11 +425,298 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
      return cur;
  }
  
@@ -339,7 +339,7 @@ index 9cecfd274..69e17f656 100644
      GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
  
      int sections[4];
-@@ -414,6 +701,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -441,6 +728,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
  
      auto * inp = build_inp_mem_hybrid();
  
@@ -355,7 +355,7 @@ index 9cecfd274..69e17f656 100644
      // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
      // the indexer cache inside it is absent when the GGUF has no indexer tensors
      const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
-@@ -482,7 +778,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -509,7 +805,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                  model.layers[il].hc_ffn_inject,
                  &inject, il);
  
@@ -364,7 +364,7 @@ index 9cecfd274..69e17f656 100644
          cb(cur, "ffn_out", il);
  
          res_hc = build_hc_combine(res_hc, cur, inject, model.layers[il].hc_ffn_inject, il);
-@@ -1349,29 +1645,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -1374,29 +1670,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
      return cur;
  }
  
@@ -489,7 +489,7 @@ index 9cecfd274..69e17f656 100644
              build_ffn(cur,
                  model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                  model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-@@ -1389,7 +1760,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1414,7 +1785,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
  
          ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
          cb(ffn_shexp, "ffn_shexp_gated", il);

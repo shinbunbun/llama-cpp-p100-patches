@@ -7,7 +7,7 @@
     # Pinned only so `nix flake check` can verify the patches still apply at zero
     # fuzz.  Consumers are not forced onto this revision.
     llama-cpp-src = {
-      url = "github:ggml-org/llama.cpp/v0.4.0";
+      url = "github:ggml-org/llama.cpp/v0.5.0";
       flake = false;
     };
   };
@@ -143,7 +143,7 @@
           '';
         }
         # Compiles the patched tree in the real derivation.  CPU-only, so it
-        # covers patch application, the nixpkgs recipe, and the four host-side
+        # covers patch application, the nixpkgs recipe, and the host-side
         # patches -- the CUDA sources are not built here, and nothing on a
         # GitHub-hosted runner can measure a P100.
         // lib.optionalAttrs (system == "x86_64-linux") {

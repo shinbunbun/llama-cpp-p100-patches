@@ -1,0 +1,57 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 4765ef220..cde8486a4 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1077,6 +1077,10 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
+ }
+ 
++static bool ggml_backend_sched_src_needs_copy(ggml_backend_sched_t sched, struct ggml_tensor * src, int src_backend_id, int cur_backend_id) {
++    return src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
++}
++
+ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int * node_backend_id) {
+     if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
+         *node_backend_id = cur_backend_id;
+@@ -1086,6 +1090,8 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+ 
+ // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++    static const char * cap_env    = getenv("GGML_SCHED_SPLIT_INPUTS_CAP");
++    static const bool   cap_inputs = cap_env && atoi(cap_env);
+     // reset splits
+     sched->n_splits = 0;
+     sched->n_graph_inputs = 0;
+@@ -1361,6 +1367,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         }
+                     }
+                 }
++                // Without this cap a split takes any number of inputs, and the device copies of large
++                // host-side inputs (KQ mask, indexer scores) then all stay live across one long split.
++                if (!need_new_split && cap_inputs && split->n_inputs > GGML_SCHED_MAX_SPLIT_INPUTS - GGML_MAX_SRC) {
++                    int n_new = 0;
++                    for (int j = 0; j < GGML_MAX_SRC; j++) {
++                        struct ggml_tensor * src = node->src[j];
++                        if (src == NULL || std::find(node->src, node->src + j, src) != node->src + j) {
++                            continue;
++                        }
++                        const size_t id = hash_id(src);
++                        if (ggml_backend_sched_src_needs_copy(sched, src, sched->hv_tensor_backend_ids[id], cur_backend_id) &&
++                            tensor_id_copy(id, cur_backend_id, 0) == NULL) {
++                            n_new++;
++                        }
++                    }
++                    need_new_split = split->n_inputs + n_new > GGML_SCHED_MAX_SPLIT_INPUTS;
++                }
+             }
+ 
+             if (node_backend_id != cur_backend_id || need_new_split) {
+@@ -1418,7 +1441,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     }
+                 }
+ 
+-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
++                if (ggml_backend_sched_src_needs_copy(sched, src, src_backend_id, cur_backend_id)) {
+                     // create a copy of the input in the split's backend
+                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+                         ggml_backend_t backend = sched->backends[cur_backend_id];
