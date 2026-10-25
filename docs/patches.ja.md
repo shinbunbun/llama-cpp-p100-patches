@@ -860,6 +860,15 @@ upstream の「前回グラフの保持を 2 つの arena にする」変更 (`g
 枠がヒットして再構築を飛ばした回も含め毎デコードそのポインタ経由で書き込むため、枠を
 交互に使うと、ある枠のグラフが走っている最中に別の枠の入力を書くことになる。
 
+モデルが meta device 上で動くとき (`-sm tensor`) も枠を使わない。meta バックエンドは
+バッファの外で作られたビューを、バッファごとに 2 つの入れ替え式コンテナで管理している。
+context のバッファを使う sched が 1 本ならこれで足りるが、枠はそのバッファを共有するので、
+再利用された枠のグラフのビューが別のグラフの再構築で消され、decode 中に
+`ggml-backend-meta.cpp` の `GGML_ASSERT(bcj.nodes[i])` に当たって落ちる (dense 9B モデルで、
+MTP ありなら 1 リクエスト目、なしなら 2 リクエスト目)。prefill がたいてい無事なのは、ubatch が
+トークン上限を超えて枠を通らないからにすぎない。`-sm tensor` では枠は一切使われず、
+`LLAMA_DEC_SLOTS` も `LLAMA_DEC_MAX_TOK` も効かない。
+
 トークン上限を 4 にしているのは、スロットのバッファがメインスケジューラとは別のレイアウトに
 なる一方、`ggml_cuda_check_fusion_memory_ranges` が実際のテンソルアドレスから融合可否を
 決めるためである。topk-moe の例外 (`ggml_nrows(node) <= TOPK_MOE_ROWS_PER_BLOCK`、
@@ -873,7 +882,7 @@ upstream の「前回グラフの保持を 2 つの arena にする」変更 (`g
 載らなくなる致命傷である一方、8 枠との差 0.38 ポイントは、実在するとはいえ
 ([benchmarking.ja.md](benchmarking.ja.md) で確立した ±0.07% の分解能は十分上回る)、
 そのリスクに見合わない。VRAM に余裕があれば `LLAMA_DEC_SLOTS=8`、`=0` で upstream の挙動に
-戻る。
+戻る。`-sm tensor` では値によらず枠は使われない。
 
 `LLAMA_DEC_MAX_TOK` の既定値 4 はマジックナンバーではない。
 `ggml_cuda_check_fusion_memory_ranges` は融合の可否を**実アドレス**で判定するので、バッファ
