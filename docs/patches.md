@@ -953,6 +953,16 @@ was last applied to (`penalties`' `inp_token_ids` / `inp_counts`, `dist`'s
 slot hit — so alternating slots would write one slot's inputs while another
 slot's graph runs.
 
+Slots are also disabled when the model runs on a meta device (`-sm tensor`). The
+meta backend tracks views created outside its buffers in two rotating containers
+per buffer. That holds while one scheduler uses a context's buffers, but the slots
+share them: a reused slot graph can find its views cleared by another graph's
+rebuild, and decode aborts on `GGML_ASSERT(bcj.nodes[i])` in
+`ggml-backend-meta.cpp` (on the first request with MTP and on the second without
+it, on a dense 9B model). Prefill usually survives only because its ubatches
+exceed the token cap and never take a slot. Under `-sm tensor` no slot is ever
+used, and `LLAMA_DEC_SLOTS` and `LLAMA_DEC_MAX_TOK` have no effect.
+
 The token cap is 4 because slot buffers are laid out differently from the main
 scheduler's, and `ggml_cuda_check_fusion_memory_ranges` decides fusion from the
 actual tensor addresses. topk-moe's exception (`ggml_nrows(node) <=
@@ -967,7 +977,8 @@ something read off the topk-moe exception.
 model does not load, while 0.38 points — real, and well above the ±0.07%
 resolution established in [benchmarking.md](benchmarking.md), but small — is not
 worth that risk. Raise it with `LLAMA_DEC_SLOTS=8` where there is headroom; `=0`
-restores upstream behaviour.
+restores upstream behaviour. Under `-sm tensor` the slots stay off whatever it is
+set to.
 
 `LLAMA_DEC_MAX_TOK` defaults to 4, and that number is load-bearing:
 `ggml_cuda_check_fusion_memory_ranges` decides fusion from actual tensor
