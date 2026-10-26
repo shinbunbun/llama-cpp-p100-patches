@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 8678a8a4d..199b667aa 100644
+index 4d091c272..429f69dc5 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1065,7 +1065,20 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1078,7 +1078,20 @@ static void mul_mat_vec_q_moe_launch(
          const uint32_t ncols_dst, const uint32_t ids_stride,
          const int warp_size, const int nchannels_dst, cudaStream_t stream) {
  
@@ -22,5 +22,5 @@ index 8678a8a4d..199b667aa 100644
 +    // benchmark, which is larger than the effect being measured.
 +    constexpr int rows_per_block = 4;
      const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-     const dim3 block_nums(nblocks_rows, nchannels_dst);
+     const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
      const dim3 block_dims(warp_size, ncols_dst);

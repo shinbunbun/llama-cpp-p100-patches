@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index c7a0c8317..023810604 100644
+index 3ffbba839..f6ecb3069 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
-@@ -210,6 +210,241 @@ static void top_k_radix_cuda(
+@@ -214,6 +214,241 @@ static void top_k_radix_cuda(
  
  #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
  
@@ -244,7 +244,7 @@ index c7a0c8317..023810604 100644
  void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0   = dst->src[0];
      const float *       src0_d = (const float *) src0->data;
-@@ -225,6 +460,19 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -229,6 +464,19 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const int64_t    nrows = ggml_nrows(src0);
      const int64_t    k     = dst->ne[0];
      ggml_cuda_pool & pool  = ctx.pool();

@@ -1,5 +1,5 @@
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 06dea1e1c..52d9afac7 100644
+index d9c508049..edbedfd5a 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -9,6 +9,7 @@
@@ -10,7 +10,7 @@ index 06dea1e1c..52d9afac7 100644
  #include <climits>
  #include <cmath>
  #include <cstring>
-@@ -108,6 +109,145 @@ struct ring_buffer {
+@@ -109,6 +110,145 @@ struct ring_buffer {
      std::vector<T> data;
  };
  
@@ -156,16 +156,16 @@ index 06dea1e1c..52d9afac7 100644
  struct common_sampler {
      common_params_sampling params;
  
-@@ -121,13 +261,16 @@ struct common_sampler {
+@@ -124,6 +264,8 @@ struct common_sampler {
  
-     llama_token_data_array cur_p;
- 
+     // for rejection sampling; independent of the draft, or the target distribution is not preserved
+     std::mt19937 rng;
 +    int pf_nkeep;                 // 0 = prefilter not applicable to this chain
 +    std::vector<int32_t> pf_idx;
-+
+ 
      void reset() {
          prev.clear();
- 
+@@ -131,7 +273,7 @@ struct common_sampler {
          llama_sampler_reset(chain);
      }
  
@@ -174,7 +174,7 @@ index 06dea1e1c..52d9afac7 100644
          const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
          const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
          const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
-@@ -152,9 +295,25 @@ struct common_sampler {
+@@ -156,9 +298,25 @@ struct common_sampler {
          } else {
              const auto * logits = llama_get_logits_ith(ctx, idx);
              GGML_ASSERT(logits != nullptr);
@@ -203,28 +203,28 @@ index 06dea1e1c..52d9afac7 100644
              }
          }
  
-@@ -432,6 +591,8 @@ struct common_sampler * common_sampler_init(
-         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-         /* .cur     = */ {},
+@@ -438,6 +596,8 @@ struct common_sampler * common_sampler_init(
          /* .cur_p   = */ {},
+         // mix it, the chain and the draft are seeded from this one too
+         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
 +        /* .pf_nkeep= */ common_sampler_prefilter_nkeep(params, vocab),
 +        /* .pf_idx  = */ {},
      };
  
      return result;
-@@ -515,6 +676,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-         /* .prev    = */ gsmpl->prev,
+@@ -522,6 +682,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
          /* .cur     = */ gsmpl->cur,
          /* .cur_p   = */ gsmpl->cur_p,
+         /* .rng     = */ gsmpl->rng,
 +        /* .pf_nkeep= */ gsmpl->pf_nkeep,
 +        /* .pf_idx  = */ {},
      };
  }
  
-@@ -535,6 +698,10 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
-     dst->cur        = src->cur;
+@@ -543,6 +705,10 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
      dst->cur_p      = src->cur_p;
      dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+     dst->rng        = src->rng;
 +    // pf_nkeep is derived from params, so it has to travel with them; pf_idx belongs to the
 +    // logits dst has not built yet.
 +    dst->pf_nkeep   = src->pf_nkeep;
@@ -232,7 +232,7 @@ index 06dea1e1c..52d9afac7 100644
      dst->t_total_us = src->t_total_us;
  }
  
-@@ -604,7 +771,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+@@ -612,7 +778,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
      auto & chain = gsmpl->chain;
      auto & cur_p = gsmpl->cur_p; // initialized by set_logits
  

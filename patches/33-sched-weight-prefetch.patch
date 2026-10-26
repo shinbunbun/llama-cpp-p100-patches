@@ -1,8 +1,8 @@
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cc3f8cd36..f1c3569f6 100644
+index 5ef80da30..56a273822 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -353,6 +353,15 @@ extern "C" {
+@@ -355,6 +355,15 @@ extern "C" {
      // Set a callback to be called for each resulting node during graph compute
      GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
  
@@ -19,7 +19,7 @@ index cc3f8cd36..f1c3569f6 100644
      // Meta backend
      //
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 158e3a294..8da3c1a96 100644
+index 49e04991f..ad0d5e5a8 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,7 @@
@@ -30,7 +30,7 @@ index 158e3a294..8da3c1a96 100644
  #include <unordered_map>
  #include <vector>
  
-@@ -833,6 +834,20 @@ struct ggml_backend_sched {
+@@ -973,6 +974,20 @@ struct ggml_backend_sched {
  
      int debug;
  
@@ -51,7 +51,7 @@ index 158e3a294..8da3c1a96 100644
      // run the GPU work that the next CPU split does not need while the CPU computes [LLAMA_SCHED_PREFETCH]
      int prefetch;
      ggml_backend_event_t prefetch_event[GGML_SCHED_MAX_BACKENDS];
-@@ -1654,6 +1669,186 @@ static bool sched_backend_is_cpu(ggml_backend_t backend) {
+@@ -1810,6 +1825,186 @@ static bool sched_backend_is_cpu(ggml_backend_t backend) {
      return ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
  }
  
@@ -238,7 +238,7 @@ index 158e3a294..8da3c1a96 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1663,6 +1858,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1819,6 +2014,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<ggml_bitset_t> used_ids;
  
      int prev_backend_id = -1;
@@ -280,7 +280,7 @@ index 158e3a294..8da3c1a96 100644
      sched->n_prefetched = 0;
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
-@@ -1718,6 +1948,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1874,6 +2104,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      ggml_backend_synchronize(split_backend);
                  }
  
@@ -291,7 +291,7 @@ index 158e3a294..8da3c1a96 100644
                  // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                  ggml_tensor * node = split->graph.nodes[0];
                  if (split->graph.n_nodes > 0 &&
-@@ -1881,6 +2115,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2037,6 +2271,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                  if (ec != GGML_STATUS_SUCCESS) {
                      return ec;
                  }
@@ -301,7 +301,7 @@ index 158e3a294..8da3c1a96 100644
              }
          } else {
              // similar to ggml_backend_compare_graph_backend
-@@ -2023,6 +2260,15 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2179,6 +2416,15 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          }
          ggml_backend_event_free(sched->prefetch_event[b]);
      }

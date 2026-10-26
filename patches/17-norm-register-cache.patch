@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index c3758cd50..5239f7ef4 100644
+index 5543307be..dbb2a91af 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
-@@ -127,10 +127,33 @@ static __global__ void rms_norm_f32(const float * x,
+@@ -129,10 +129,33 @@ static __global__ void rms_norm_f32(const float * x,
  
      float tmp = 0.0f; // partial sum for thread in warp
  
@@ -39,7 +39,7 @@ index c3758cd50..5239f7ef4 100644
      }
  
      // sum up partial sums
-@@ -140,16 +163,30 @@ static __global__ void rms_norm_f32(const float * x,
+@@ -142,18 +165,32 @@ static __global__ void rms_norm_f32(const float * x,
      const float mean = tmp / ncols;
      const float scale = rsqrtf(mean + eps);
  
@@ -54,6 +54,9 @@ index c3758cd50..5239f7ef4 100644
              const int mul_col = fastmodulo(col, mul_ncols_packed);
 -            dst[col]          = scale * x[col] * mul[mul_col];
 +            dst[col]          = scale * xi * mul[mul_col];
+         } else if constexpr (do_scale) {
+-            dst[col] = scale_out * (scale * x[col]);
++            dst[col] = scale_out * (scale * xi);
          } else {
 -            dst[col] = scale * x[col];
 +            dst[col] = scale * xi;
@@ -74,7 +77,7 @@ index c3758cd50..5239f7ef4 100644
          }
      }
  }
-@@ -258,10 +295,26 @@ static __global__ void l2_norm_f32(
+@@ -262,10 +299,26 @@ static __global__ void l2_norm_f32(
  
      float tmp = 0.0f; // partial sum for thread in warp
  
@@ -104,7 +107,7 @@ index c3758cd50..5239f7ef4 100644
      }
  
      // sum up partial sums
-@@ -272,8 +325,18 @@ static __global__ void l2_norm_f32(
+@@ -276,8 +329,18 @@ static __global__ void l2_norm_f32(
      // from https://pytorch.org/docs/stable/generated/torch.nn.functional.normalize.html
      const float scale = rsqrtf(fmaxf(tmp, eps * eps));
  

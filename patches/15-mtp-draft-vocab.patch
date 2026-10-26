@@ -1,5 +1,5 @@
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index e195f50d0..ee3cfe0c6 100644
+index 97e0cee70..d804db59e 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -31,6 +31,7 @@
@@ -10,7 +10,7 @@ index e195f50d0..ee3cfe0c6 100644
  #include <functional>
  #include <map>
  #include <numeric>
-@@ -1879,9 +1880,171 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1959,9 +1960,166 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -19,19 +19,8 @@ index e195f50d0..ee3cfe0c6 100644
      return true;
  }
  
-+// Gather a reduced-vocabulary copy of the LM head, used only by the MTP/NextN draft pass.
-+//
-+// The draft head is by far the most expensive tensor in a draft forward (it is the single
-+// largest weight in the model and a draft reads all of it to produce one token), yet the
-+// draft only ever needs its argmax and that token's probability - and whatever it proposes
-+// is verified against the target, so restricting the draft to a subset of the vocabulary
-+// cannot change what the model emits. It only costs acceptance when the correct token is
-+// outside the subset.
-+//
-+// The subset comes from LLAMA_MTP_DRAFT_VOCAB, a whitespace-separated list of token ids
-+// (workload-derived: BPE id order is the training corpus' frequency order, which is a poor
-+// match for any particular deployment). Rows are copied verbatim, so within the subset the
-+// draft's numbers are bit-identical to the full head.
++// Reduced-vocabulary copy of the LM head for the MTP draft pass, from LLAMA_MTP_DRAFT_VOCAB (whitespace-separated
++// token ids). Rows are copied verbatim, so within the subset the draft is bit-identical to the full head.
 +void llama_model::build_draft_head(const llama_model_loader & ml) {
 +    const char * path = getenv("LLAMA_MTP_DRAFT_VOCAB");
 +    if (path == nullptr || *path == '\0') {
@@ -51,6 +40,12 @@ index e195f50d0..ee3cfe0c6 100644
 +
 +    if (output_s != nullptr) {
 +        LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB ignored (LM head has a per-tensor scale)\n", __func__);
++        return;
++    }
++
++    // only these MTP graphs read draft_head
++    if (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) {
++        LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_VOCAB ignored (not supported for this architecture)\n", __func__);
 +        return;
 +    }
 +
@@ -180,13 +175,13 @@ index e195f50d0..ee3cfe0c6 100644
 +}
 +
  ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-     return ml.create_tensor(
+     const buft_list_t * buft_list_layer = nullptr;
+     if (tn.bid != -1) {
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 984b2cf38..9bfe14521 100644
+index 2243377cc..dc767faf9 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -639,6 +639,15 @@ struct llama_model {
+@@ -666,6 +666,15 @@ struct llama_model {
      struct ggml_tensor * output_s    = nullptr;
      struct ggml_tensor * output_in_s = nullptr;
  
@@ -202,7 +197,7 @@ index 984b2cf38..9bfe14521 100644
      // NextN/MTP model-level projections
      struct ggml_tensor * nextn_proj_pre  = nullptr;
      struct ggml_tensor * nextn_proj_post = nullptr;
-@@ -766,6 +775,10 @@ struct llama_model {
+@@ -797,6 +806,10 @@ struct llama_model {
      virtual void load_vocab  (llama_model_loader & ml) = 0;
      virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
  
@@ -214,19 +209,18 @@ index 984b2cf38..9bfe14521 100644
      virtual void load_arch_hparams(llama_model_loader & ml) = 0;
      virtual void load_arch_tensors(llama_model_loader & ml) = 0;
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index a1e263500..24996e52d 100644
+index ab98744a5..76504eb60 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
-@@ -636,7 +636,23 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+@@ -651,7 +651,22 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
      ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
      ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
      GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
 -    cur = build_lora_mm(head_w, cur, head_s);
 +
-+    // the draft only needs its own argmax and that token's probability, and whatever it
-+    // proposes is verified against the target - so a reduced-vocabulary head changes the
-+    // acceptance rate, never the emitted text. worth it: the full head is the single
-+    // largest tensor a draft forward reads.
++    // drafts are verified against the target: under argmax verification a reduced-vocabulary
++    // head changes the acceptance rate, never the emitted text. worth it: the full head is the
++    // single largest tensor a draft forward reads.
 +    if (model.draft_head && head_w == model.output && head_s == nullptr && cur->ne[1] == 1 &&
 +            (loras == nullptr || loras->empty())) {
 +        const int64_t n_vocab = model.output->ne[1];
@@ -243,10 +237,10 @@ index a1e263500..24996e52d 100644
  
      res->t_logits = cur;
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index bdf772625..db6e01aa8 100644
+index f0f917af7..552a087d0 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
-@@ -733,7 +733,21 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+@@ -734,7 +734,21 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
      ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
      ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
      GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");

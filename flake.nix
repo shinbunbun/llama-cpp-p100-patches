@@ -7,7 +7,7 @@
     # Pinned only so `nix flake check` can verify the patches still apply at zero
     # fuzz.  Consumers are not forced onto this revision.
     llama-cpp-src = {
-      url = "github:ggml-org/llama.cpp/v0.5.0";
+      url = "github:ggml-org/llama.cpp/v0.6.0";
       flake = false;
     };
   };

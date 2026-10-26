@@ -1,11 +1,11 @@
 diff --git a/src/models/models.h b/src/models/models.h
-index 9eea0ab59..5eda43094 100644
+index 0beae2ae2..c525b93f5 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -2385,6 +2385,15 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2490,6 +2490,15 @@ struct llama_model_qwen4exp : public llama_model_base {
      llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
  
-     class llm_graph_input_qsa;
+     class llm_graph_input_kpool;
 +    class llm_graph_input_moe_cache;
 +
 +    // routed experts recently used on the CPU, copied into device slots; null when disabled
@@ -18,7 +18,7 @@ index 9eea0ab59..5eda43094 100644
      // hc weights with the 1/hc factor folded in, where that is exact
      mutable std::unordered_set<const ggml_tensor *> hc_prescaled_set;
      mutable std::once_flag hc_fold_once;
-@@ -2467,7 +2476,16 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2611,7 +2620,16 @@ struct llama_model_qwen4exp : public llama_model_base {
  
          ggml_tensor * build_layer_ffn(
                      ggml_tensor * cur,
@@ -37,10 +37,10 @@ index 9eea0ab59..5eda43094 100644
          ggml_tensor * build_norm_gated(
                      ggml_tensor * input,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 91c0b70ae..a02ff6d44 100644
+index 7a21632a0..8dadabfb8 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -425,11 +425,298 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -472,9 +472,296 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
      return cur;
  }
  
@@ -331,15 +331,13 @@ index 91c0b70ae..a02ff6d44 100644
 +
 +
  llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
-     llm_build_delta_net_base(params), model(model) {
+     graph(model, params, no_build{}) {
      const int64_t hc = hparams.dsv4_hc_mult;
- 
-     static_cast<const llama_model_qwen4exp &>(model).hc_fold();
 +
      GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
  
      int sections[4];
-@@ -441,6 +728,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -486,6 +773,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
  
      auto * inp = build_inp_mem_hybrid();
  
@@ -355,7 +353,7 @@ index 91c0b70ae..a02ff6d44 100644
      // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
      // the indexer cache inside it is absent when the GGUF has no indexer tensors
      const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
-@@ -509,7 +805,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -563,7 +859,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                  model.layers[il].hc_ffn_inject,
                  &inject, il);
  
@@ -364,7 +362,7 @@ index 91c0b70ae..a02ff6d44 100644
          cb(cur, "ffn_out", il);
  
          res_hc = build_hc_combine(res_hc, cur, inject, model.layers[il].hc_ffn_inject, il);
-@@ -1374,29 +1670,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -1450,29 +1746,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
      return cur;
  }
  
@@ -374,7 +372,23 @@ index 91c0b70ae..a02ff6d44 100644
 +    const auto & m  = static_cast<const llama_model_qwen4exp &>(model);
 +    const auto * mc = m.mcache.get();
 +    const auto & layer = model.layers[il];
-+
+ 
+-    ggml_tensor * moe_out =
+-        build_moe_ffn(cur,
+-            model.layers[il].ffn_gate_inp,
+-            model.layers[il].ffn_up_exps,
+-            model.layers[il].ffn_gate_exps,
+-            model.layers[il].ffn_down_exps,
+-            nullptr,
+-            n_expert, n_expert_used,
+-            LLM_FFN_SILU, true,
+-            hparams.expert_weights_scale,
+-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, model.layers[il].ffn_gate_up_exps,
+-            model.layers[il].ffn_up_exps_s,
+-            model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
+-    cb(moe_out, "ffn_moe_out", il);
 +    const int64_t n_embd_ = cur->ne[0];
 +    const int64_t n_tok   = cur->ne[1];
 +    const int64_t k       = n_expert_used;
@@ -404,22 +418,7 @@ index 91c0b70ae..a02ff6d44 100644
 +    }
 +    ggml_build_forward_expand(gf, weights);
  
--    ggml_tensor * moe_out =
--        build_moe_ffn(cur,
--            model.layers[il].ffn_gate_inp,
--            model.layers[il].ffn_up_exps,
--            model.layers[il].ffn_gate_exps,
--            model.layers[il].ffn_down_exps,
--            nullptr,
--            n_expert, n_expert_used,
--            LLM_FFN_SILU, true,
--            hparams.expert_weights_scale,
--            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
--            nullptr, model.layers[il].ffn_gate_up_exps,
--            model.layers[il].ffn_up_exps_s,
--            model.layers[il].ffn_gate_exps_s,
--            model.layers[il].ffn_down_exps_s);
--    cb(moe_out, "ffn_moe_out", il);
+-    // shared experts, as in the Qwen3Next reference
 +    if (n_tok > 0) {
 +        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, selected, k, 1, selected->nb[1], 0)),
 +                ggml_view_2d(ctx0, mc->hist, k, 1, mc->hist->nb[1], il*mc->hist->nb[1])));
@@ -443,8 +442,7 @@ index 91c0b70ae..a02ff6d44 100644
 +        cb(out, "ffn_moe_down", il);
 +        return out;
 +    };
- 
--    // shared experts, as in the Qwen3Next reference
++
 +    // device work queued between the CPU branch inputs and the CPU branch runs while the CPU computes
 +    ggml_tensor * on_gpu = branch(mc->up[il], mc->gate[il], mc->down[il], ids_gpu);
 +    ggml_build_forward_expand(gf, on_gpu);
@@ -489,7 +487,7 @@ index 91c0b70ae..a02ff6d44 100644
              build_ffn(cur,
                  model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                  model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-@@ -1414,7 +1785,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1490,7 +1861,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
  
          ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
          cb(ffn_shexp, "ffn_shexp_gated", il);

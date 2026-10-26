@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 0174d0031..eb973fae0 100644
+index f72e4dee5..c0a914e68 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -695,6 +695,10 @@ static __global__ void mul_mat_vec_q(
@@ -13,7 +13,7 @@ index 0174d0031..eb973fae0 100644
  
      const     int row0 = rows_per_cuda_block*blockIdx.x;
      const     int blocks_per_row_x = ncols_x / qk;
-@@ -969,11 +973,14 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -982,11 +986,14 @@ static __global__ void mul_mat_vec_q_moe(
  
      const uint32_t token_idx   = threadIdx.y;
  
@@ -31,7 +31,7 @@ index 0174d0031..eb973fae0 100644
      const int      row0        = c_rows_per_block*blockIdx.x;
      const int      blocks_per_row_x = ncols_x / qk;
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index 5b20e9ee0..00a5c6a15 100644
+index 2977aa12d..e9e933e67 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -1042,6 +1042,49 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
