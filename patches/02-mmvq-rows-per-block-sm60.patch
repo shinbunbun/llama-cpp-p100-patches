@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index a85155360..8678a8a4d 100644
+index 251577d2f..4d091c272 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -580,10 +580,27 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int

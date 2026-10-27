@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3253aa95c..b0b6fb662 100644
+index 29e9f1e9d..727ef8ac7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3713,6 +3713,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3807,6 +3807,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -36,10 +36,10 @@ index 3253aa95c..b0b6fb662 100644
          static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
                                   std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
 diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
-index d3e594878..ece72b0b7 100644
+index 84788c5dc..3158a5a9d 100644
 --- a/ggml/src/ggml-cuda/unary.cu
 +++ b/ggml/src/ggml-cuda/unary.cu
-@@ -702,6 +702,113 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+@@ -716,6 +716,113 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
      }
  }
  

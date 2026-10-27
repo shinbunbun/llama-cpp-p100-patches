@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index bd5c5d421..858a04af5 100644
+index d0a572e15..ea835b324 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
-@@ -815,7 +815,19 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+@@ -816,7 +816,19 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                  if (cc >= GGML_CUDA_CC_TURING) {
                      return ne11 <= 4;
                  }

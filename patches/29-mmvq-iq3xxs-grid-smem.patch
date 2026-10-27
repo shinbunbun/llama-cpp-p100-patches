@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 53f453e2e..0174d0031 100644
+index d2d4c4b73..f72e4dee5 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -691,6 +691,11 @@ static __global__ void mul_mat_vec_q(
@@ -14,7 +14,7 @@ index 53f453e2e..0174d0031 100644
      const     int row0 = rows_per_cuda_block*blockIdx.x;
      const     int blocks_per_row_x = ncols_x / qk;
      constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
-@@ -963,6 +968,13 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -976,6 +981,13 @@ static __global__ void mul_mat_vec_q_moe(
      }
  
      const uint32_t token_idx   = threadIdx.y;
@@ -29,7 +29,7 @@ index 53f453e2e..0174d0031 100644
      const int      blocks_per_row_x = ncols_x / qk;
      constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index f2a6f2009..5b20e9ee0 100644
+index f65fe530e..2977aa12d 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -1169,6 +1169,29 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(

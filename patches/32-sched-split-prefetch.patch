@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 8e619b4f4..158e3a294 100644
+index 0348cebc6..49e04991f 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -833,6 +833,13 @@ struct ggml_backend_sched {
+@@ -973,6 +973,13 @@ struct ggml_backend_sched {
  
      int debug;
  
@@ -16,7 +16,7 @@ index 8e619b4f4..158e3a294 100644
      // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
      // ref: https://github.com/ggml-org/llama.cpp/pull/17617
      int debug_realloc;
-@@ -1643,6 +1650,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1799,6 +1806,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -27,7 +27,7 @@ index 8e619b4f4..158e3a294 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1652,6 +1663,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1808,6 +1819,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<ggml_bitset_t> used_ids;
  
      int prev_backend_id = -1;
@@ -35,7 +35,7 @@ index 8e619b4f4..158e3a294 100644
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
-@@ -1668,12 +1680,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1824,12 +1836,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -64,7 +64,7 @@ index 8e619b4f4..158e3a294 100644
              if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-@@ -1795,10 +1823,64 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1951,10 +1979,64 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -132,7 +132,7 @@ index 8e619b4f4..158e3a294 100644
              }
          } else {
              // similar to ggml_backend_compare_graph_backend
-@@ -1915,6 +1997,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2071,6 +2153,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          }
      }
  
@@ -147,7 +147,7 @@ index 8e619b4f4..158e3a294 100644
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
  
-@@ -1931,10 +2021,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2087,10 +2177,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
          for (int c = 0; c < sched->n_copies; c++) {
              ggml_backend_event_free(sched->events[b][c]);
          }

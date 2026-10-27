@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index 023810604..61748a84b 100644
+index f6ecb3069..5bed0401d 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
-@@ -378,6 +378,256 @@ static __global__ void __launch_bounds__(CUDA_TOP_K_BLOCK)
+@@ -382,6 +382,256 @@ static __global__ void __launch_bounds__(CUDA_TOP_K_BLOCK)
      }
  }
  
@@ -259,7 +259,7 @@ index 023810604..61748a84b 100644
  static bool top_k_partial_cuda(ggml_cuda_pool & pool, const float * src, int * dst,
                                 const int ncols, const int nrows, const int k, cudaStream_t stream) {
      static const bool disable = getenv("GGML_CUDA_DISABLE_TOP_K_PARTIAL") != nullptr &&
-@@ -472,6 +722,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -476,6 +726,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
          top_k_partial_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
          return;
      }

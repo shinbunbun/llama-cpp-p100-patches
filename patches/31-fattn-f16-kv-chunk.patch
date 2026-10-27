@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 6d1ce52db..c202d76d5 100644
+index 41d948335..64b749b6f 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -50,8 +50,39 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
@@ -61,7 +61,7 @@ index 6d1ce52db..c202d76d5 100644
          }
      }
  
-@@ -972,6 +1003,89 @@ static __global__ void flash_attn_combine_results(
+@@ -977,6 +1008,89 @@ static __global__ void flash_attn_combine_results(
      dst[tid] = VKQ_numerator / VKQ_denominator;
  }
  
@@ -151,7 +151,7 @@ index 6d1ce52db..c202d76d5 100644
  template <int DV, int ncols1, int ncols2>
  void launch_fattn(
      ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-@@ -1006,8 +1120,12 @@ void launch_fattn(
+@@ -1011,8 +1125,12 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -165,7 +165,7 @@ index 6d1ce52db..c202d76d5 100644
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1023,7 +1141,12 @@ void launch_fattn(
+@@ -1028,7 +1146,12 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -179,7 +179,7 @@ index 6d1ce52db..c202d76d5 100644
          const size_t bs = ggml_blck_size(K->type);
          const size_t ts = ggml_type_size(K->type);
  
-@@ -1051,7 +1174,7 @@ void launch_fattn(
+@@ -1056,7 +1179,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -188,18 +188,15 @@ index 6d1ce52db..c202d76d5 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1109,7 +1232,9 @@ void launch_fattn(
+@@ -1114,6 +1237,7 @@ void launch_fattn(
      // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
      // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
      //     multiple sequences of possibly different lengths.
--    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
 +    // The pool frees in LIFO order, so KV_max is allocated here for the chunked path too (it is scanned per chunk below).
-+    const bool use_KV_max = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
-+    if (use_KV_max) {
+     const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+     if (scan_mask) {
          const int64_t s31 = mask->nb[1] / sizeof(half2);
-         const int64_t s33 = mask->nb[3] / sizeof(half2);
- 
-@@ -1120,10 +1245,12 @@ void launch_fattn(
+@@ -1126,10 +1250,12 @@ void launch_fattn(
          const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
  
          KV_max.alloc(ne_KV_max);
@@ -216,7 +213,7 @@ index 6d1ce52db..c202d76d5 100644
      }
  
      const dim3 block_dim(warp_size, nwarps, 1);
-@@ -1132,7 +1259,8 @@ void launch_fattn(
+@@ -1138,7 +1264,8 @@ void launch_fattn(
      GGML_ASSERT(max_blocks_per_sm > 0);
      int parallel_blocks = max_blocks_per_sm;
  
@@ -226,7 +223,7 @@ index 6d1ce52db..c202d76d5 100644
      const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
  
      dim3 blocks_num;
-@@ -1202,6 +1330,10 @@ void launch_fattn(
+@@ -1214,6 +1341,10 @@ void launch_fattn(
              }
          }
  
@@ -237,7 +234,7 @@ index 6d1ce52db..c202d76d5 100644
          blocks_num.x = ntiles_x;
          blocks_num.y = parallel_blocks;
          blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
-@@ -1235,6 +1367,107 @@ void launch_fattn(
+@@ -1247,6 +1378,107 @@ void launch_fattn(
  
      GGML_ASSERT(block_dim.x % warp_size == 0);
  
@@ -297,7 +294,7 @@ index 6d1ce52db..c202d76d5 100644
 +                GGML_ASSERT(mask->nb[0] == sizeof(half));
 +                mask_chunk = (const char *) mask->data + kv0*sizeof(half);
 +            }
-+            if (use_KV_max) {
++            if (scan_mask) {
 +                const int64_t s31 = mask->nb[1] / sizeof(half2);
 +                const int64_t s33 = mask->nb[3] / sizeof(half2);
 +
@@ -346,10 +343,10 @@ index 6d1ce52db..c202d76d5 100644
      ggml_cuda_kernel_launch(fattn_kernel, launch_params,
          (const char *) Q->data,
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index d1fcf58cb..e8ec78388 100644
+index bb34e01f3..3afb52afb 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -746,8 +746,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -749,8 +749,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              break;
      }
  

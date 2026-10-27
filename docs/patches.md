@@ -2,9 +2,9 @@
 
 日本語版: [patches.ja.md](patches.ja.md)
 
-45 patches, grouped by scope below; the application order is the file
+43 patches, grouped by scope below; the application order is the file
 numbering. Order matters: several touch the same files, and later ones build
-on earlier ones. All 45 are generated against llama.cpp `v0.5.0`, where they
+on earlier ones. All 43 are generated against llama.cpp `v0.6.0`, where they
 apply at zero fuzz and zero offset (see [patches.nix](../nix/patches.nix)
 and the top-level README for the current `llamaCppTag`).
 
@@ -14,9 +14,18 @@ them by default in the qwen4exp graph (ggml-org/llama.cpp#28901). That removed t
 matched from every layer; only the final head mix (`il = -1`) still takes the
 unfused path, once per graph, which is not worth a kernel of its own. The numbering keeps the gap.
 
+Patch 44 `qwen4exp-qsa-block-key-cache` was deleted at `v0.6.0`. Upstream now
+ships its own k-pool for this architecture (a hybrid memory with an index-key
+pool), which covers what 44 did. Patch 45 was rewritten on top of it.
+
+Patch 48 `fuse-rms-norm-scale` was deleted at `v0.6.0`. Upstream fuses
+`RMS_NORM` + `SCALE` itself.
+
+Patch numbers are not reused.
+
 Every patch carries its full reasoning — including the measurements that
 justify it and the alternatives that were tried and rejected — in the comments
-it adds to the source. This page is the index. Patches 32–48 are the exception:
+it adds to the source. This page is the index. Patches 32–47 are the exception:
 their measurements live on this page rather than in the source.
 
 **Scope** classifies who benefits:
@@ -736,7 +745,9 @@ Patch 28 gives `top_k` a partial path for small k (k <= 16); above that it still
 falls back to CUB's full segmented sort. A sparse-attention indexer selects
 k = 2,051 of 40,544 scores, so it sorted all 40,544 to keep the first 2,051:
 **133 µs to read 162 KB** (161 µs at 210k depth, 65.6 ms for a 4,096-row prefill
-chunk).
+chunk). That shape and the figures below predate `v0.6.0`: the rewritten 45 takes
+its top-k over pool blocks (k = top_k / ratio of n_pool scores), which has not
+been re-measured.
 
 Adds a radix select for large k (`GGML_CUDA_TOP_K_SELECT=1`), in the same block
 patch 28 guards off for HIP and for builds whose CUB provides `DeviceTopK`, and
@@ -767,23 +778,6 @@ benchmark matches question for question (p = 1.000).
 Kernel 133 → **74.8 µs** at the decode shape, 65.6 → **28.6 ms** at 4,096 rows.
 End to end: decode 40k 48.6 → **47.5 ms (−2.3%)**, prefill of 2,050 tokens
 126.8 → **131.1 t/s (+3.4%)**, decode at 210k unchanged.
-
-### 48 · `fuse-rms-norm-scale` — `CUDA`
-
-Since `v0.5.0` gated delta-net normalizes q and k as `scale(rms_norm(x, eps/n),
-1/sqrt(n))` instead of `l2_norm` (ggml-org/llama.cpp#28068), so 17's and 18's L2-norm halves stop
-firing on these models and each layer launches four small kernels. It matches any
-run of contiguous F32 RMS_NORM → SCALE pairs, not only those, and runs it as one
-launch of a kernel built from `rms_norm_f32<256>`'s implementation, with the
-scale applied in its epilogue the way `scale_f32` applies it, so the output is
-bit-identical (9B, 256 greedy tokens: same tokens and same top-5
-log-probabilities with and without it). It does not fuse when an output would
-alias any input, when the RMS_NORM result has another consumer, or for rows of
-1,024 or more, nor while the graph runs concurrent streams
-(`GGML_CUDA_GRAPH_OPT=1`). `GGML_CUDA_DISABLE_FUSE_RMS_SCALE=1` turns it off.
-
-`llama-bench` tg64, four rounds, order reversed every other round: 9B 72.93 →
-73.72 t/s (+1.1%), 35B-A3B 79.39 → 81.34 (+2.5%).
 
 ## Delta-net / gated-delta-net (Qwen3-Next, Qwen3.5)
 
@@ -963,6 +957,14 @@ it, on a dense 9B model). Prefill usually survives only because its ubatches
 exceed the token cap and never take a slot. Under `-sm tensor` no slot is ever
 used, and `LLAMA_DEC_SLOTS` and `LLAMA_DEC_MAX_TOK` have no effect.
 
+Slots are disabled as well when the memory is a hybrid memory with an active
+k-pool (`v0.6.0`: the sparse-attention MoE, and also GLM5-Next, which was not
+measured). Those graphs keep their topology while the
+pool tensors grow, so a lazily reserved slot re-reserves at every pool step. At
+210k depth, slots on: decode 10.38 t/s, slots off: 11.75 t/s; at 40k they were
+even (19.19 vs 19.16 t/s), so on this model slots buy nothing to keep. An
+explicit `LLAMA_DEC_SLOTS` is overridden with a warning.
+
 The token cap is 4 because slot buffers are laid out differently from the main
 scheduler's, and `ggml_cuda_check_fusion_memory_ranges` decides fusion from the
 actual tensor addresses. topk-moe's exception (`ggml_nrows(node) <=
@@ -1074,7 +1076,9 @@ inputs (the KQ mask and the indexer scores of a sparse-attention model) the
 device copies of all of them stay live across one long split. On the
 offloaded sparse-attention MoE at ctx 262,144 / ubatch 6144 the CUDA0 compute
 buffer went from 2,596 MiB to 9,512 MiB and the context no longer fit on a
-16 GiB card; with this patch it is 2,600 MiB. The cap is fixed at
+16 GiB card; with this patch it is 2,600 MiB (measured on `v0.5.0`). On
+`v0.6.0`, with 45 rewritten, the same configuration fits either way: 3,402 MiB
+without it, 1,976 MiB with it. The cap is fixed at
 `GGML_SCHED_MAX_SPLIT_INPUTS` and counts each distinct new input a node brings, so it
 does not drift with the input list's capacity. It is **off by default** and
 enabled with `GGML_SCHED_SPLIT_INPUTS_CAP=1`: it moves split boundaries on any
@@ -1084,14 +1088,17 @@ graph that reaches the cap, and only this workload has been shown to need it.
 
 ### 15 · `mtp-draft-vocab` — `model`
 
-Restricts the vocabulary of the **MTP draft head only**. Splitting a width-1
+Restricts the vocabulary of the **MTP draft head only**, on the qwen35 and
+qwen35moe MTP graphs (other architectures ignore it with a warning). Splitting a width-1
 Q4_1 GEMV by grid X shows 12.7% of it is one tensor — `output.weight`, 606 MiB
 — at 1188.8 µs per call, 535 GB/s, 73% of HBM2 peak: purely bandwidth-bound.
 75% of that is the draft side, 8.1% of the decode wall.
 
 The draft only needs its own argmax and probability, and **every proposal is
-verified by the target**, so shrinking the vocabulary cannot change which tokens
-the target accepts — only how often a draft is accepted. The demonstration pins
+verified by the target**, so under argmax verification shrinking the vocabulary
+cannot change which tokens the target accepts — only how often a draft is
+accepted. Under rejection verification (probabilistic drafting) the output
+distribution is kept but the sampled tokens can differ. The demonstration pins
 the draft width so both builds share an FP path; at the default `p-min` the
 *number* of drafted tokens changes, so byte-identical output is not claimed
 there. Demonstrated: with `--spec-draft-p-min 0` (fixed
@@ -1122,7 +1129,7 @@ Patch 14 (`getrows-narrow-rows`) is a prerequisite: the expansion back to
 `[n_vocab]` is a `get_rows` with `ne00 = 1`, which cost 278 µs and turned the
 whole thing **−29%** until that was fixed.
 
-Patches 42 and 44–46 target one architecture: a hybrid gated-delta-net /
+Patches 42 and 45–46 target one architecture: a hybrid gated-delta-net /
 sparse-attention MoE (`qwen4exp`, i.e. Qwen3.8-Flash-Next) — 48 layers, 512
 experts with 10 used, a gated delta-net block in most layers and a quantized
 sparse-attention (QSA) path in the rest. The numbers below come from
@@ -1146,7 +1153,7 @@ set reproduces the measured tree **bit for bit** (16/16 positions, max
 alter output.
 
 **What 32–46 were worth on this model** (measured on `v0.4.0`, where they were
-fifteen patches including the since-deleted 43; on `v0.5.0` the same configuration also needs
+fifteen patches including 43 and 44, both since deleted, 44's block-key cache now replaced by the upstream k-pool; on `v0.5.0` the same configuration also needs
 `LLAMA_QWEN4EXP_HC_FOLD=1` and `GGML_SCHED_SPLIT_INPUTS_CAP=1`), both arms built
 from this repository and measured after the split, two rounds with the arm order reversed:
 
@@ -1181,7 +1188,7 @@ the 15,697 MiB peak this context length was already validated at.
 
 Long-context accuracy over the same span went 59/78 → 62/78 (26 questions at
 three depths, McNemar p = 1.000 on every comparison), measured during
-development rather than on this build.
+development rather than on a release build.
 
 ### 42 · `qwen4exp-hc-exact` — `model`
 
@@ -1199,6 +1206,9 @@ matmuls per layer plus the element-wise glue. Two changes remain:
 - drop the `CONT` before the stream average. Since `v0.5.0` only the final head
   mix (`il = -1`) reaches that code: the layers take upstream's fused
   hyper-connection op (ggml-org/llama.cpp#28901). **Bit-identical**
+
+On the MTP graph, the fold is now applied when that graph is built, and its
+hyper-connection combines take the folded `inject` weights.
 
 The gamma reshape this patch used to make is upstream since `v0.5.0`, which reads
 gamma as `[n_embd, hc]` so RMS_NORM and MUL are adjacent (ggml-org/llama.cpp#28896).
@@ -1220,45 +1230,31 @@ for training. The `CONT` removal
 is on with no kill switch; its bit-identity rests on the whole-set comparison at
 the top of this section rather than on a check of its own.
 
-### 44 · `qwen4exp-qsa-block-key-cache` — `model`
-
-The sparse-attention indexer recomputes pooled, normalized and rotated block
-keys for the entire context on every ubatch, which makes decode cost grow with
-depth. This keeps them per layer as F32 `[128, n_kv/4]` — 384 MiB at ctx 262,144
-— and refreshes only the blocks whose cells changed. Invalidation hooks sit on
-`clear`, `seq_rm`, `seq_cp`, `seq_keep`, `seq_add`, `seq_div` and `state_read`.
-**Almost all of decode's depth dependence disappears.** `LLAMA_QSA_CACHE=0`
-disables it.
-
-Known limitation: the incremental refresh only writes *complete* blocks, so
-while the newest positions form a partial block — up to `ratio - 1` of them —
-that block is scored against whatever its cache row already held (zeros on a
-fresh context, the key of a longer previous context otherwise). The full-refresh
-path, which runs whenever the cache falls further behind than one ubatch, writes
-every block including the partial one. The accuracy figures on this page were
-taken with this behaviour in place.
-
-A block is only fixed once its cells are known: the cache is used for a single
-sequence whose cells hold positions 0..n−1 without gaps, so block *b* is
-position block *b*. Two traps worth recording: `ubatch.is_pos_2d()` is true for
-text input on an mrope model, so using it as the enable condition silently kept
-the cache from ever being used; and on the cached path the per-cell index
-tensors are never allocated (`data == null`), which faults in `set_input` unless
-the setter writes to scratch instead.
-
 ### 45 · `qwen4exp-qsa-sparse-gather` — `model`
 
-Upstream ships this architecture with sparse attention stubbed out — `TODO:
-enable sparse attention when we are ready`, the graph is dense flash attention
-with a top-k mask —
-and the upstream sparse path needs Turing mma, so Pascal with a q4_0 KV cache
-cannot take it. This gathers the selected cells' K, V and mask with `get_rows`
-and feeds flash attention one query per stream slot. The indexer scores and the
-top-k are chunked per query row (`LLAMA_QSA_CHUNK`, default 32), which removes
-the `[n_kv × n_ubatch]` intermediate: **compute buffer 3,773 → 1,063 MiB** at
-chunk 32. `LLAMA_QSA_GATHER=0` returns to the dense path; so does a build or context
-without flash attention, more than one stream, a 4-D mask, or a KV cache shorter
-than `2*(top_k + ratio - 1)`, all of which the sparse path requires.
+Upstream selects the cells through its k-pool but still runs dense flash
+attention over the whole cache, with the selection scattered into an
+`n_kv`-wide mask. This gathers the selected cells' K, V and mask with `get_rows`
+and feeds flash attention one query per stream slot, so the dense path's
+`[n_kv × n_ubatch]` selection mask is never built (upstream's KQ mask input is
+still allocated and filled, though nothing reads it). The indexer scores and the
+top-k are chunked per query row (`LLAMA_QSA_CHUNK`, default 32), so the
+`[n_pool × n_ubatch]` scores are not held at once either (on `v0.5.0`, before
+the rewrite below, compute buffer 3,773 → 1,063 MiB at chunk 32; the `v0.6.0`
+figures follow the rewrite). `LLAMA_QSA_GATHER=0` returns to the dense path; so does a build or context
+without flash attention, more than one stream, or a KV cache shorter
+than twice the selected cell count (`ratio*min(n_pool, top_k/ratio) + ratio - 1`), all of which the sparse path requires.
+
+At `v0.6.0` this patch was rewritten on top of upstream's k-pool. The indexer is
+split into `build_qsa_index` (the pooled block keys and the rotated queries),
+scoring goes through `ggml_lightning_indexer` against the pool tensors, the top-k
+is taken over pool blocks, and the selected cells are the pool's cell indices
+plus the incomplete tail, gathered as before. The k-pool's gather mode fills the
+indices, so padding slots address a real cell and are masked out instead of
+pointing past the cache. The block-key cache and its refresh plan are gone. On
+`v0.6.0` at ctx 262,144 / ubatch 6144 in the production configuration, the CUDA
+compute buffer is **1,976 MiB**; with `LLAMA_QSA_GATHER=0` the dense path asks for
+**12,910 MiB** and the context does not fit on the 16 GB card.
 
 This patch is **on by default and changes output**: gathering the selected cells
 and running attention over them accumulates in top-k order, where the dense path
@@ -1269,15 +1265,15 @@ bit-identical to upstream.
 The gather writes F16 directly: with an F16 destination, CUDA's `get_rows` does
 q4_0 → float → half in one pass instead of an F32 write plus a CPY. The rounding
 is the same, so this part is **bit-identical**, and prefill gains 7% at 20k and
-3.4% at 40k while decode loses about 1%. Only the K/V gathers take it: the mask
-gather has no buffer to inspect when the graph is built, so it keeps the F32 write
-and an explicit cast, which is also what any CPU placement needs. (Gathering the raw q4_0 bytes instead was tried and abandoned: the
+3.4% at 40k while decode loses about 1%. A source whose type the device cannot
+gather falls back to the F32 write and an explicit cast, which is also what any
+CPU placement needs. (Gathering the raw q4_0 bytes instead was tried and abandoned: the
 compute buffer grew with the chunk count, 17.8 GB at ubatch 4096, and the server
 would not start.)
 
 `LLAMA_QSA_PAD=1` pads the gathered K/V and mask to a multiple of
 `FATTN_KQ_STRIDE` so flash attention takes the vector kernel instead of the tile
-kernel. Re-measured on this build by flipping only that variable, two rounds with
+kernel. Re-measured on the `v0.5.0` build (before the rewrite) by flipping only that variable, two rounds with
 the order reversed: a fresh 40k prefill **165.5 vs 178.0 s (−7.0%)** and decode
 at 40k **47.4 vs 49.0 ms/token**, During development it measured −7.8% on prefill and −18% on 262k
 speculative decode, at a VRAM peak that did not move; the re-measurement did not
@@ -1290,8 +1286,9 @@ relative RMS against a CPU F32 reference is *lower* than the unpadded path in
 every shape measured, and a paired per-chunk perplexity comparison gives
 t = −0.36.
 
-`LLAMA_QSA_TREE_CONCAT=1` builds the chunked output with a pairwise concat tree
-instead of a left-leaning chain.
+The chunked output is joined with a pairwise concat tree rather than a
+left-leaning chain, which would recopy every earlier chunk at each step.
+`LLAMA_QSA_TREE_CONCAT`, which used to select the tree, no longer has an effect.
 
 ### 46 · `qwen4exp-moe-expert-cache` — `model`
 
@@ -1328,7 +1325,7 @@ Slot count, decode ms/token, interleaved two rounds:
 | 60 | **51.0** | **52.4** |
 
 A slot costs about 92.5 MiB across the 48 layers. A longer replan period is
-better than the default. Re-measured on this build with the slot restored so the
+better than the default. Re-measured on the `v0.5.0` build with the slot restored so the
 arms see the same context, two rounds with the order reversed: 128 gives
 **47.45 vs 48.65 ms/token (−2.5%)** against 32, and one of the two rounds showed
 no difference (47.2 / 47.7 against 49.8 / 47.5). During development it measured
